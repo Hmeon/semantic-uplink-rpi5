@@ -1,0 +1,30 @@
+cat > .gitignore <<'EOF'
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+.env
+.env.*.local
+.mypy_cache/
+.pytest_cache/
+*.egg-info/
+
+# Editors
+.vscode/
+.idea/
+
+# Data/Logs (원본 데이터는 원천 보관소 별도 권장)
+data/
+logs/
+notebooks/.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker/Mosquitto runtime
+infra/mosquitto/data/
+infra/mosquitto/log/
+EOF
