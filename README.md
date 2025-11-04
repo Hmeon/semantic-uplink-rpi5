@@ -104,9 +104,13 @@ pip install -r requirements.txt
 
 # 브로커 실행(개발용)
 sudo systemctl enable mosquitto && sudo systemctl start mosquitto
-실행 순서 · Run Order
-bash
-코드 복사
+```
+
+---
+
+## 실행 순서 · Run Order
+
+```bash
 # 1) 링크 프로파일 적용 (예: 저속 10kbps)
 python -m link.shaper.tc_profiles apply lo slow_10kbps
 
@@ -123,42 +127,47 @@ python -m edge.edge_daemon --mode adaptive --arms configs/policy.yaml
 
 # 4) 결과 집계/시각화
 python -m collector.analyze --input data/ --out results/
-설정 · Configuration
-configs/의 YAML만 바꿔도 실험 조건이 바뀝니다(재현성↑).
+```
 
-configs/device.yaml
+---
 
-yaml
-코드 복사
+## 설정 · Configuration
+`configs/`의 **YAML**만 바꿔도 실험 조건이 바뀝니다(재현성↑).
+
+**`configs/device.yaml`**
+```yaml
 device_id: rpi5a
 sensors:
   mic:  { frame_ms: 100, samplerate: 16000, normalize: true }
   temp: { period_hz: 1 }
 ui:    { enabled: true, backend: "lcd" }  # lcd | console
 mqtt:  { host: localhost, port: 1883, base_topic: "edge" }
-configs/policy.yaml
+```
 
-yaml
-코드 복사
+**`configs/policy.yaml`**
+```yaml
 arms:
   - { tau: 1.5, kbits: 6 }
   - { tau: 3.0, kbits: 8 }
   - { tau: 6.0, kbits: 10 }
 reward:  { alpha: 1.0, beta: 1.0, gamma: 0.5 }  # AoI, MAE, Rate 가중
 safety:  { aoi_max_ms: 5000, mae_max: 2.0 }
-configs/link_profiles.yaml
+```
 
-yaml
-코드 복사
+**`configs/link_profiles.yaml`**
+```yaml
 profiles:
   slow_10kbps: { tbf: "tbf rate 10kbit burst 4kbit limit 4k",  netem: "netem delay 300ms loss 3%" }
   delay_loss:  { tbf: "tbf rate 100kbit burst 16kbit limit 32k", netem: "netem delay 500ms loss 8% reorder 10%" }
   cellular_var:{ tbf: "tbf rate 200kbit burst 32kbit limit 64k", netem: "netem delay 120ms loss 2%" }
-데이터 모델 · Data Model
-Event (예시)
+```
 
-json
-코드 복사
+---
+
+## 데이터 모델 · Data Model
+
+**Event (예시)**
+```json
 {
   "ts": "2025-11-03T10:21:34.512Z",
   "seq": 10231,
@@ -173,10 +182,10 @@ json
   "profile": "slow_10kbps",
   "policy": "linucb#5"
 }
-PolicyDecision (예시)
+```
 
-json
-코드 복사
+**PolicyDecision (예시)**
+```json
 {
   "ts": "2025-11-03T10:21:34.480Z",
   "device_id": "rpi5a",
@@ -189,9 +198,12 @@ json
   "kbits": 8,
   "reward": -1.42
 }
-폴더 구조 · Repository Layout
-bash
-코드 복사
+```
+
+---
+
+## 폴더 구조 · Repository Layout
+```
 common/          # 스키마·양자화·시간/MQTT 유틸
 edge/            # 센서→예측→정책→업로더→UI
 collector/       # 브로커 구독→지표 계산/저장
@@ -201,131 +213,134 @@ configs/         # device/policy/link 설정
 docs/figma/      # (이 README가 임베드한) 다이어그램
 data/, logs/     # 실험 산출물
 .github/         # CI 워크플로
-로드맵(7주) · 7‑week Roadmap
-W1: 지표·프로파일 동결 / 수집기 파이프 완료
+```
 
-W2: 기준선(주기 전송) 수집 / AoI·MAE·Rate 대시보드
+---
 
-W3: 고정 τ ETS / 1차 리포트
+## 로드맵(7주) · 7‑week Roadmap
+- **W1**: 지표·프로파일 동결 / 수집기 파이프 완료  
+- **W2**: 기준선(주기 전송) 수집 / AoI·MAE·Rate 대시보드  
+- **W3**: 고정 **τ** ETS / 1차 리포트  
+- **W4–W5**: **LinUCB** 구현·튜닝 / 안전가드 검증  
+- **W6**: 반복 실험 / 파레토 곡선  
+- **W7**: UI 통합 / 최종 보고·데모
 
-W4–W5: LinUCB 구현·튜닝 / 안전가드 검증
+---
 
-W6: 반복 실험 / 파레토 곡선
+## 품질 게이트 · Quality Gates
+- [ ] **토픽/스키마** 필수 필드 누락 0  
+- [ ] **QoS1 중복** 수신 처리(SEQ de‑dup)  
+- [ ] **Outbox** 오프라인→복구 유실 0  
+- [ ] **프로파일 3종 × 모드 3종** 반복 ≥ 3회  
+- [ ] **지표**: 평균·P95 **AoI**, 평균 **MAE**, 평균 **바이트/초**  
+- [ ] 파레토 곡선 + 표(주기 vs 고정τ vs 적응)  
+- [ ] README/다이어그램/스크립트 동기화
 
-W7: UI 통합 / 최종 보고·데모
+---
 
-품질 게이트 · Quality Gates
- 토픽/스키마 필수 필드 누락 0
+## 보안 · 개인정보 · Security & Privacy
+- **Transport**: TLS(옵션), 인증(계정·토큰) 권장  
+- **MQTT**: QoS1/지속세션/Retain 조합 시 **중복 가능성** 고려  
+- **Audio**: **원음 미보관·미전송**, **RMS 통계**만 사용  
+- **Data at Rest**: 로컬 Outbox/로그 암호화(선택), 접근권한 최소화
 
- QoS1 중복 수신 처리(SEQ de‑dup)
+---
 
- Outbox 오프라인→복구 유실 0
-
- 프로파일 3종 × 모드 3종 반복 ≥ 3회
-
- 지표: 평균·P95 AoI, 평균 MAE, 평균 바이트/초
-
- 파레토 곡선 + 표(주기 vs 고정τ vs 적응)
-
- README/다이어그램/스크립트 동기화
-
-보안 · 개인정보 · Security & Privacy
-Transport: TLS(옵션), 인증(계정·토큰) 권장
-
-MQTT: QoS1/지속세션/Retain 조합 시 중복 가능성 고려
-
-Audio: 원음 미보관·미전송, RMS 통계만 사용
-
-Data at Rest: 로컬 Outbox/로그 암호화(선택), 접근권한 최소화
-
-기여 · Contributing
-bash
-코드 복사
+## 기여 · Contributing
+```bash
 pip install -e .[dev]
 ruff . && pytest -q
-브랜치: feat/*, fix/*, chore/*
+```
+- 브랜치: `feat/*`, `fix/*`, `chore/*`  
+- 커밋: `type(scope): subject` (예: `feat(edge): add AR(1) predictor`)
 
-커밋: type(scope): subject (예: feat(edge): add AR(1) predictor)
+---
 
-라이선스 · License
+## 라이선스 · License
 TBD (추후 지정)
 
-English Version
-Overview
-Problem · Periodic transmissions waste bandwidth on low/unstable links and degrade freshness (AoI).
+---
 
-Idea · At the edge, transmit an event only when the residual |e| exceeds a threshold τ, and adapt quantization bits k to link conditions.
+# English Version
 
-Reliability · Combine MQTT QoS1, Outbox (offline queue), and backoff to handle disconnections and duplicates.
+## Overview
+- **Problem** · Periodic transmissions waste bandwidth on low/unstable links and degrade **freshness (AoI)**.  
+- **Idea** · At the edge, transmit an **event** only when the **residual** |e| exceeds a **threshold τ**, and adapt **quantization bits k** to link conditions.  
+- **Reliability** · Combine **MQTT QoS1**, **Outbox (offline queue)**, and **backoff** to handle disconnections and duplicates.  
+- **Goal** · **≥ 60%** traffic reduction, **≥ 30%** AoI improvement, **≤ 10%** MAE penalty.
 
-Goal · ≥ 60% traffic reduction, ≥ 30% AoI improvement, ≤ 10% MAE penalty.
+## Architecture
+<p align="center">
+  <img src="docs/figma/architecture_ko.svg" alt="Architecture Map" width="88%">
+</p>
 
-Architecture
-<p align="center"> <img src="docs/figma/architecture_ko.svg" alt="Architecture Map" width="88%"> </p>
-Data Flow
-<p align="center"> <img src="docs/figma/sequence_ko.svg" alt="Event Sequence" width="88%"> </p>
-Policy (LinUCB)
-<p align="center"> <img src="docs/figma/linucb_state_ko.svg" alt="LinUCB Policy State" width="78%"> </p>
-Key Metrics
-Rate (bytes/sec at broker), AoI, MAE
-Target: Rate↓, AoI↓, MAE↑ bounded
+## Data Flow
+<p align="center">
+  <img src="docs/figma/sequence_ko.svg" alt="Event Sequence" width="88%">
+</p>
 
-Quick Start
-bash
-코드 복사
+## Policy (LinUCB)
+<p align="center">
+  <img src="docs/figma/linucb_state_ko.svg" alt="LinUCB Policy State" width="78%">
+</p>
+
+## Key Metrics
+- **Rate** (bytes/sec at broker), **AoI**, **MAE**  
+**Target**: **Rate↓**, **AoI↓**, **MAE↑** bounded
+
+## Quick Start
+```bash
 sudo apt update && sudo apt full-upgrade -y
 sudo apt install -y mosquitto mosquitto-clients iproute2 python3-venv python3-dev build-essential libportaudio2
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 sudo systemctl enable mosquitto && sudo systemctl start mosquitto
-Run Order
-bash
-코드 복사
+```
+
+## Run Order
+```bash
 python -m link.shaper.tc_profiles apply lo slow_10kbps
 python -m collector.collector
 python -m edge.edge_daemon --mode periodic
 python -m edge.edge_daemon --mode fixed --tau_mic 3.0 --tau_temp 0.2
 python -m edge.edge_daemon --mode adaptive --arms configs/policy.yaml
 python -m collector.analyze --input data/ --out results/
-Configuration
-See configs/ YAML files to change experiment settings without touching code.
+```
 
-Repository Layout
-bash
-코드 복사
+## Configuration
+See `configs/` YAML files to change experiment settings without touching code.
+
+## Repository Layout
+```
 common/  edge/  collector/  link/  experiments/  configs/  docs/figma/  data/  logs/  .github/
-7‑week Roadmap
-W1: Metrics/profiles freeze; collector pipeline
+```
 
-W2: Baseline (periodic) & dashboard
+## 7‑week Roadmap
+- W1: Metrics/profiles freeze; collector pipeline  
+- W2: Baseline (periodic) & dashboard  
+- W3: Fixed‑τ ETS; report v1  
+- W4–W5: LinUCB & guardrail tests  
+- W6: Repeats & Pareto  
+- W7: UI integration & demo
 
-W3: Fixed‑τ ETS; report v1
+## Quality Gates
+- Topic/schema validations; QoS1 de‑dup; outbox recovery (0 loss)  
+- 3 profiles × 3 modes × ≥3 runs; AoI (mean/P95), MAE, Rate summary  
+- Pareto chart & table; README/diagrams/scripts in sync
 
-W4–W5: LinUCB & guardrail tests
-
-W6: Repeats & Pareto
-
-W7: UI integration & demo
-
-Quality Gates
-Topic/schema validations; QoS1 de‑dup; outbox recovery (0 loss)
-
-3 profiles × 3 modes × ≥3 runs; AoI (mean/P95), MAE, Rate summary
-
-Pareto chart & table; README/diagrams/scripts in sync
-
-Contributing
-bash
-코드 복사
+## Contributing
+```bash
 pip install -e .[dev]
 ruff . && pytest -q
-License
+```
+
+## License
 TBD
 
-부록 · Appendix
-Pipeline Diagram (Optional)
+---
 
-<p align="center"> <img src="docs/figma/pipeline_ko.svg" alt="Pipeline Diagram" width="86%"> </p>
-makefile
-코드 복사
-::contentReference[oaicite:0]{index=0}
+## 부록 · Appendix
+- **Pipeline Diagram (Optional)**  
+  <p align="center">
+    <img src="docs/figma/pipeline_ko.svg" alt="Pipeline Diagram" width="86%">
+  </p>
