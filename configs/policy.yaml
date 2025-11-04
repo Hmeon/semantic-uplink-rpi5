@@ -1,0 +1,12 @@
+# 정책/팔(arms) 정의 — (tau, kbits) 조합
+arms:
+  - { tau: 1.5, kbits: 6 }
+  - { tau: 3.0, kbits: 8 }
+  - { tau: 6.0, kbits: 10 }
+reward:
+  alpha: 1.0   # AoI 가중
+  beta:  1.0   # MAE 가중
+  gamma: 0.5   # 전송량 가중
+safety:
+  aoi_max_ms: 5000
+  mae_max: 2.0

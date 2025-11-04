@@ -1,0 +1,16 @@
+# 디바이스/센서 설정
+device_id: rpi5a
+sensors:
+  mic:
+    frame_ms: 100
+    samplerate: 16000
+    normalize: true
+  temp:
+    period_hz: 1
+ui:
+  enabled: true
+  backend: "lcd"   # lcd | console
+mqtt:
+  host: localhost
+  port: 1883
+  base_topic: "edge"

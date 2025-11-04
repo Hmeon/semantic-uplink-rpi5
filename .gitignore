@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 cat > .gitignore <<'EOF'
 # Python
 __pycache__/
@@ -28,3 +29,32 @@ Thumbs.db
 infra/mosquitto/data/
 infra/mosquitto/log/
 EOF
+=======
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+.env
+
+# Data & logs
+data/raw/*
+data/processed/*
+!data/**/.gitkeep
+logs/**/*
+!logs/**/.gitkeep
+
+# OS / IDE
+.DS_Store
+.vscode/
+.idea/
+
+# Build artifacts
+dist/
+build/
+*.parquet
+*.sqlite
+*.db
+>>>>>>> 97afa74 (chore: scaffold semantic-uplink-rpi5 (edge/collector/link/common + CI))

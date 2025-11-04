@@ -1,0 +1,11 @@
+# tc/netem/tbf 프로파일 정의
+profiles:
+  slow_10kbps:
+    tbf:   "tbf rate 10kbit burst 4kbit limit 4k"
+    netem: "netem delay 300ms loss 3%"
+  delay_loss:
+    tbf:   "tbf rate 100kbit burst 16kbit limit 32k"
+    netem: "netem delay 500ms loss 8% reorder 10%"
+  cellular_var:
+    tbf:   "tbf rate 200kbit burst 32kbit limit 64k"
+    netem: "netem delay 120ms loss 2%"
