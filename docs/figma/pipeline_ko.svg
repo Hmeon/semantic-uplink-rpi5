@@ -1,0 +1,83 @@
+<svg width="1600" height="900" viewBox="0 0 1600 900" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <!-- 스타일 정의: 한글 가독성을 위해 고딕형 글꼴(시스템 기본 상속) 사용 -->
+    <style>
+      .title { font: 700 48px/1.2 'Sans Serif', 'Noto Sans CJK KR', sans-serif; fill:#0f172a; }
+      .label { font: 700 20px/1.35 'Sans Serif', 'Noto Sans CJK KR', sans-serif; fill:#0f172a; }
+      .sublabel { font: 500 16px/1.35 'Sans Serif', 'Noto Sans CJK KR', sans-serif; fill:#334155; }
+      .chip { font: 600 14px/1.3 'Sans Serif', 'Noto Sans CJK KR', sans-serif; fill:#0f172a; }
+      .card { rx:16; stroke:#1f2937; stroke-opacity:.18; stroke-width:2; }
+      .card-fill-blue    { fill:#B7E3F6; }
+      .card-fill-amber   { fill:#FBE3A2; }
+      .card-fill-pink    { fill:#F8C7D0; }
+      .card-fill-green   { fill:#BFE6C7; }
+      .card-fill-orange  { fill:#F9C39B; }
+      .card-fill-indigo  { fill:#C9C7F3; }
+      .card-fill-ui      { fill:#D8F2D6; }
+    </style>
+    <!-- 화살표 머리 정의 -->
+    <marker id="arrow" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto">
+      <path d="M0,0 L14,7 L0,14 z" fill="#334155" />
+    </marker>
+    <marker id="arrowLight" markerWidth="14" markerHeight="14" refX="11" refY="7" orient="auto">
+      <path d="M0,0 L14,7 L0,14 z" fill="#64748b" />
+    </marker>
+  </defs>
+  <!-- 제목 -->
+  <text class="title" x="800" y="110" text-anchor="middle">AIoT 의미전송 파이프라인</text>
+  <!-- 파이프라인 노드: 센서, 엣지 센서, 정책 에이전트, 업로더, 링크 셰이퍼, MQTT 브로커, 수집기 -->
+  <!-- 카드 크기: w=180 h=110, y=220, x 좌표는 80 + 212*n -->
+  <!-- 센서 -->
+  <rect class="card card-fill-blue" x="80" y="220" width="180" height="110"/>
+  <text class="label" x="170" y="260" text-anchor="middle">센서</text>
+  <text class="sublabel" x="170" y="286" text-anchor="middle">마이크 RMS, 온도</text>
+  <!-- 엣지 센서 -->
+  <rect class="card card-fill-amber" x="292" y="220" width="180" height="110"/>
+  <text class="label" x="382" y="260" text-anchor="middle">엣지 센서</text>
+  <text class="sublabel" x="382" y="286" text-anchor="middle">샘플링 &amp; 예측</text>
+  <!-- 정책 에이전트 -->
+  <rect class="card card-fill-pink" x="504" y="220" width="180" height="110"/>
+  <text class="label" x="594" y="260" text-anchor="middle">정책 에이전트</text>
+  <text class="sublabel" x="594" y="286" text-anchor="middle">LinUCB (τ, k 적응)</text>
+  <!-- 업로더 -->
+  <rect class="card card-fill-green" x="716" y="220" width="180" height="110"/>
+  <text class="label" x="806" y="260" text-anchor="middle">업로더</text>
+  <text class="sublabel" x="806" y="286" text-anchor="middle">MQTT 클라이언트</text>
+  <!-- 링크 셰이퍼 -->
+  <rect class="card card-fill-orange" x="928" y="220" width="180" height="110"/>
+  <text class="label" x="1018" y="260" text-anchor="middle">링크 셰이퍼</text>
+  <text class="sublabel" x="1018" y="286" text-anchor="middle">tc 프로파일</text>
+  <!-- MQTT 브로커 -->
+  <rect class="card card-fill-indigo" x="1140" y="220" width="180" height="110"/>
+  <text class="label" x="1230" y="260" text-anchor="middle">MQTT 브로커</text>
+  <text class="sublabel" x="1230" y="286" text-anchor="middle">모스키토</text>
+  <!-- 수집기 -->
+  <rect class="card card-fill-blue" x="1352" y="220" width="180" height="110"/>
+  <text class="label" x="1442" y="260" text-anchor="middle">수집기</text>
+  <text class="sublabel" x="1442" y="286" text-anchor="middle">AoI/MSE/Rate 계산</text>
+  <!-- UI: 엣지 상태 표시 및 버튼 -->
+  <rect class="card card-fill-ui" x="420" y="420" width="460" height="160"/>
+  <text class="label" x="650" y="472" text-anchor="middle">UI</text>
+  <text class="sublabel" x="650" y="500" text-anchor="middle">LCD, 버튼</text>
+  <!-- UI 상태 칩 예시 -->
+  <rect x="535" y="525" width="230" height="34" rx="17" fill="#ffffff" stroke="#94a3b8" stroke-opacity="0.6"/>
+  <text class="chip" x="650" y="548" text-anchor="middle">정책 τ=3.0 • k=8 • AoI 1.2s</text>
+  <!-- 가로 화살표: 노드 간 연결 -->
+  <g stroke="#334155" stroke-width="3" fill="none" marker-end="url(#arrow)">
+    <line x1="260"  y1="275" x2="292"  y2="275"/>
+    <line x1="472"  y1="275" x2="504"  y2="275"/>
+    <line x1="684"  y1="275" x2="716"  y2="275"/>
+    <line x1="896"  y1="275" x2="928"  y2="275"/>
+    <line x1="1108" y1="275" x2="1140" y2="275"/>
+    <line x1="1320" y1="275" x2="1352" y2="275"/>
+  </g>
+  <!-- 대각선 화살표: 엣지 센서/정책 에이전트 → UI -->
+  <g stroke="#64748b" stroke-width="3" fill="none" marker-end="url(#arrowLight)" stroke-dasharray="8,6">
+    <line x1="382" y1="330" x2="550" y2="420"/>
+    <line x1="594" y1="330" x2="650" y2="420"/>
+  </g>
+  <!-- 하단 설명 -->
+  <text class="sublabel" x="800" y="830" text-anchor="middle" fill="#475569">
+    MQTT QoS1 • 오프라인 큐 • 안전 가드 (AoI_max, MAE_max)
+  </text>
+</svg>
