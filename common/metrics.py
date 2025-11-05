@@ -1,5 +1,5 @@
 # common/metrics.py
-# Python 3.10+
+# Python 3.10
 # 목적:
 # - AoI(평균/분위수) 연속시간 정의 기반 계산
 # - MQTT v3.1.1 PUBLISH 총 바이트(헤더 포함) 추정
