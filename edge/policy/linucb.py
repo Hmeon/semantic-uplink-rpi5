@@ -17,6 +17,14 @@ import numpy as np
 
 from common.schema import PolicyDecisionMsg, PolicyMode, SensorType, LinkProfile
 
+__all__ = [
+    "Arm",
+    "LinUCBConfig",
+    "PolicyState",
+    "LinUCBPolicy",
+    "LinUCB",
+]
+
 
 @dataclass(slots=True, frozen=True)
 class Arm:
@@ -251,3 +259,74 @@ class LinUCBPolicy:
         qn = float(max(0, s.q_len)) / 50.0  # 보수적 스케일(큐 50개≈1.0)
         x = np.array([1.0, aoi_n, res_n, resv_n, loss, qn], dtype=np.float64)
         return x
+
+
+class LinUCB:
+    """Backwards-compatible LinUCB variant for the lightweight unit tests."""
+
+    def __init__(
+        self,
+        arms: Sequence[tuple[float, int]] | Sequence[Arm],
+        d: int,
+        alpha: float = 0.7,
+        lambda_ridge: float = 1.0,
+    ) -> None:
+        if d <= 0:
+            raise ValueError("d must be positive")
+        if alpha <= 0:
+            raise ValueError("alpha must be positive")
+
+        self.arms: list[Arm] = [a if isinstance(a, Arm) else Arm(*a) for a in arms]
+        if not self.arms:
+            raise ValueError("arms must not be empty")
+
+        self.d = int(d)
+        self.alpha = float(alpha)
+        self.lambda_ridge = float(lambda_ridge)
+
+        self._A = [np.eye(self.d, dtype=np.float64) * self.lambda_ridge for _ in self.arms]
+        self._b = [np.zeros((self.d,), dtype=np.float64) for _ in self.arms]
+
+    def select(self, context: Sequence[float] | np.ndarray) -> tuple[float, int]:
+        x = np.asarray(context, dtype=np.float64)
+        if x.shape != (self.d,):
+            raise ValueError(f"context must have shape ({self.d},)")
+
+        best_idx = 0
+        best_score = -math.inf
+        for i, (A, b) in enumerate(zip(self._A, self._b)):
+            try:
+                theta = np.linalg.solve(A, b)
+            except np.linalg.LinAlgError:
+                theta = np.zeros_like(b)
+            try:
+                Ax = np.linalg.solve(A, x)
+                s = float(np.sqrt(max(0.0, float(np.dot(x, Ax)))))
+            except np.linalg.LinAlgError:
+                s = 0.0
+            score = float(np.dot(theta, x) + self.alpha * s)
+            if score > best_score:
+                best_score = score
+                best_idx = i
+        arm = self.arms[best_idx]
+        return (arm.tau, arm.kbits)
+
+    def update(
+        self,
+        arm: tuple[float, int] | Arm,
+        reward: float,
+        context: Sequence[float] | np.ndarray,
+    ) -> None:
+        x = np.asarray(context, dtype=np.float64)
+        if x.shape != (self.d,):
+            raise ValueError(f"context must have shape ({self.d},)")
+
+        if not isinstance(arm, Arm):
+            arm = Arm(*arm)
+        try:
+            idx = next(i for i, a in enumerate(self.arms) if a == arm)
+        except StopIteration as exc:  # pragma: no cover - defensive branch
+            raise ValueError("arm not part of the policy") from exc
+
+        self._A[idx] += np.outer(x, x)
+        self._b[idx] += float(reward) * x

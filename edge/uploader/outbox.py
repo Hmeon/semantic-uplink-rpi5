@@ -70,6 +70,25 @@ class Outbox:
         _LOG.info("Outbox opened: %s (ack_timeout_s=%.1f, backoff_base_s=%.1f, cap_s=%.1f)",
                   db_path, ack_timeout_s, backoff_base_s, backoff_cap_s)
 
+    # ---- Compatibility helpers (legacy API expected by GitHub unit tests) ----
+
+    def setup(self) -> None:
+        """Ensure the database schema exists (idempotent)."""
+        self._bootstrap_db()
+
+    def pending(self) -> int:
+        """Return the number of queued or inflight messages."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute("SELECT COUNT(*) FROM messages WHERE status IN (0, 1)")
+            (count,) = cur.fetchone()
+            cur.close()
+        return int(count)
+
+    def mark_done(self, msg_id: int) -> bool:
+        """Alias for :meth:`ack` maintained for backwards compatibility."""
+        return self.ack(int(msg_id))
+
     # ---------------- 내부: DB 구성 ----------------
 
     def _bootstrap_db(self) -> None:
