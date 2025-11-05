@@ -1,6 +1,7 @@
 """시간/AoI/타임스탬프 유틸리티 스켈레톤."""
+
 from __future__ import annotations
-import time
+
 from datetime import datetime, timezone
 
 ISO_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"

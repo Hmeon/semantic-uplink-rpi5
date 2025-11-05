@@ -1,5 +1,7 @@
 import numpy as np
+
 from edge.policy.linucb import LinUCB
+
 
 def test_linucb_construct_select():
     arms = [(1.5, 6), (3.0, 8)]

@@ -14,26 +14,27 @@ import os
 import signal
 import sys
 import time
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterator, Optional, Tuple
 
 __all__ = ["TempSensor", "Sample"]
 
 
 @dataclass
 class Sample:
-    ts_ns: int            # 측정 시각(ns, epoch; tick 직후)
-    seq: int              # per-device 단조 증가 시퀀스
-    celsius: float        # 보정/스케일 적용 후 최종 온도(℃)
-    source: str           # "w1" | "sysfs" | "mock"
-    valid: bool           # 해당 측정의 유효성(읽기/CRC/범위)
-    raw_path: Optional[str] = None  # 읽기 경로(디버그)
+    ts_ns: int  # 측정 시각(ns, epoch; tick 직후)
+    seq: int  # per-device 단조 증가 시퀀스
+    celsius: float  # 보정/스케일 적용 후 최종 온도(℃)
+    source: str  # "w1" | "sysfs" | "mock"
+    valid: bool  # 해당 측정의 유효성(읽기/CRC/범위)
+    raw_path: str | None = None  # 읽기 경로(디버그)
 
 
 class _BaseSource:
     source_name = "base"
-    raw_path: Optional[str] = None
-    def read_celsius(self) -> Tuple[Optional[float], bool]:
+    raw_path: str | None = None
+
+    def read_celsius(self) -> tuple[float | None, bool]:
         """온도(℃), valid를 반환. 실패 시 (None, False)."""
         raise NotImplementedError
     def close(self) -> None:
@@ -44,7 +45,7 @@ class _W1Source(_BaseSource):
     """1-Wire DS18B20: /sys/bus/w1/devices/28-*/w1_slave"""
     source_name = "w1"
 
-    def __init__(self, w1_path: Optional[str] = None):
+    def __init__(self, w1_path: str | None = None):
         if w1_path:
             self.raw_path = w1_path
         else:
@@ -54,9 +55,9 @@ class _W1Source(_BaseSource):
                 raise FileNotFoundError("No DS18B20 (w1) device found under /sys/bus/w1/devices")
             self.raw_path = candidates[0]
 
-    def read_celsius(self) -> Tuple[Optional[float], bool]:
+    def read_celsius(self) -> tuple[float | None, bool]:
         try:
-            with open(self.raw_path, "r", encoding="ascii", errors="strict") as f:
+            with open(self.raw_path, encoding="ascii", errors="strict") as f:
                 lines = f.read().strip().splitlines()
             if len(lines) < 2:
                 return (None, False)
@@ -79,7 +80,7 @@ class _SysfsSource(_BaseSource):
     """
     source_name = "sysfs"
 
-    def __init__(self, sysfs_path: Optional[str] = None):
+    def __init__(self, sysfs_path: str | None = None):
         if sysfs_path:
             self.raw_path = sysfs_path
         else:
@@ -93,9 +94,9 @@ class _SysfsSource(_BaseSource):
                     raise FileNotFoundError("No sysfs thermal/hwmon temperature input found")
                 self.raw_path = hw[0]
 
-    def read_celsius(self) -> Tuple[Optional[float], bool]:
+    def read_celsius(self) -> tuple[float | None, bool]:
         try:
-            with open(self.raw_path, "r", encoding="ascii", errors="strict") as f:
+            with open(self.raw_path, encoding="ascii", errors="strict") as f:
                 s = f.read().strip()
             # 값 스케일: milli‑C 또는 ℃
             v = float(s)
@@ -116,7 +117,7 @@ class _MockSource(_BaseSource):
         self._amp = amp_c
         self._period = max(1.0, period_s)
 
-    def read_celsius(self) -> Tuple[Optional[float], bool]:
+    def read_celsius(self) -> tuple[float | None, bool]:
         t = time.monotonic() - self._t0
         val = self._base + self._amp * math.sin(2 * math.pi * t / self._period)
         # ±0.05°C 정도의 미세 노이즈
@@ -157,7 +158,7 @@ class TempSensor:
         self._last_value: float | None = None  # 읽기 실패 시 유지용
         # 백엔드 선택
         self._src: _BaseSource
-        self._backend_name = None
+        self._backend_name: str | None = None
         self._src = self._select_backend(backend, w1_path=w1_path, sysfs_path=sysfs_path)
         self._backend_name = self._src.source_name
         # 시그널 안전 종료
@@ -219,9 +220,11 @@ class TempSensor:
             # 보정/스케일
             val_c = self.c_scale * val_c + self.c_offset
             # 범위 체크(옵션)
-            if valid and (self.min_c is not None and val_c < self.min_c or
-                          self.max_c is not None and val_c > self.max_c):
-                valid = False  # 비정상 값
+            if valid:
+                below_min = self.min_c is not None and val_c < self.min_c
+                above_max = self.max_c is not None and val_c > self.max_c
+                if below_min or above_max:
+                    valid = False  # 비정상 값
             # 전 샘플 유지 정책: invalid면 last_value 유지(값 자체는 유지하되 플래그로 식별)
             if not valid and self._last_value is not None:
                 val_c = self._last_value
@@ -246,21 +249,29 @@ class TempSensor:
 
     # ---------------- 기타 ----------------
 
-    def _handle_signal(self, signum, frame) -> None:
+    def _handle_signal(self, signum: int, frame) -> None:  # pragma: no cover - signal handler
         try:
             self.close()
         finally:
             raise SystemExit(0)
 
     def __repr__(self) -> str:
-        return (f"TempSensor(device_id={self.device_id!r}, hz={self.sample_hz}, "
-                f"backend={self._backend_name}, path={getattr(self._src, 'raw_path', None)!r})")
+        raw_path = getattr(self._src, "raw_path", None)
+        return (
+            "TempSensor("
+            f"device_id={self.device_id!r}, "
+            f"hz={self.sample_hz}, "
+            f"backend={self._backend_name}, "
+            f"path={raw_path!r})"
+        )
 
 
 # ---------------- CLI(현장 점검용) ----------------
 def main():
     import argparse
-    p = argparse.ArgumentParser(description="1Hz Temperature sensor stream (DS18B20/sysfs/mock)")
+    p = argparse.ArgumentParser(
+        description="1Hz Temperature sensor stream (DS18B20/sysfs/mock)"
+    )
     p.add_argument("--device-id", required=True)
     p.add_argument("--backend", choices=["auto", "w1", "sysfs", "mock"], default="auto")
     p.add_argument("--sample-hz", type=float, default=1.0)
@@ -289,7 +300,15 @@ def main():
     try:
         for s in sensor.stream(duration_s=args.duration_s):
             v = f"{s.celsius:6.3f}" if s.celsius == s.celsius else "  NaN "  # NaN 출력 처리
-            print(f"[temp] ts={s.ts_ns} seq={s.seq:6d} T={v} °C valid={s.valid} src={s.source} path={s.raw_path}")
+            print(
+                "[temp] "
+                f"ts={s.ts_ns} "
+                f"seq={s.seq:6d} "
+                f"T={v} °C "
+                f"valid={s.valid} "
+                f"src={s.source} "
+                f"path={s.raw_path}"
+            )
             count += 1
     finally:
         sensor.close()

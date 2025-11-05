@@ -60,7 +60,7 @@ class QResult:
     step: float       # 양자화 간격(Δ)
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class UniformQuantizer:
     """
     균일(mid-tread) 양자화기. vmin..vmax 구간을 (2^kbits)개의 격자점으로 균등 분할.
@@ -70,6 +70,23 @@ class UniformQuantizer:
     vmin: float
     vmax: float
     kbits: int
+
+    def __init__(self, vmin: float | None = None, vmax: float | None = None, kbits: int | None = None, **kwargs) -> None:
+        if vmin is None and "xmin" in kwargs:
+            vmin = kwargs.pop("xmin")
+        if vmax is None and "xmax" in kwargs:
+            vmax = kwargs.pop("xmax")
+        if kbits is None and "bits" in kwargs:
+            kbits = kwargs.pop("bits")
+        if kwargs:
+            raise TypeError(f"unexpected keyword arguments: {', '.join(sorted(kwargs))}")
+        if vmin is None or vmax is None or kbits is None:
+            raise TypeError("vmin, vmax and kbits are required")
+
+        object.__setattr__(self, "vmin", float(vmin))
+        object.__setattr__(self, "vmax", float(vmax))
+        object.__setattr__(self, "kbits", int(kbits))
+        self.__post_init__()
 
     def __post_init__(self):
         if not (math.isfinite(self.vmin) and math.isfinite(self.vmax)):
