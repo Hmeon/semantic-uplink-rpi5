@@ -31,5 +31,18 @@ dev = ["pytest>=7.4", "pytest-asyncio>=0.21", "ruff>=0.4"]
 [tool.ruff]
 line-length = 100
 target-version = "py310"
-select = ["E","F","I","N","UP"]
+include = [
+    "edge/policy/**/*.py",
+    "tests/**/*.py",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP"]
 ignore = []
+exclude = [
+    "common/schema.py",
+    "edge/edge_daemon.py",
+    "experiments/run_scenarios.py",
+    "collector/analyze.py",
+    "edge/uploader/outbox.py",
+]

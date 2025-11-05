@@ -1,5 +1,6 @@
 import pytest
 
+
 @pytest.mark.asyncio
 async def test_outbox_api_exists():
     from edge.uploader.outbox import Outbox

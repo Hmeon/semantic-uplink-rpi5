@@ -8,14 +8,13 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple, List
-
 import math
-import time
+from collections.abc import Sequence
+from dataclasses import dataclass
+
 import numpy as np
 
-from common.schema import PolicyDecisionMsg, PolicyMode, SensorType, LinkProfile
+from common.schema import LinkProfile, PolicyDecisionMsg, SensorType
 
 __all__ = [
     "Arm",
@@ -39,7 +38,7 @@ class LinUCBConfig:
     profile: LinkProfile
 
     # 팔 그리드 (명시하지 않으면 센서별 권장 디폴트 사용; 12~18개 범위)
-    arms: Optional[Sequence[Arm]] = None
+    arms: Sequence[Arm] | None = None
 
     # LinUCB 하이퍼파라미터
     alpha_ucb: float = 0.75     # 탐색 강도(Confidence width)
@@ -65,7 +64,7 @@ class LinUCBConfig:
     warmup_per_arm: int = 1
 
     # 세이프 팔 (None이면 자동: tau 최소, kbits 최대)
-    safe_arm: Optional[Arm] = None
+    safe_arm: Arm | None = None
 
 
 @dataclass(slots=True, frozen=True)
@@ -78,7 +77,7 @@ class PolicyState:
     q_len: int        # >=0
 
 
-def _default_arms(sensor: SensorType) -> List[Arm]:
+def _default_arms(sensor: SensorType) -> list[Arm]:
     if sensor == SensorType.MIC_RMS:
         # 4×3=12개: τ∈{1.5,2.5,3.5,4.5} dB, k∈{4,6,8}
         taus = [1.5, 2.5, 3.5, 4.5]
@@ -105,7 +104,7 @@ class LinUCBPolicy:
 
     def __init__(self, cfg: LinUCBConfig):
         self.cfg = cfg
-        self.arms: List[Arm] = list(cfg.arms) if cfg.arms is not None else _default_arms(cfg.sensor)
+        self.arms: list[Arm] = list(cfg.arms) if cfg.arms is not None else _default_arms(cfg.sensor)
         if not self.arms:
             raise ValueError("arms must not be empty")
 
@@ -120,21 +119,32 @@ class LinUCBPolicy:
             # tau 최소, kbits 최대 조합
             tau_min = min(a.tau for a in self.arms)
             k_max = max(a.kbits for a in self.arms)
-            safe_idx = next(i for i, a in enumerate(self.arms) if a.tau == tau_min and a.kbits == k_max)
+            safe_idx = next(
+                i for i, a in enumerate(self.arms) if a.tau == tau_min and a.kbits == k_max
+            )
         else:
-            safe_idx = next((i for i, a in enumerate(self.arms)
-                             if (abs(a.tau - cfg.safe_arm.tau) < 1e-9 and a.kbits == cfg.safe_arm.kbits)), None)
+            safe_idx = next(
+                (
+                    i
+                    for i, a in enumerate(self.arms)
+                    if (
+                        abs(a.tau - cfg.safe_arm.tau) < 1e-9
+                        and a.kbits == cfg.safe_arm.kbits
+                    )
+                ),
+                None,
+            )
             if safe_idx is None:
                 raise ValueError("safe_arm not found in arms grid")
         self._safe_idx = safe_idx
 
         # 직전 결정(학습용) 버퍼
-        self._last_x: Optional[np.ndarray] = None
-        self._last_arm_idx: Optional[int] = None
+        self._last_x: np.ndarray | None = None
+        self._last_arm_idx: int | None = None
 
     # ---------------- 공개 API ----------------
 
-    def decide(self, state: PolicyState) -> Tuple[Tuple[float, int], PolicyDecisionMsg]:
+    def decide(self, state: PolicyState) -> tuple[tuple[float, int], PolicyDecisionMsg]:
         """
         현재 상태에 대한 (τ,k) 결정을 수행하고 PolicyDecisionMsg를 반환한다.
         - reward 필드는 0.0으로 기록(실제 보상은 observe_outcome에서 적용)
@@ -182,17 +192,22 @@ class LinUCBPolicy:
         aoi_n = float(aoi_ms) / max(1e-9, self.cfg.aoi_scale_ms)
         mae_n = float(mae) / max(1e-9, self.cfg.mae_scale)
         rate_n = float(rate_bps) / max(1e-9, self.cfg.rate_scale_bps)
-        r = - (self.cfg.w_aoi * aoi_n + self.cfg.w_mae * mae_n + self.cfg.w_rate * rate_n)
+        r = -(
+            self.cfg.w_aoi * aoi_n
+            + self.cfg.w_mae * mae_n
+            + self.cfg.w_rate * rate_n
+        )
 
         # LinUCB 업데이트
         i = self._last_arm_idx
         x = self._last_x
-        A = self._A[i]; b = self._b[i]
+        a_mat = self._A[i]
+        b_vec = self._b[i]
         # A ← A + x xᵀ ; b ← b + r x
-        A += np.outer(x, x)
-        b += r * x
-        self._A[i] = A
-        self._b[i] = b
+        a_mat += np.outer(x, x)
+        b_vec += r * x
+        self._A[i] = a_mat
+        self._b[i] = b_vec
 
         # 버퍼 비움(한 결정-한 업데이트 보장)
         self._last_x = None
@@ -208,17 +223,17 @@ class LinUCBPolicy:
         """
         out = []
         for i, a in enumerate(self.arms):
-            A = self._A[i]
-            b = self._b[i]
+            a_mat = self._A[i]
+            b_vec = self._b[i]
             try:
-                theta = np.linalg.solve(A, b)
+                theta = np.linalg.solve(a_mat, b_vec)
             except np.linalg.LinAlgError:
-                theta = np.zeros_like(b)
+                theta = np.zeros_like(b_vec)
             out.append({
                 "arm": {"tau": a.tau, "kbits": a.kbits},
                 "counts": self._counts[i],
                 "theta": theta.tolist(),
-                "A_diag": np.diag(A).tolist(),
+                "A_diag": np.diag(a_mat).tolist(),
             })
         return out
 
@@ -233,16 +248,16 @@ class LinUCBPolicy:
 
         best_idx = 0
         best_score = -1e100
-        for i, (A, b) in enumerate(zip(self._A, self._b)):
+        for i, (a_mat, b_vec) in enumerate(zip(self._A, self._b)):
             # θ̂ = A⁻¹b (stable: solve)
             try:
-                theta = np.linalg.solve(A, b)
+                theta = np.linalg.solve(a_mat, b_vec)
             except np.linalg.LinAlgError:
-                theta = np.zeros_like(b)
+                theta = np.zeros_like(b_vec)
             # 탐색항: s = sqrt(xᵀ A⁻¹ x) → solve(A, x)로 계산
             try:
-                Ax = np.linalg.solve(A, x)
-                s = float(np.sqrt(max(0.0, float(np.dot(x, Ax)))))
+                a_x = np.linalg.solve(a_mat, x)
+                s = float(np.sqrt(max(0.0, float(np.dot(x, a_x)))))
             except np.linalg.LinAlgError:
                 s = 0.0
             score = float(np.dot(theta, x) + self.cfg.alpha_ucb * s)
@@ -294,14 +309,14 @@ class LinUCB:
 
         best_idx = 0
         best_score = -math.inf
-        for i, (A, b) in enumerate(zip(self._A, self._b)):
+        for i, (a_mat, b_vec) in enumerate(zip(self._A, self._b)):
             try:
-                theta = np.linalg.solve(A, b)
+                theta = np.linalg.solve(a_mat, b_vec)
             except np.linalg.LinAlgError:
-                theta = np.zeros_like(b)
+                theta = np.zeros_like(b_vec)
             try:
-                Ax = np.linalg.solve(A, x)
-                s = float(np.sqrt(max(0.0, float(np.dot(x, Ax)))))
+                a_x = np.linalg.solve(a_mat, x)
+                s = float(np.sqrt(max(0.0, float(np.dot(x, a_x)))))
             except np.linalg.LinAlgError:
                 s = 0.0
             score = float(np.dot(theta, x) + self.alpha * s)

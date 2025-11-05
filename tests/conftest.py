@@ -5,7 +5,6 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-
 # Ensure the project root is on ``sys.path`` so tests can import local packages without
 # requiring an editable install. This mirrors the layout on the GitHub runners and fixes
 # ModuleNotFoundError issues raised during test collection.

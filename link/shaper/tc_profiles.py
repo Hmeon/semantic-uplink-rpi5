@@ -16,36 +16,53 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, Optional
+
 
 # ---------- 프로파일 정의 (동결안과 동일) ----------
 @dataclass(frozen=True)
 class TcProfile:
     name: str
     # egress 기준 속도(kbit); cellular_var는 None (토글 사용)
-    rate_kbit: Optional[int]
+    rate_kbit: int | None
     delay_ms: int
     jitter_ms: int
     loss_pct: float
     reorder_pct: float = 0.0
     # cellular_var 전용
-    low_kbit: Optional[int] = None
-    high_kbit: Optional[int] = None
+    low_kbit: int | None = None
+    high_kbit: int | None = None
     var_default_period_s: int = 30
 
-PROFILES: Dict[str, TcProfile] = {
+PROFILES: dict[str, TcProfile] = {
     # 10kbps, delay 300±50ms, loss 3%
     "slow_10kbps": TcProfile(
-        name="slow_10kbps", rate_kbit=10, delay_ms=300, jitter_ms=50, loss_pct=3.0, reorder_pct=0.0
+        name="slow_10kbps",
+        rate_kbit=10,
+        delay_ms=300,
+        jitter_ms=50,
+        loss_pct=3.0,
+        reorder_pct=0.0,
     ),
     # 100kbps, delay 500±100ms, loss 8%, reorder 10%
     "delay_loss": TcProfile(
-        name="delay_loss", rate_kbit=100, delay_ms=500, jitter_ms=100, loss_pct=8.0, reorder_pct=10.0
+        name="delay_loss",
+        rate_kbit=100,
+        delay_ms=500,
+        jitter_ms=100,
+        loss_pct=8.0,
+        reorder_pct=10.0,
     ),
     # 50↔200kbps 변동, delay 120±80ms, loss 2%
     "cellular_var": TcProfile(
-        name="cellular_var", rate_kbit=None, delay_ms=120, jitter_ms=80, loss_pct=2.0,
-        reorder_pct=0.0, low_kbit=50, high_kbit=200, var_default_period_s=30
+        name="cellular_var",
+        rate_kbit=None,
+        delay_ms=120,
+        jitter_ms=80,
+        loss_pct=2.0,
+        reorder_pct=0.0,
+        low_kbit=50,
+        high_kbit=200,
+        var_default_period_s=30,
     ),
 }
 
@@ -89,7 +106,10 @@ def _build_netem_args(p: TcProfile) -> str:
 def _apply_egress(iface: str, rate_kbit: int, netem_args: str) -> None:
     # HTB 루트 및 클래스(1:1), leaf에 netem 부착
     _run(f"tc qdisc replace dev {iface} root handle 1: htb default 1")
-    _run(f"tc class replace dev {iface} parent 1: classid 1:1 htb rate {rate_kbit}kbit ceil {rate_kbit}kbit")
+    _run(
+        f"tc class replace dev {iface} parent 1: classid 1:1 "
+        f"htb rate {rate_kbit}kbit ceil {rate_kbit}kbit"
+    )
     if netem_args:
         _run(f"tc qdisc replace dev {iface} parent 1:1 handle 10: netem {netem_args}")
     else:
@@ -120,14 +140,14 @@ def _apply_ingress(iface: str, rate_kbit: int, netem_args: str, ifb: str = "ifb0
 # ---------- 토글 스레드(셀룰러 변동 속도) ----------
 
 class _RateToggle:
-    def __init__(self, iface: str, ifb: Optional[str], low_kbit: int, high_kbit: int, period_s: int):
+    def __init__(self, iface: str, ifb: str | None, low_kbit: int, high_kbit: int, period_s: int):
         self.iface = iface
         self.ifb = ifb
         self.low_kbit = low_kbit
         self.high_kbit = high_kbit
         self.period_s = max(2, period_s)
         self._stop = threading.Event()
-        self._th: Optional[threading.Thread] = None
+        self._th: threading.Thread | None = None
         self._cur = "low"  # start low
 
     def start(self):
@@ -139,16 +159,25 @@ class _RateToggle:
                     sys.stderr.write(f"[tc] toggle error: {e}\n")
         self._th = threading.Thread(target=_loop, daemon=True)
         self._th.start()
-        print(f"[tc] rate toggle started: {self.low_kbit}↔{self.high_kbit} kbit every {self.period_s}s")
+        print(
+            "[tc] rate toggle started: "
+            f"{self.low_kbit}↔{self.high_kbit} kbit every {self.period_s}s"
+        )
 
     def _flip(self):
         self._cur = "high" if self._cur == "low" else "low"
         rate = self.high_kbit if self._cur == "high" else self.low_kbit
         # egress 변경
-        _run(f"tc class replace dev {self.iface} parent 1: classid 1:1 htb rate {rate}kbit ceil {rate}kbit")
+        _run(
+            f"tc class replace dev {self.iface} parent 1: classid 1:1 "
+            f"htb rate {rate}kbit ceil {rate}kbit"
+        )
         # ingress(ifb) 변경
         if self.ifb:
-            _run(f"tc class replace dev {self.ifb} parent 1: classid 1:1 htb rate {rate}kbit ceil {rate}kbit")
+            _run(
+                f"tc class replace dev {self.ifb} parent 1: classid 1:1 "
+                f"htb rate {rate}kbit ceil {rate}kbit"
+            )
         print(f"[tc] toggled rate -> {rate} kbit")
 
     def stop(self, timeout: float = 2.0):
@@ -160,19 +189,25 @@ class _RateToggle:
 
 # ---------- 외부 API ----------
 
-_toggle_registry: Dict[str, _RateToggle] = {}  # iface -> toggle
+_toggle_registry: dict[str, _RateToggle] = {}  # iface -> toggle
 
-def get_profiles() -> Dict[str, TcProfile]:
+def get_profiles() -> dict[str, TcProfile]:
     return dict(PROFILES)
 
-def apply_profile(iface: str, profile: str, both: bool = False, var_period_s: int | None = None) -> None:
+def apply_profile(
+    iface: str,
+    profile: str,
+    both: bool = False,
+    var_period_s: int | None = None,
+) -> None:
     """
     지정 인터페이스(iface)에 프로파일을 적용한다.
     both=True면 ifb0를 사용해 ingress에도 동일 제약을 건다.
     """
     _require_root()
     if profile not in PROFILES:
-        raise ValueError(f"unknown profile: {profile} (choices: {', '.join(PROFILES)})")
+        choices = ", ".join(PROFILES)
+        raise ValueError(f"unknown profile: {profile} (choices: {choices})")
     p = PROFILES[profile]
     netem_args = _build_netem_args(p)
 
@@ -199,8 +234,16 @@ def apply_profile(iface: str, profile: str, both: bool = False, var_period_s: in
         _toggle_registry.pop(iface, None)
 
     if p.name == "cellular_var":
-        period = var_period_s if var_period_s and var_period_s > 0 else p.var_default_period_s
-        toggler = _RateToggle(iface=iface, ifb=ifb_name, low_kbit=p.low_kbit, high_kbit=p.high_kbit, period_s=period)
+        period = (
+            var_period_s if var_period_s and var_period_s > 0 else p.var_default_period_s
+        )
+        toggler = _RateToggle(
+            iface=iface,
+            ifb=ifb_name,
+            low_kbit=p.low_kbit,
+            high_kbit=p.high_kbit,
+            period_s=period,
+        )
         toggler.start()
         _toggle_registry[iface] = toggler
 
@@ -262,7 +305,12 @@ def main():
     p_apply.add_argument("--iface", required=True)
     p_apply.add_argument("--profile", required=True, choices=list(PROFILES.keys()))
     p_apply.add_argument("--both", action="store_true", help="apply to ingress via ifb0 as well")
-    p_apply.add_argument("--var-period", type=int, default=None, help="period(s) for cellular_var toggle")
+    p_apply.add_argument(
+        "--var-period",
+        type=int,
+        default=None,
+        help="period(s) for cellular_var toggle",
+    )
 
     p_clear = sub.add_parser("clear", help="clear shaper")
     p_clear.add_argument("--iface", required=True)
