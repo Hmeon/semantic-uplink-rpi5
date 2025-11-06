@@ -203,16 +203,50 @@ profiles:
 ---
 
 ## 폴더 구조 · Repository Layout
-```
-common/          # 스키마·양자화·시간/MQTT 유틸
-edge/            # 센서→예측→정책→업로더→UI
-collector/       # 브로커 구독→지표 계산/저장
-link/            # tc 기반 링크 셰이퍼
-experiments/     # 자동실험 스크립트
-configs/         # device/policy/link 설정
-docs/figma/      # (이 README가 임베드한) 다이어그램
-data/, logs/     # 실험 산출물
-.github/         # CI 워크플로
+```text
+.
+├── common/
+│   ├── discord_webhook.py     # Discord 웹훅 클라이언트 & 메시지 포맷터
+│   ├── metrics.py             # AoI·MAE·전송량 계산 유틸
+│   ├── mqttutil.py            # MQTT QoS1 업로드 & Outbox 헬퍼
+│   ├── quantize.py            # 센서 값 양자화/복원 도구
+│   └── schema.py              # 이벤트/정책 Pydantic 스키마
+├── edge/
+│   ├── edge_daemon.py         # 센서→정책→업로더 제어 메인 엔트리포인트
+│   ├── sensors/               # 마이크 RMS·온도 센서 파이프라인
+│   ├── predict/               # EWMA/AR(1) 등 예측기 구현
+│   ├── policy/                # 고정τ·LinUCB 정책 로직
+│   ├── uploader/              # MQTT 업로더·재전송 Outbox
+│   └── ui/                    # LCD·콘솔 UI 어댑터
+├── collector/
+│   ├── collector.py           # 브로커 구독·수집·저장 루프
+│   ├── analyze.py             # 지표 분석 CLI & Discord 알림 옵션
+│   └── store_sqlite.py        # 경량 SQLite 스토리지 백엔드
+├── link/
+│   └── shaper/
+│       └── tc_profiles.py     # tc/netem 링크 제약 프로파일 적용기
+├── experiments/
+│   └── run_scenarios.py       # 시나리오 일괄 실행 스크립트
+├── scripts/
+│   ├── apply_profile.sh       # tc 프로파일 CLI 래퍼
+│   ├── start_collector.sh     # 수집기 실행 스크립트
+│   └── start_edge.sh          # 엣지 데몬 실행 스크립트
+├── tests/
+│   ├── integration/
+│   │   └── test_end_to_end_placeholder.py  # 엔드투엔드 자리표시자
+│   └── unit/
+│       ├── test_discord_webhook.py         # Discord 웹훅 단위 테스트
+│       ├── test_linucb.py                  # LinUCB 정책 검증
+│       ├── test_outbox.py                  # MQTT Outbox 신뢰성 테스트
+│       └── test_quantize.py                # 양자화 정확도 테스트
+├── configs/                   # 디바이스·정책·링크 YAML 설정
+├── docs/
+│   └── figma/                 # 아키텍처/시퀀스 다이어그램 자산
+├── infra/
+│   └── mosquitto/             # 브로커 설정 템플릿
+├── models/                    # (추후 확장용) ML 모델 아티팩트
+├── data/, logs/               # 실험 결과 & 런타임 로그 출력
+└── requirements.txt, pyproject.toml 등 프로젝트 메타데이터
 ```
 
 ---
@@ -311,8 +345,21 @@ python -m collector.analyze --input data/ --out results/
 See `configs/` YAML files to change experiment settings without touching code.
 
 ## Repository Layout
-```
-common/  edge/  collector/  link/  experiments/  configs/  docs/figma/  data/  logs/  .github/
+```text
+.
+├── common/ — shared helpers (Discord webhook, metrics, MQTT outbox, quantizers)
+├── edge/ — sensor ingestion, predictors, policies, uploader, and UIs
+├── collector/ — MQTT subscriber, analytics CLI, and storage adapters
+├── link/shaper/ — tc/netem profile orchestration utilities
+├── experiments/ — batch scenario runner for reproducible studies
+├── scripts/ — convenience launchers for edge/collector/link shaping
+├── tests/ — unit & integration coverage for policies, quantization, webhooks, etc.
+├── configs/ — reproducible YAML profiles for devices, policies, and link shapes
+├── docs/figma/ — architecture and sequence diagrams embedded in this README
+├── infra/mosquitto/ — broker configuration templates
+├── models/ — (reserved) ML artefacts and checkpoints
+├── data/, logs/ — experiment outputs and runtime diagnostics
+└── requirements.txt, pyproject.toml — Python dependencies & packaging metadata
 ```
 
 ## 7‑week Roadmap
