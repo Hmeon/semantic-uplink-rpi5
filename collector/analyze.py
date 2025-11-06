@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 from typing import Iterable, List
@@ -35,6 +36,7 @@ from typing import Iterable, List
 import numpy as np
 import pandas as pd
 
+from common.discord_webhook import DiscordWebhookError, send_discord_message
 from common.schema import EventMsg, SensorType, LinkProfile, PolicyMode
 
 
@@ -315,6 +317,59 @@ def _write_report_md(out_dir: Path, summary: pd.DataFrame) -> None:
     p.write_text("\n".join(lines), encoding="utf-8")
 
 
+def _fmt_num(value, fmt: str) -> str:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return "NaN"
+    if not math.isfinite(num):
+        return "NaN"
+    return format(num, fmt)
+
+
+def format_summary_for_discord(summary: pd.DataFrame, *, limit: int = 10) -> str:
+    """Create a compact Discord-friendly text report from the summary table."""
+
+    title = "**Semantic Uplink 분석 요약**"
+    if summary.empty:
+        return f"{title}\n집계된 행이 없어 전송할 내용이 없습니다."
+
+    lines = [title]
+    lines.append(f"총 {len(summary)}행 중 상위 {min(limit, len(summary))}행을 전송합니다.")
+
+    subset = summary.head(limit)
+    for _, row in subset.iterrows():
+        profile = row.get("profile", "?")
+        policy = row.get("policy", "?")
+        sensor = row.get("sensor", "?")
+        events = int(row.get("n_events", 0))
+        rate = _fmt_num(row.get("rate_Bps"), ".1f")
+        aoi_mean = _fmt_num(row.get("aoi_mean_ms"), ".1f")
+        aoi_p95 = _fmt_num(row.get("aoi_p95_ms"), ".1f")
+        mae_mean = _fmt_num(row.get("mae_event_mean"), ".3f")
+        mae_p95 = _fmt_num(row.get("mae_event_p95"), ".3f")
+        kbits = _fmt_num(row.get("kbits_mean"), ".2f")
+        lines.append(
+            "- `{}/{}` sensor={} · events={} · rate={} B/s · AoIμ={} ms (p95={} ms) · MAE={} (p95={}) · k̄={}".format(
+                profile,
+                policy,
+                sensor,
+                events,
+                rate,
+                aoi_mean,
+                aoi_p95,
+                mae_mean,
+                mae_p95,
+                kbits,
+            )
+        )
+
+    if len(summary) > limit:
+        lines.append(f"… (총 {len(summary)}행 중 {limit}행만 표시)")
+
+    return "\n".join(lines)
+
+
 # ----------------------------- CLI -----------------------------
 
 def parse_args():
@@ -325,6 +380,12 @@ def parse_args():
                     help="요약 결과 출력 디렉터리")
     ap.add_argument("--save-parquet", action="store_true",
                     help="metrics_summary.parquet도 함께 저장")
+    ap.add_argument("--discord-webhook", default=None,
+                    help="요약 결과를 전송할 Discord webhook URL")
+    ap.add_argument("--discord-username", default=None,
+                    help="Discord 메시지에 사용할 표시 이름(옵션)")
+    ap.add_argument("--discord-mention", action="append", default=[],
+                    help="메시지에서 멘션할 Discord 사용자 ID (여러 번 지정 가능)")
     return ap.parse_args()
 
 
@@ -353,6 +414,25 @@ def main():
     print(f"[analyze] saved: {csv_path}")
     if args.save_parquet:
         print(f"[analyze] saved: {pq_path}")
+
+    if args.discord_webhook:
+        mentions = [m.strip() for m in args.discord_mention if m and m.strip()]
+        mention_prefix = ""
+        allowed_mentions = None
+        if mentions:
+            mention_prefix = " ".join(f"<@{m}>" for m in mentions) + "\n"
+            allowed_mentions = {"parse": [], "users": mentions}
+        message = mention_prefix + format_summary_for_discord(summary)
+        try:
+            send_discord_message(
+                args.discord_webhook,
+                message,
+                username=args.discord_username,
+                allowed_mentions=allowed_mentions,
+            )
+            print("[analyze] sent Discord notification")
+        except DiscordWebhookError as e:
+            print(f"[analyze] WARN: failed to send Discord notification: {e}")
 
 
 if __name__ == "__main__":
