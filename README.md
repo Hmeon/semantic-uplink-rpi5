@@ -154,6 +154,26 @@ reward:  { alpha: 1.0, beta: 1.0, gamma: 0.5 }  # AoI, MAE, Rate 가중
 safety:  { aoi_max_ms: 5000, mae_max: 2.0 }
 ```
 
+**`edge/edge_daemon.py` DS3231 RTC 가드**
+
+네트워크가 끊겨도 타임스탬프 정확도를 유지하려면 부팅 직후 RTC→시스템 클럭 동기화를 수행합니다.
+
+```bash
+python -m edge.edge_daemon \
+  --device-id rpi5a \
+  --profile slow_10kbps \
+  --mic-enable --temp-enable \
+  --rtc-enable --rtc-bus 1 --rtc-address 0x68 \
+  --rtc-drift-guard 2.0 --rtc-resync 600
+```
+
+- `--rtc-enable`: DS3231 가드 활성화 (I²C 버스/주소 지정)
+- `--rtc-drift-guard`: RTC와 시스템 시간 차이가 해당 초를 넘으면 즉시 재동기화
+- `--rtc-resync`: 주기적 재확인(초). `<=0`이면 부팅 시 1회만 수행
+- `--rtc-push-system`: NTP 등으로 시스템 시간이 앞서면 RTC에 다시 기록 (기본 False)
+
+RTC는 정확한 이벤트 타임스탬프를 제공해 AoI·지연 측정의 신뢰도를 높여 줍니다.
+
 **`configs/link_profiles.yaml`**
 ```yaml
 profiles:
