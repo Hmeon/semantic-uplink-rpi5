@@ -10,6 +10,7 @@ loguru>=0.7
 rich>=13.0
 pandas>=2.0
 pyarrow>=14.0
+smbus2>=0.4
 
 # dev
 pytest>=7.4

@@ -24,6 +24,7 @@ from edge.sensors.temp import TempSensor
 from edge.predict.ewma import EWMAConfig, EWMAPredictor
 from edge.uploader.outbox import Outbox
 from edge.uploader.mqtt_publisher import MQTTPublisher
+from edge.rtc import DS3231, RTCGuardian
 
 
 @dataclass(slots=True)
@@ -55,6 +56,16 @@ class TempCfg:
     sysfs_path: str | None = None
 
 
+@dataclass(slots=True)
+class RTCCfg:
+    enable: bool = False
+    bus: int = 1
+    address: int = 0x68
+    drift_guard_s: float = 2.0
+    resync_interval_s: float = 900.0
+    push_system_to_rtc: bool = False
+
+
 class EdgeDaemon:
     def __init__(
         self,
@@ -68,6 +79,7 @@ class EdgeDaemon:
         keepalive: int = 30,
         mic: MicCfg | None = None,
         temp: TempCfg | None = None,
+        rtc: RTCCfg | None = None,
     ):
         self.device_id = device_id
         self.profile = profile
@@ -78,6 +90,7 @@ class EdgeDaemon:
         self.keepalive = int(keepalive)
         self.mic_cfg = mic or MicCfg()
         self.temp_cfg = temp or TempCfg()
+        self.rtc_cfg = rtc or RTCCfg()
 
         # 런타임
         os.makedirs(os.path.dirname(self.outbox_path) or ".", exist_ok=True)
@@ -93,11 +106,14 @@ class EdgeDaemon:
         self._stop = threading.Event()
         self._mic_thread: Optional[threading.Thread] = None
         self._temp_thread: Optional[threading.Thread] = None
+        self._rtc_device: DS3231 | None = None
+        self._rtc_guardian: RTCGuardian | None = None
 
     # ---------- 라이프사이클 ----------
 
     def start(self):
         self._install_signals()
+        self._maybe_start_rtc()
         self.publisher.start()
 
         if self.mic_cfg.enable:
@@ -138,9 +154,60 @@ class EdgeDaemon:
             self.publisher.stop()
         finally:
             self.outbox.close()
+        self._stop_rtc()
         print("[edge] stopped.")
 
     # ---------- 내부: 센서 루프 ----------
+
+    def _maybe_start_rtc(self):
+        if not self.rtc_cfg.enable or self._rtc_guardian is not None:
+            return
+        try:
+            self._rtc_device = DS3231(bus=self.rtc_cfg.bus, address=self.rtc_cfg.address)
+            self._rtc_guardian = RTCGuardian(
+                self._rtc_device,
+                drift_guard_s=self.rtc_cfg.drift_guard_s,
+                resync_interval_s=self.rtc_cfg.resync_interval_s,
+                push_system_to_rtc=self.rtc_cfg.push_system_to_rtc,
+            )
+            status = self._rtc_guardian.guard_once()
+            if status.rtc_time is None:
+                print(f"[edge] RTC unavailable: {status.last_error}")
+                self._rtc_guardian = None
+                if self._rtc_device is not None:
+                    try:
+                        self._rtc_device.close()
+                    except Exception:
+                        pass
+                    self._rtc_device = None
+                return
+            drift = status.drift_seconds or 0.0
+            print(f"[edge] RTC sync: rtc={status.rtc_time.isoformat()} drift={drift:.3f}s")
+            if self.rtc_cfg.resync_interval_s > 0:
+                self._rtc_guardian.start()
+        except Exception as e:
+            print(f"[edge] RTC init failed: {e}")
+            self._rtc_guardian = None
+            if self._rtc_device is not None:
+                try:
+                    self._rtc_device.close()
+                except Exception:
+                    pass
+                self._rtc_device = None
+
+    def _stop_rtc(self):
+        if self._rtc_guardian is not None:
+            try:
+                self._rtc_guardian.stop()
+            except Exception:
+                pass
+            self._rtc_guardian = None
+        if self._rtc_device is not None:
+            try:
+                self._rtc_device.close()
+            except Exception:
+                pass
+            self._rtc_device = None
 
     def _mic_loop(self):
         cfg = self.mic_cfg
@@ -268,6 +335,14 @@ def main():
     # Outbox
     p.add_argument("--outbox", default=None, help="SQLite 경로(기본: <run-dir>/outbox.sqlite)")
 
+    # RTC 옵션
+    p.add_argument("--rtc-enable", action="store_true", default=False, help="DS3231 RTC 가드 활성화")
+    p.add_argument("--rtc-bus", type=int, default=1, help="DS3231 I2C bus 번호")
+    p.add_argument("--rtc-address", type=_parse_int_auto, default=0x68, help="DS3231 I2C 주소(예: 0x68)")
+    p.add_argument("--rtc-drift-guard", type=float, default=2.0, help="RTC와 시스템간 허용 오차(초)")
+    p.add_argument("--rtc-resync", type=float, default=900.0, help="재동기화 주기(초), <=0이면 1회만")
+    p.add_argument("--rtc-push-system", action="store_true", help="시스템 시간이 앞설 때 RTC에 기록")
+
     # MIC 옵션
     p.add_argument("--mic-enable", action="store_true", default=False, help="마이크 스트림 활성화")
     p.add_argument("--mic-backend", choices=["auto", "sounddevice", "arecord"], default="auto")
@@ -310,8 +385,7 @@ def main():
         alpha=args.mic_alpha,
         tau=args.mic_tau,
         kbits=args.mic_kbits,
-        heartbeat_s=(None if args.micHeartbeatIsNone(args.mic_heartbeat) else float(args.mic_heartbeat))  # noqa
-        if False else float(args.mic_heartbeat),
+        heartbeat_s=_hb_none(args.mic_heartbeat),
         min_emit_ms=args.mic_min_emit_ms,
     )
 
@@ -332,6 +406,15 @@ def main():
         print("[edge] ERROR: at least one sensor must be enabled (--mic-enable / --temp-enable)")
         sys.exit(2)
 
+    rtc_cfg = RTCCfg(
+        enable=bool(args.rtc_enable),
+        bus=args.rtc_bus,
+        address=args.rtc_address,
+        drift_guard_s=args.rtc_drift_guard,
+        resync_interval_s=args.rtc_resync,
+        push_system_to_rtc=bool(args.rtc_push_system),
+    )
+
     daemon = EdgeDaemon(
         device_id=args.device_id,
         profile=LinkProfile(args.profile),
@@ -342,6 +425,7 @@ def main():
         keepalive=args.keepalive,
         mic=mic_cfg,
         temp=temp_cfg,
+        rtc=rtc_cfg,
     )
     try:
         daemon.start()
@@ -358,6 +442,13 @@ def _hb_none(x: float | None) -> float | None:
     except Exception:
         return None
     return None if xv <= 0 else xv
+
+
+def _parse_int_auto(val: str) -> int:
+    try:
+        return int(str(val), 0)
+    except ValueError as e:
+        raise argparse.ArgumentTypeError(f"invalid integer literal: {val}") from e
 
 
 if __name__ == "__main__":
