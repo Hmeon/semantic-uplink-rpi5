@@ -25,6 +25,8 @@ from edge.predict.ewma import EWMAConfig, EWMAPredictor
 from edge.uploader.outbox import Outbox
 from edge.uploader.mqtt_publisher import MQTTPublisher
 from edge.rtc import DS3231, RTCGuardian
+from edge.ui.lcd import DisplayConfig, build_display
+from edge.ui.status import StatusTracker
 
 
 @dataclass(slots=True)
@@ -66,6 +68,16 @@ class RTCCfg:
     push_system_to_rtc: bool = False
 
 
+@dataclass(slots=True)
+class UICfg:
+    enable: bool = False
+    kind: str = "auto"         # auto|lcd1602|ssd1306|console
+    bus: int = 1
+    address: int | None = None
+    refresh_s: float = 1.0
+    rate_window_s: float = 10.0
+
+
 class EdgeDaemon:
     def __init__(
         self,
@@ -80,6 +92,7 @@ class EdgeDaemon:
         mic: MicCfg | None = None,
         temp: TempCfg | None = None,
         rtc: RTCCfg | None = None,
+        ui: UICfg | None = None,
     ):
         self.device_id = device_id
         self.profile = profile
@@ -91,6 +104,7 @@ class EdgeDaemon:
         self.mic_cfg = mic or MicCfg()
         self.temp_cfg = temp or TempCfg()
         self.rtc_cfg = rtc or RTCCfg()
+        self.ui_cfg = ui or UICfg()
 
         # 런타임
         os.makedirs(os.path.dirname(self.outbox_path) or ".", exist_ok=True)
@@ -108,6 +122,11 @@ class EdgeDaemon:
         self._temp_thread: Optional[threading.Thread] = None
         self._rtc_device: DS3231 | None = None
         self._rtc_guardian: RTCGuardian | None = None
+        self._ui_thread: Optional[threading.Thread] = None
+        self._display = None
+
+        # UI/통계 집계
+        self._status = StatusTracker(profile=self.profile, rate_window_s=self.ui_cfg.rate_window_s)
 
     # ---------- 라이프사이클 ----------
 
@@ -123,6 +142,8 @@ class EdgeDaemon:
         if self.temp_cfg.enable:
             self._temp_thread = threading.Thread(target=self._temp_loop, name="edge-temp", daemon=True)
             self._temp_thread.start()
+
+        self._maybe_start_ui()
 
         print("[edge] started. Press Ctrl+C to stop.")
         try:
@@ -144,6 +165,13 @@ class EdgeDaemon:
         if getattr(self, "_temp_obj", None):
             try:
                 self._temp_obj.close()
+            except Exception:
+                pass
+        if self._ui_thread and self._ui_thread.is_alive():
+            self._ui_thread.join(timeout=2.0)
+        if getattr(self, "_display", None):
+            try:
+                self._display.close()
             except Exception:
                 pass
         if self._mic_thread and self._mic_thread.is_alive():
@@ -209,6 +237,48 @@ class EdgeDaemon:
                 pass
             self._rtc_device = None
 
+    def _maybe_start_ui(self):
+        if not self.ui_cfg.enable or self._ui_thread is not None:
+            return
+        try:
+            disp_cfg = DisplayConfig(
+                kind=self.ui_cfg.kind,
+                bus=self.ui_cfg.bus,
+                address=self.ui_cfg.address,
+                refresh_s=self.ui_cfg.refresh_s,
+            )
+            self._display = build_display(disp_cfg)
+        except Exception as e:
+            self._display = None
+            print(f"[ui] init failed: {e}")
+            return
+        if self._display is None:
+            return
+        self._ui_thread = threading.Thread(target=self._ui_loop, name="edge-ui", daemon=True)
+        self._ui_thread.start()
+
+    def _ui_loop(self):
+        if self._display is None:
+            return
+        interval = max(0.2, float(self.ui_cfg.refresh_s))
+        while not self._stop.is_set():
+            try:
+                pending = self.outbox.pending()
+            except Exception as e:
+                pending = 0
+                print(f"[ui] outbox pending error: {e}")
+            mqtt_ok = self.publisher.is_connected()
+            snap = self._status.snapshot(mqtt_connected=mqtt_ok, outbox_pending=pending)
+            try:
+                self._display.show_snapshot(snap)
+            except Exception as e:
+                print(f"[ui] render error: {e}")
+            time.sleep(interval)
+        try:
+            self._display.close()
+        except Exception:
+            pass
+
     def _mic_loop(self):
         cfg = self.mic_cfg
         # 센서 준비
@@ -236,12 +306,15 @@ class EdgeDaemon:
             for s in self._mic_obj.stream(duration_s=None):
                 if self._stop.is_set():
                     break
+                self._status.update_mic(s.dbfs, s.clip_ratio)
                 evt = pred.predict_and_maybe_emit(s)
                 if evt is None:
                     continue
                 # Outbox 적재(QoS1), created_ns=evt.ts → AoI/Rate 재현성
                 try:
-                    self.outbox.enqueue(evt.mqtt_topic(), evt.to_json_bytes(), qos=1, retain=False, created_ns=evt.ts)
+                    payload = evt.to_json_bytes()
+                    self._status.record_payload(len(payload), evt.ts)
+                    self.outbox.enqueue(evt.mqtt_topic(), payload, qos=1, retain=False, created_ns=evt.ts)
                 except Exception as e:
                     print(f"[edge] outbox enqueue error(mic): {e}")
         except SystemExit:
@@ -281,11 +354,14 @@ class EdgeDaemon:
             for s in self._temp_obj.stream(duration_s=None):
                 if self._stop.is_set():
                     break
+                self._status.update_temp(s.celsius, s.valid)
                 evt = pred.predict_and_maybe_emit(s)
                 if evt is None:
                     continue
                 try:
-                    self.outbox.enqueue(evt.mqtt_topic(), evt.to_json_bytes(), qos=1, retain=False, created_ns=evt.ts)
+                    payload = evt.to_json_bytes()
+                    self._status.record_payload(len(payload), evt.ts)
+                    self.outbox.enqueue(evt.mqtt_topic(), payload, qos=1, retain=False, created_ns=evt.ts)
                 except Exception as e:
                     print(f"[edge] outbox enqueue error(temp): {e}")
         except SystemExit:
@@ -368,6 +444,14 @@ def main():
     p.add_argument("--temp-w1-path", default=None)
     p.add_argument("--temp-sysfs-path", default=None)
 
+    # UI 옵션
+    p.add_argument("--ui-enable", action="store_true", default=False, help="I2C LCD/OLED 상태 표시")
+    p.add_argument("--ui-kind", choices=["auto", "lcd1602", "ssd1306", "console"], default="auto")
+    p.add_argument("--ui-bus", type=int, default=1, help="I2C bus 번호 (기본 1)")
+    p.add_argument("--ui-address", type=_parse_int_auto, default=None, help="LCD/OLED I2C 주소 override")
+    p.add_argument("--ui-refresh", type=float, default=1.0, help="표시 갱신 주기(초)")
+    p.add_argument("--ui-rate-window", type=float, default=10.0, help="전송률 이동 평균 윈도우(초)")
+
     args = p.parse_args()
 
     # 기본 run-dir/outbox
@@ -402,6 +486,15 @@ def main():
         sysfs_path=args.temp_sysfs_path,
     )
 
+    ui_cfg = UICfg(
+        enable=bool(args.ui_enable),
+        kind=args.ui_kind,
+        bus=args.ui_bus,
+        address=args.ui_address,
+        refresh_s=args.ui_refresh,
+        rate_window_s=args.ui_rate_window,
+    )
+
     if not mic_cfg.enable and not temp_cfg.enable:
         print("[edge] ERROR: at least one sensor must be enabled (--mic-enable / --temp-enable)")
         sys.exit(2)
@@ -426,6 +519,7 @@ def main():
         mic=mic_cfg,
         temp=temp_cfg,
         rtc=rtc_cfg,
+        ui=ui_cfg,
     )
     try:
         daemon.start()

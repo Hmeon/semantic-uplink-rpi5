@@ -101,6 +101,10 @@ class MQTTPublisher:
         self._mid2oid: Dict[int, int] = {}
         self._map_lock = threading.Lock()
 
+    def is_connected(self) -> bool:
+        """MQTT 연결 상태 플래그(상태 표시/UI용)."""
+        return bool(self._connected)
+
     # ------------- MQTT 콜백 -------------
 
     def _on_connect(self, client: mqtt.Client, userdata, flags, rc, properties=None):

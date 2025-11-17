@@ -361,6 +361,11 @@ python -m edge.edge_daemon --mode adaptive --arms configs/policy.yaml
 python -m collector.analyze --input data/ --out results/
 ```
 
+### LCD/OLED status (현장 디버깅)
+- 1602 LCD (PCF8574 모듈): `python -m edge.edge_daemon --device-id rpi --profile slow_10kbps --mic-enable --temp-enable --ui-enable --ui-kind lcd1602 --ui-address 0x27`
+- 0.96\" SSD1306 OLED: `--ui-enable --ui-kind ssd1306 --ui-address 0x3C` (requires `pip install luma.oled pillow`)
+- 표시 내용: `TEMP/MIC dBFS`, `TX kbps`, `MQTT 링크`, Outbox 큐 길이. `--ui-refresh`(초), `--ui-rate-window`(초)로 갱신·전송률 윈도우 조정.
+
 ## Configuration
 See `configs/` YAML files to change experiment settings without touching code.
 
