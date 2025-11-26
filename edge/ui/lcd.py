@@ -159,6 +159,27 @@ def _normalize_lines(lines: Sequence[str], columns: int, rows: int) -> list[str]
     return normed
 
 
+def _abbr_mode(mode: str) -> str:
+    m = mode.lower()
+    if "periodic" in m:
+        return "PER"
+    if "adaptive" in m:
+        return "LIN"
+    if "fixed" in m or "tau" in m:
+        return "ETS"
+    return mode[:3].upper()
+
+
+def _abbr_profile(profile: str) -> str:
+    if profile.startswith("slow"):
+        return "S10K"
+    if profile.startswith("delay"):
+        return "DELAY"
+    if profile.startswith("cell"):
+        return "CELL"
+    return profile[:5].upper()
+
+
 def format_lines(snap: UISnapshot, columns: int, rows: int) -> list[str]:
     temp = "--.-" if snap.temp_c is None else f"{snap.temp_c:4.1f}"
     mic = "--.-" if snap.mic_dbfs is None else f"{snap.mic_dbfs:5.1f}"
@@ -167,16 +188,23 @@ def format_lines(snap: UISnapshot, columns: int, rows: int) -> list[str]:
     link = "UP" if snap.mqtt_connected else "DN"
     q = f"Q{snap.outbox_pending}"
     profile = snap.profile.value
+    mode = snap.mode.value
+    aoi_txt = "--" if snap.aoi_ms is None else f"{snap.aoi_ms:4.0f}"
+    mae_txt = "--" if snap.mae is None else f"{snap.mae:3.1f}"
 
     lines: list[str] = []
-    lines.append(f"T:{temp}C M:{mic}")
-    if rows > 2:
-        clip_txt = f"clip {clip}" if clip else "clip --"
-        lines.append(f"MIC {clip_txt}")
-        lines.append(f"TX {rate_kbps:5.1f} kbps {q}")
-        lines.append(f"MQTT {link} {profile}")
+    mode_abbr = _abbr_mode(mode)
+    prof_abbr = _abbr_profile(profile)
+    if columns <= 16 and rows <= 2:
+        # 16x2 LCD용 압축 포맷
+        lines.append(f"{mode_abbr}/{prof_abbr} R{rate_kbps:4.1f}k")
+        lines.append(f"A{aoi_txt} M{mae_txt} {link} {q}")
     else:
-        lines.append(f"TX:{rate_kbps:4.1f}k {link} {q}")
+        lines.append(f"{mode_abbr}/{prof_abbr} T:{temp}C M:{mic}")
+        clip_txt = f"clip {clip}" if clip else "clip --"
+        lines.append(f"{clip_txt} {link} {q}")
+        lines.append(f"R:{rate_kbps:5.1f} kbps AoI:{aoi_txt}")
+        lines.append(f"MAE:{mae_txt}")
     return _normalize_lines(lines, columns, rows)
 
 

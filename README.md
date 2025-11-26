@@ -7,8 +7,8 @@
 ![Status](https://img.shields.io/badge/Status-PoC-brightgreen)
 ![CI](https://img.shields.io/badge/CI-ruff%20%7C%20pytest-blueviolet)
 
-> **KR** · 저속·불안정 링크(LoRa 급 제약 가정)에서 **필요한 순간·필요한 정보만** 보내도록, 엣지 AI가 전송 정책(**임계값 τ**, **양자화 k**)을 스스로 조절하는 **의미전송(Semantic Uplink)** 프로젝트입니다.  
-> **EN** · An edge‑intelligent **semantic uplink** that adapts **threshold (τ)** and **quantization (k)** to send **only information that matters** over low/unstable links.
+> **KR** · 저속·불안정 링크(LoRa 급 제약)에서 **필요한 순간·필요한 정보만** 보내도록, 엣지가 전송 정책(**임계값 τ**, **양자화 k**)을 스스로 조절하는 **의미전송(Semantic Uplink)** 실험 플랫폼입니다.  
+> **EN** · A Raspberry Pi 5 semantic uplink that adapts **threshold (τ)** and **quantization (k)** to send **only information that matters** on constrained links, proving superiority over periodic sampling.
 
 ---
 
@@ -34,10 +34,24 @@
 ---
 
 ## 개요 · Overview
+- **목적**: RPi5 실험 플랫폼으로 **의미 기반/적응형 정책이 주기 전송보다 전송량–신선도–정확도 면에서 우월함을 실험적으로 입증**합니다.  
 - **문제**: 주기 전송은 저속/손실 링크에서 **불필요한 트래픽**과 **신선도 저하(AoI↑)** 를 초래합니다.  
-- **핵심 아이디어**: 엣지에서 **예측값 대비 잔차** |e|가 **임계값 τ**를 넘을 때만 전송(이벤트 트리거, SoD). 링크 상태를 반영해 **양자화 비트수 k**를 가변 적용.  
-- **신뢰성**: MQTT **QoS1 + Outbox(오프라인 큐) + 백오프**로 **끊김 복구**와 **중복 허용**을 조합.  
-- **목표**: 전송량 **≥ 60% 절감**, AoI **≥ 30% 개선**, MAE 증가는 **≤ 10%**로 제한.
+- **아이디어**: 엣지에서 **잔차 |e| > τ**일 때만 이벤트 전송, 링크 상태에 맞춰 **양자화 kbits**를 조절. LinUCB로 (τ,k) 팔을 선택.  
+- **신뢰성**: MQTT **QoS1 + Outbox(오프라인 큐) + 백오프**, DS3231 RTC 가드.  
+- **목표**: 전송량 **≥ 60% 절감**, AoI **≥ 30% 개선**, MAE 증가는 **≤ 10%**.
+
+## 하드웨어 베이스라인
+- **Controller**: Raspberry Pi 5 (8GB), Python 3.11+
+- **Sensors**: DS18B20 온도(1 Hz), USB Mic RMS(16 kHz → 100 ms 프레임)
+- **UI**: 1602 I2C LCD(PCF8574, addr 0x27) + 버튼 3개(모드 17 / 프로파일 27 / 마커 22, 내부 풀업)
+- **Optional**: Buzzer(BCM 18)
+
+## 링크/정책 프로파일
+- **Link**: `SLOW_10K`(10 kbps, delay 300 ms, loss 3%), `DELAY_LOSS`(100 kbps, delay 500 ms, loss 8%), `CELLULAR_VAR`(50↔200 kbps 토글)
+- **Policies**
+  - `PERIODIC`: 모든 샘플 전송 (대역 상한선 기준선)
+  - `FIXED_TAU`(ETS): EWMA 예측 + 잔차 |e|>τ 이벤트 트리거
+  - `ADAPTIVE`(LinUCB): 컨텍스트( AoI, residual, residual variance, outbox 큐 ) 기반 (τ,kbits) 팔 선택 + 안전가드
 
 > We reduce traffic without sacrificing usefulness by sending **only deviations that matter**, while keeping **freshness (AoI)** high and **error (MAE)** bounded.
 
@@ -338,11 +352,16 @@ TBD (추후 지정)
   <img src="docs/figma/linucb_state_ko.svg" alt="LinUCB Policy State" width="78%">
 </p>
 
+### Semantic Policies (실험 축)
+- **Periodic**: 모든 샘플 전송 — 대역 상한선·AoI 하한선 기준선
+- **Fixed τ (ETS)**: EWMA 잔차 |e|>τ일 때만 이벤트 전송 (센서별 τ·kbits)
+- **Adaptive (LinUCB)**: 컨텍스트 밴딧으로 (τ,kbits) 팔 선택, 안전가드(AoI_max, MAE_max) 포함
+
 ## Key Metrics
 - **Rate** (bytes/sec at broker), **AoI**, **MAE**  
 **Target**: **Rate↓**, **AoI↓**, **MAE↑** bounded
 
-## Quick Start
+## Quick Start (RPi5)
 ```bash
 sudo apt update && sudo apt full-upgrade -y
 sudo apt install -y mosquitto mosquitto-clients iproute2 python3-venv python3-dev build-essential libportaudio2
@@ -351,23 +370,47 @@ pip install -r requirements.txt
 sudo systemctl enable mosquitto && sudo systemctl start mosquitto
 ```
 
-## Run Order
+## Run Order (1 회 실험)
 ```bash
-python -m link.shaper.tc_profiles apply lo slow_10kbps
-python -m collector.collector
-python -m edge.edge_daemon --mode periodic
-python -m edge.edge_daemon --mode fixed --tau_mic 3.0 --tau_temp 0.2
-python -m edge.edge_daemon --mode adaptive --arms configs/policy.yaml
-python -m collector.analyze --input data/ --out results/
+# 0) 링크 프로파일 적용 (root 필요)
+sudo python -m link.shaper.tc_profiles apply eth0 slow_10kbps
+
+# 1) 수집기(브로커 구독 → Parquet 적재)
+python -m collector.collector --run-dir artifacts/run1
+
+# 2) 엣지 실행 (모드별)
+## 주기 전송
+python -m edge.edge_daemon --device-id rpi5a --profile slow_10kbps \
+  --mode periodic --mic-enable --temp-enable --ui-enable --buttons-enable
+
+## 고정 임계 ETS
+python -m edge.edge_daemon --device-id rpi5a --profile slow_10kbps \
+  --mode fixed_tau --mic-tau 3.0 --temp-tau 0.2 \
+  --mic-enable --temp-enable --ui-enable --buttons-enable
+
+## LinUCB 적응
+python -m edge.edge_daemon --device-id rpi5a --profile slow_10kbps \
+  --mode adaptive --arms configs/policy.yaml \
+  --mic-enable --temp-enable --ui-enable --buttons-enable
+
+# 3) 분석 (AoI/MAE/Rate 집계)
+python -m collector.analyze --input artifacts/run1/logs --out results/run1
 ```
 
-### LCD/OLED status (현장 디버깅)
-- 1602 LCD (PCF8574 모듈): `python -m edge.edge_daemon --device-id rpi --profile slow_10kbps --mic-enable --temp-enable --ui-enable --ui-kind lcd1602 --ui-address 0x27`
-- 0.96\" SSD1306 OLED: `--ui-enable --ui-kind ssd1306 --ui-address 0x3C` (requires `pip install luma.oled pillow`)
-- 표시 내용: `TEMP/MIC dBFS`, `TX kbps`, `MQTT 링크`, Outbox 큐 길이. `--ui-refresh`(초), `--ui-rate-window`(초)로 갱신·전송률 윈도우 조정.
+### LCD/OLED + 버튼 (현장 제어)
+- 1602 LCD: `--ui-enable --ui-kind lcd1602 --ui-address 0x27`  
+  16x2 포맷: `MODE/PROFILE`, `Rate(kbps)`, `AoI(ms)`, `MAE`, 링크/큐 상태
+- 버튼(BCM): 모드(17), 프로파일(27), 마커(22). `--buttons-enable`로 활성화.
+  - 버튼1: 정책 모드 순환 (PER→ETS→LINUCB)
+  - 버튼2: 링크 프로파일 순환 (SLOW_10K→DELAY_LOSS→CELLULAR_VAR), `--tc-apply-on-button` 시 즉시 tc 적용
+  - 버튼3: 마커 전송(`marker/<device_id>`) → collector `markers.parquet`에 기록
+- 0.96\" SSD1306: `--ui-kind ssd1306 --ui-address 0x3C` (추가 의존: `pip install luma.oled pillow`)
 
 ## Configuration
 See `configs/` YAML files to change experiment settings without touching code.
+- `configs/device.yaml`: device_id, sensor rates, LCD backend, MQTT host/port
+- `configs/policy.yaml`: LinUCB arms(τ,kbits), reward weights (α,β,γ), safety (AoI/MAE max)
+- `configs/link_profiles.yaml`: tc/netem profiles (`slow_10kbps`, `delay_loss`, `cellular_var`)
 
 ## Repository Layout
 ```text
@@ -386,6 +429,12 @@ See `configs/` YAML files to change experiment settings without touching code.
 ├── data/, logs/ — experiment outputs and runtime diagnostics
 └── requirements.txt, pyproject.toml — Python dependencies & packaging metadata
 ```
+
+### Collector Outputs
+- `logs/events.parquet` — deduped sensor events (seq-based)
+- `logs/decisions.parquet` — policy decisions/rewards (adaptive)
+- `logs/markers.parquet` — button/marker events for timeline alignment
+- `collector_meta.json` — bytes, duplicates, counts for the run
 
 ## 7‑week Roadmap
 - W1: Metrics/profiles freeze; collector pipeline  

@@ -66,13 +66,33 @@ class EWMAPredictor:
 
         self.cfg = cfg
         self._q = quantizer_for_sensor(cfg.sensor, cfg.kbits, vmin=cfg.vmin, vmax=cfg.vmax)
+        self._q_cache: dict[int, Any] = {int(cfg.kbits): self._q}
         self._last_pred: float | None = None
         self._last_emit_ns: int | None = None
         self._boot_emitted: bool = False
 
     # ---------------- 공용 API ----------------
 
-    def predict_and_maybe_emit(self, sample: Any) -> EventMsg | None:
+    def preview(self, sample: Any) -> tuple[int, int, float, bool, float, float]:
+        """
+        샘플을 **상태 업데이트 없이** 미리 계산한다.
+        반환: (ts_ns, seq, x_raw, valid, last_pred, resid)
+        """
+        ts_ns, seq, x_raw, value_valid = self._extract_value(sample)
+        last_pred = x_raw if self._last_pred is None else self._last_pred
+        resid = abs(x_raw - last_pred)
+        return ts_ns, seq, x_raw, value_valid, last_pred, resid
+
+    def predict_and_maybe_emit(
+        self,
+        sample: Any,
+        *,
+        override_tau: float | None = None,
+        override_kbits: int | None = None,
+        policy_mode: PolicyMode | None = None,
+        override_heartbeat_s: float | None = None,
+        override_min_emit_ms: int | None = None,
+    ) -> EventMsg | None:
         """
         센서 샘플 하나를 입력 받아, 조건을 만족하면 EventMsg를 생성.
         - mic_rms.Sample: (ts_ns, seq, dbfs, clip_ratio)
@@ -84,30 +104,45 @@ class EWMAPredictor:
             self._update_ewma(None)
             return None
 
+        # 구성/오버라이드 적용
+        tau = self.cfg.tau if override_tau is None else float(override_tau)
+        kbits = self.cfg.kbits if override_kbits is None else int(override_kbits)
+        hb_s = self.cfg.heartbeat_s if override_heartbeat_s is None else override_heartbeat_s
+        min_emit_ms = (
+            self.cfg.min_emit_interval_ms
+            if override_min_emit_ms is None
+            else int(override_min_emit_ms)
+        )
+        policy = PolicyMode.FIXED_TAU if policy_mode is None else policy_mode
+
         # 직전 예측(없으면 x_raw로 부트스트랩)
         last_pred = x_raw if self._last_pred is None else self._last_pred
         resid = abs(x_raw - last_pred)
 
         # 전송 여부 판단
         now_ns = ts_ns  # 센서 프레임 종결 시각을 전송 시각으로 사용
-        emit_due_to_resid = resid > self.cfg.tau
-        emit_due_to_boot = (self.cfg.bootstrap_emit and not self._boot_emitted and self._last_pred is None)
+        emit_due_to_resid = resid > tau
+        emit_due_to_boot = (
+            self.cfg.bootstrap_emit
+            and not self._boot_emitted
+            and self._last_pred is None
+        )
         emit_due_to_hb = False
         if not emit_due_to_resid and not emit_due_to_boot:
-            if self.cfg.heartbeat_s and self.cfg.heartbeat_s > 0:
-                if (self._last_emit_ns is None) or (now_ns - self._last_emit_ns >= int(self.cfg.heartbeat_s * 1e9)):
+            if hb_s and hb_s > 0:
+                if (self._last_emit_ns is None) or (now_ns - self._last_emit_ns >= int(hb_s * 1e9)):
                     emit_due_to_hb = True
 
         should_emit = emit_due_to_resid or emit_due_to_boot or emit_due_to_hb
 
         # 최소 간격 가드
-        if should_emit and self.cfg.min_emit_interval_ms > 0 and self._last_emit_ns is not None:
-            if now_ns - self._last_emit_ns < int(self.cfg.min_emit_interval_ms * 1e6):
+        if should_emit and min_emit_ms > 0 and self._last_emit_ns is not None:
+            if now_ns - self._last_emit_ns < int(min_emit_ms * 1e6):
                 should_emit = False  # rate-limit
 
         evt: EventMsg | None = None
         if should_emit:
-            qv = self._q.quantize(x_raw).q  # 대표값(실수)
+            qv = self._quantizer(kbits).quantize(x_raw).q  # 대표값(실수)
             evt = EventMsg(
                 ts=int(ts_ns),
                 seq=int(seq),                     # (device_id, sensor, seq)로 de-dup
@@ -116,10 +151,10 @@ class EWMAPredictor:
                 val=float(qv),
                 pred=float(last_pred),
                 res=float(resid),
-                tau=float(self.cfg.tau),
-                kbits=int(self.cfg.kbits),
+                tau=float(tau),
+                kbits=int(kbits),
                 profile=self.cfg.profile,
-                policy=PolicyMode.FIXED_TAU,
+                policy=policy,
                 aoi_ms=None,                      # 수집기 기준 계산. 엣지에서는 기록 생략.
             )
             self._last_emit_ns = now_ns
@@ -130,7 +165,9 @@ class EWMAPredictor:
         self._update_ewma(x_raw)
         return evt
 
-    def run(self, sample_iter: Iterator[Any], duration_s: float | None = None) -> Iterator[EventMsg]:
+    def run(
+        self, sample_iter: Iterator[Any], duration_s: float | None = None
+    ) -> Iterator[EventMsg]:
         """
         샘플 이터레이터를 소비하며 EventMsg를 yield.
         duration_s가 주어지면 그 시간 경과 후 종료(샘플 ts 기준이 아니라 벽시계 기준).
@@ -147,7 +184,23 @@ class EWMAPredictor:
         """상태 정리(현재는 유지할 리소스 없음)."""
         return
 
+    @property
+    def last_emit_ns(self) -> int | None:
+        return self._last_emit_ns
+
+    @property
+    def last_pred(self) -> float | None:
+        return self._last_pred
+
     # ---------------- 내부 유틸 ----------------
+
+    def _quantizer(self, kbits: int):
+        kbits = int(kbits)
+        if kbits in self._q_cache:
+            return self._q_cache[kbits]
+        q = quantizer_for_sensor(self.cfg.sensor, kbits, vmin=self.cfg.vmin, vmax=self.cfg.vmax)
+        self._q_cache[kbits] = q
+        return q
 
     def _extract_value(self, sample: Any) -> Tuple[int, int, float, bool]:
         """

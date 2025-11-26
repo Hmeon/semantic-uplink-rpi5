@@ -65,8 +65,10 @@ class ExperimentPlan:
     temp_kbits: int = 8
     temp_heartbeat_s: float = 10.0
 
+    arms_path: str = "configs/policy.yaml"
+
     # 모드/프로파일
-    modes: Tuple[str, ...] = ("periodic", "fixed_tau", "adaptive")  # adaptive는 자리만
+    modes: Tuple[str, ...] = ("periodic", "fixed_tau", "adaptive")
     profiles: Tuple[str, ...] = ("slow_10kbps", "delay_loss", "cellular_var")
 
     # 실행 옵션
@@ -158,10 +160,12 @@ class ScenarioRunner:
             sys.executable, "-m", "edge.edge_daemon",
             "--device-id", p.device_id,
             "--profile", sc.profile.value,
+            "--mode", sc.mode.value,
             "--broker", p.broker,
             "--port", str(p.port),
             "--client-id", f"edge-{p.device_id}",
             "--run-dir", str(run_dir),
+            "--arms", p.arms_path,
         ]
 
         if p.use_mic:
@@ -171,9 +175,7 @@ class ScenarioRunner:
                      "--mic-alpha", str(p.mic_alpha),
                      "--mic-kbits", str(p.mic_kbits),
                      "--mic-heartbeat", str(p.mic_heartbeat_s)]
-            # periodic 모드: resid>τ를 항상 참으로 만들기 위해 τ<0
-            mic_tau = (-1e-6) if sc.mode == PolicyMode.PERIODIC else p.mic_tau_fixed
-            base += ["--mic-tau", str(mic_tau)]
+            base += ["--mic-tau", str(p.mic_tau_fixed)]
 
         if p.use_temp:
             base += ["--temp-enable",
@@ -181,14 +183,7 @@ class ScenarioRunner:
                      "--temp-alpha", str(p.temp_alpha),
                      "--temp-kbits", str(p.temp_kbits),
                      "--temp-heartbeat", str(p.temp_heartbeat_s)]
-            temp_tau = (-1e-6) if sc.mode == PolicyMode.PERIODIC else p.temp_tau_fixed
-            base += ["--temp-tau", str(temp_tau)]
-
-        if sc.mode == PolicyMode.ADAPTIVE:
-            # 아직 edge_daemon에 LinUCB 연결 전 → 명확히 경고하고 fixed_tau와 동일 설정으로 실행 방지
-            print("[exp] NOTE: adaptive mode is not yet wired in edge_daemon; skipping this scenario.")
-            # None 커맨드 반환 → 상위에서 곧바로 종료/정리
-            return [sys.executable, "-c", "import time; print('adaptive mode skipped'); time.sleep(1)"]
+            base += ["--temp-tau", str(p.temp_tau_fixed)]
 
         return base
 
@@ -359,6 +354,7 @@ def parse_args() -> ExperimentPlan:
     ap.add_argument("--temp-kbits", type=int, default=8)
     ap.add_argument("--temp-heartbeat", type=float, default=10.0)
 
+    ap.add_argument("--arms-path", default="configs/policy.yaml", help="LinUCB arms config path")
     ap.add_argument("--modes", default="periodic,fixed_tau,adaptive",
                     help="comma-separated: periodic,fixed_tau,adaptive")
     ap.add_argument("--profiles", default="slow_10kbps,delay_loss,cellular_var",
@@ -396,6 +392,7 @@ def parse_args() -> ExperimentPlan:
         temp_kbits=args.temp_kbits,
         temp_heartbeat_s=args.temp_heartbeat,
 
+        arms_path=args.arms_path,
         modes=tuple(m.strip() for m in args.modes.split(",") if m.strip()),
         profiles=tuple(p.strip() for p in args.profiles.split(",") if p.strip()),
         with_collector=bool(args.with_collector),

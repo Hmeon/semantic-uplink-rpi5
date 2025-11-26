@@ -1,7 +1,7 @@
 # edge/edge_daemon.py
 # Python 3.10+
-# 목적: 센서(mic_rms/temp) → EWMA(고정 τ) → EventMsg → Outbox(SQLite) → MQTTPublisher(QoS1)
-#       엔드-투-엔드 파이프라인 오케스트레이션.
+# 목적: 센서(mic_rms/temp) → 예측(EWMA) → 정책(periodic/fixed/linucb) → EventMsg
+#       → Outbox(SQLite) → MQTTPublisher(QoS1) : 엔드-투-엔드 파이프라인 오케스트레이션.
 # - 재현성: ns 타임스탬프/seq 보존, (device_id,sensor,seq) 기준 중복 제거는 collector에서 수행.
 # - 최소 복잡도: 정책은 고정 τ(ETS) 기준선에 집중. LinUCB는 별도 단계에서 결합.
 # - 유실 0: Outbox 내구성 + 퍼블리셔 재연결/ACK 기반 삭제로 보장.
@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import signal
 import sys
@@ -18,15 +19,20 @@ import time
 from dataclasses import dataclass
 from typing import Optional
 
-from common.schema import SensorType, LinkProfile
+import yaml
+
+from common.schema import LinkProfile, PolicyMode, SensorType
 from edge.sensors.mic_rms import MicRMS
 from edge.sensors.temp import TempSensor
-from edge.predict.ewma import EWMAConfig, EWMAPredictor
+from edge.predict.ewma import EWMAConfig
 from edge.uploader.outbox import Outbox
 from edge.uploader.mqtt_publisher import MQTTPublisher
 from edge.rtc import DS3231, RTCGuardian
 from edge.ui.lcd import DisplayConfig, build_display
 from edge.ui.status import StatusTracker
+from edge.policy.runtime import SensorPolicyRuntime, StepResult, load_linucb_config
+from edge.ui.buttons import ButtonsConfig, build_buttons
+from link.shaper import tc_profiles
 
 
 @dataclass(slots=True)
@@ -78,6 +84,22 @@ class UICfg:
     rate_window_s: float = 10.0
 
 
+@dataclass(slots=True)
+class ButtonsCfg:
+    enable: bool = True
+    mode_pin: int = 17
+    profile_pin: int = 27
+    marker_pin: int = 22
+    debounce_ms: int = 200
+
+
+@dataclass(slots=True)
+class LinkCfg:
+    iface: str = "eth0"
+    both: bool = False            # ingress 포함 여부
+    apply_on_button: bool = False # 버튼으로 프로파일 변경 시 tc 적용 여부 (root 필요)
+
+
 class EdgeDaemon:
     def __init__(
         self,
@@ -85,6 +107,8 @@ class EdgeDaemon:
         device_id: str,
         profile: LinkProfile,
         outbox_path: str,
+        mode: PolicyMode = PolicyMode.FIXED_TAU,
+        arms_cfg: dict | None = None,
         broker: str = "localhost",
         port: int = 1883,
         client_id: str = "edge-pub",
@@ -93,10 +117,14 @@ class EdgeDaemon:
         temp: TempCfg | None = None,
         rtc: RTCCfg | None = None,
         ui: UICfg | None = None,
+        buttons: ButtonsCfg | None = None,
+        link: LinkCfg | None = None,
     ):
         self.device_id = device_id
         self.profile = profile
         self.outbox_path = outbox_path
+        self.mode = mode
+        self._arms_cfg = arms_cfg or {}
         self.broker = broker
         self.port = int(port)
         self.client_id = client_id
@@ -105,6 +133,8 @@ class EdgeDaemon:
         self.temp_cfg = temp or TempCfg()
         self.rtc_cfg = rtc or RTCCfg()
         self.ui_cfg = ui or UICfg()
+        self.buttons_cfg = buttons or ButtonsCfg()
+        self.link_cfg = link or LinkCfg()
 
         # 런타임
         os.makedirs(os.path.dirname(self.outbox_path) or ".", exist_ok=True)
@@ -118,15 +148,24 @@ class EdgeDaemon:
         )
 
         self._stop = threading.Event()
+        self._lock = threading.Lock()
         self._mic_thread: Optional[threading.Thread] = None
         self._temp_thread: Optional[threading.Thread] = None
         self._rtc_device: DS3231 | None = None
         self._rtc_guardian: RTCGuardian | None = None
         self._ui_thread: Optional[threading.Thread] = None
         self._display = None
+        self._buttons = None
 
         # UI/통계 집계
-        self._status = StatusTracker(profile=self.profile, rate_window_s=self.ui_cfg.rate_window_s)
+        self._status = StatusTracker(
+            profile=self.profile,
+            mode=self.mode,
+            rate_window_s=self.ui_cfg.rate_window_s,
+        )
+        # 정책 실행기
+        self._mic_policy: SensorPolicyRuntime | None = None
+        self._temp_policy: SensorPolicyRuntime | None = None
 
     # ---------- 라이프사이클 ----------
 
@@ -136,16 +175,24 @@ class EdgeDaemon:
         self.publisher.start()
 
         if self.mic_cfg.enable:
-            self._mic_thread = threading.Thread(target=self._mic_loop, name="edge-mic", daemon=True)
+            self._mic_thread = threading.Thread(
+                target=self._mic_loop, name="edge-mic", daemon=True
+            )
             self._mic_thread.start()
 
         if self.temp_cfg.enable:
-            self._temp_thread = threading.Thread(target=self._temp_loop, name="edge-temp", daemon=True)
+            self._temp_thread = threading.Thread(
+                target=self._temp_loop, name="edge-temp", daemon=True
+            )
             self._temp_thread.start()
 
         self._maybe_start_ui()
+        self._maybe_start_buttons()
 
-        print("[edge] started. Press Ctrl+C to stop.")
+        print(
+            f"[edge] started (mode={self.mode.value}, profile={self.profile.value}). "
+            "Press Ctrl+C to stop."
+        )
         try:
             while not self._stop.is_set():
                 time.sleep(0.5)
@@ -172,6 +219,11 @@ class EdgeDaemon:
         if getattr(self, "_display", None):
             try:
                 self._display.close()
+            except Exception:
+                pass
+        if getattr(self, "_buttons", None):
+            try:
+                self._buttons.stop()
             except Exception:
                 pass
         if self._mic_thread and self._mic_thread.is_alive():
@@ -279,6 +331,108 @@ class EdgeDaemon:
         except Exception:
             pass
 
+    def _maybe_start_buttons(self):
+        if self._buttons is not None:
+            return
+        self._buttons = build_buttons(
+            ButtonsConfig(
+                enable=self.buttons_cfg.enable,
+                mode_pin=self.buttons_cfg.mode_pin,
+                profile_pin=self.buttons_cfg.profile_pin,
+                marker_pin=self.buttons_cfg.marker_pin,
+                debounce_ms=self.buttons_cfg.debounce_ms,
+            ),
+            on_mode=self._cycle_mode,
+            on_profile=self._cycle_profile,
+            on_marker=self._emit_marker,
+        )
+        try:
+            self._buttons.start()
+        except Exception as e:
+            print(f"[buttons] init failed: {e}")
+
+    def _cycle_mode(self):
+        with self._lock:
+            modes = [PolicyMode.PERIODIC, PolicyMode.FIXED_TAU, PolicyMode.ADAPTIVE]
+            cur_idx = modes.index(self.mode) if self.mode in modes else 0
+            next_mode = modes[(cur_idx + 1) % len(modes)]
+            if next_mode == PolicyMode.ADAPTIVE and not self._arms_cfg:
+                print("[buttons] adaptive mode unavailable (no arms config).")
+                return
+            self.mode = next_mode
+            self._status.update_policy(mode=self.mode)
+            print(f"[buttons] mode -> {self.mode.value}")
+            self._refresh_policies()
+
+    def _cycle_profile(self):
+        with self._lock:
+            profiles = [
+                LinkProfile.SLOW_10KBPS,
+                LinkProfile.DELAY_LOSS,
+                LinkProfile.CELLULAR_VAR,
+            ]
+            cur_idx = profiles.index(self.profile) if self.profile in profiles else 0
+            self.profile = profiles[(cur_idx + 1) % len(profiles)]
+            self._status.update_policy(profile=self.profile)
+            print(f"[buttons] profile -> {self.profile.value}")
+            self._apply_link_profile()
+            self._refresh_policies()
+
+    def _emit_marker(self):
+        ts = time.time_ns()
+        payload = json.dumps(
+            {
+                "ts": ts,
+                "device_id": self.device_id,
+                "type": "marker",
+                "note": "button_press",
+            }
+        ).encode("utf-8")
+        try:
+            self._status.record_payload(len(payload), ts)
+            self.outbox.enqueue(
+                f"marker/{self.device_id}", payload, qos=1, retain=False, created_ns=ts
+            )
+            print("[buttons] marker emitted")
+        except Exception as e:
+            print(f"[buttons] marker enqueue failed: {e}")
+
+    def _apply_link_profile(self):
+        if not self.link_cfg.apply_on_button:
+            return
+        try:
+            tc_profiles.apply_profile(
+                self.link_cfg.iface, self.profile.value, both=self.link_cfg.both
+            )
+            print(f"[tc] applied profile {self.profile.value} on {self.link_cfg.iface}")
+        except Exception as e:
+            print(f"[tc] apply failed: {e}")
+
+    def _refresh_policies(self):
+        # 현재 모드/프로파일을 반영해 정책 실행기를 재생성
+        if self.mic_cfg.enable:
+            self._mic_policy = self._build_policy_runtime(
+                sensor=SensorType.MIC_RMS,
+                alpha=self.mic_cfg.alpha,
+                tau=self.mic_cfg.tau,
+                kbits=self.mic_cfg.kbits,
+                heartbeat_s=self.mic_cfg.heartbeat_s,
+                min_emit_ms=self.mic_cfg.min_emit_ms,
+                nominal_period_s=self.mic_cfg.frame_ms / 1000.0,
+            )
+        if self.temp_cfg.enable:
+            self._temp_policy = self._build_policy_runtime(
+                sensor=SensorType.TEMP,
+                alpha=self.temp_cfg.alpha,
+                tau=self.temp_cfg.tau,
+                kbits=self.temp_cfg.kbits,
+                heartbeat_s=self.temp_cfg.heartbeat_s,
+                min_emit_ms=self.temp_cfg.min_emit_ms,
+                nominal_period_s=(
+                    (1.0 / self.temp_cfg.sample_hz) if self.temp_cfg.sample_hz > 0 else 1.0
+                ),
+            )
+
     def _mic_loop(self):
         cfg = self.mic_cfg
         # 센서 준비
@@ -290,33 +444,27 @@ class EdgeDaemon:
             arecord_device=cfg.arecord_device,
             sounddevice_device=cfg.sounddevice_device,
         )
-        pred = EWMAPredictor(EWMAConfig(
-            device_id=self.device_id,
+        self._mic_policy = self._build_policy_runtime(
             sensor=SensorType.MIC_RMS,
             alpha=cfg.alpha,
             tau=cfg.tau,
             kbits=cfg.kbits,
-            profile=self.profile,
             heartbeat_s=cfg.heartbeat_s,
-            min_emit_interval_ms=cfg.min_emit_ms,
-            bootstrap_emit=True,
-        ))
-        print(f"[edge] mic loop started: {self._mic_obj!r} α={cfg.alpha} τ={cfg.tau} k={cfg.kbits}")
+            min_emit_ms=cfg.min_emit_ms,
+            nominal_period_s=cfg.frame_ms / 1000.0,
+        )
+        print(
+            f"[edge] mic loop started: {self._mic_obj!r} mode={self.mode.value} "
+            f"α={cfg.alpha} τ={cfg.tau} k={cfg.kbits}"
+        )
         try:
             for s in self._mic_obj.stream(duration_s=None):
                 if self._stop.is_set():
                     break
                 self._status.update_mic(s.dbfs, s.clip_ratio)
-                evt = pred.predict_and_maybe_emit(s)
-                if evt is None:
-                    continue
-                # Outbox 적재(QoS1), created_ns=evt.ts → AoI/Rate 재현성
-                try:
-                    payload = evt.to_json_bytes()
-                    self._status.record_payload(len(payload), evt.ts)
-                    self.outbox.enqueue(evt.mqtt_topic(), payload, qos=1, retain=False, created_ns=evt.ts)
-                except Exception as e:
-                    print(f"[edge] outbox enqueue error(mic): {e}")
+                pending = self.outbox.pending()
+                res = self._mic_policy.step(s, outbox_pending=pending)
+                self._handle_step_result(res, label="mic", sensor=SensorType.MIC_RMS)
         except SystemExit:
             pass
         except Exception as e:
@@ -338,32 +486,27 @@ class EdgeDaemon:
             w1_path=cfg.w1_path,
             sysfs_path=cfg.sysfs_path,
         )
-        pred = EWMAPredictor(EWMAConfig(
-            device_id=self.device_id,
+        self._temp_policy = self._build_policy_runtime(
             sensor=SensorType.TEMP,
             alpha=cfg.alpha,
             tau=cfg.tau,
             kbits=cfg.kbits,
-            profile=self.profile,
             heartbeat_s=cfg.heartbeat_s,
-            min_emit_interval_ms=cfg.min_emit_ms,
-            bootstrap_emit=True,
-        ))
-        print(f"[edge] temp loop started: {self._temp_obj!r} α={cfg.alpha} τ={cfg.tau} k={cfg.kbits}")
+            min_emit_ms=cfg.min_emit_ms,
+            nominal_period_s=(1.0 / cfg.sample_hz) if cfg.sample_hz > 0 else 1.0,
+        )
+        print(
+            f"[edge] temp loop started: {self._temp_obj!r} mode={self.mode.value} "
+            f"α={cfg.alpha} τ={cfg.tau} k={cfg.kbits}"
+        )
         try:
             for s in self._temp_obj.stream(duration_s=None):
                 if self._stop.is_set():
                     break
                 self._status.update_temp(s.celsius, s.valid)
-                evt = pred.predict_and_maybe_emit(s)
-                if evt is None:
-                    continue
-                try:
-                    payload = evt.to_json_bytes()
-                    self._status.record_payload(len(payload), evt.ts)
-                    self.outbox.enqueue(evt.mqtt_topic(), payload, qos=1, retain=False, created_ns=evt.ts)
-                except Exception as e:
-                    print(f"[edge] outbox enqueue error(temp): {e}")
+                pending = self.outbox.pending()
+                res = self._temp_policy.step(s, outbox_pending=pending)
+                self._handle_step_result(res, label="temp", sensor=SensorType.TEMP)
         except SystemExit:
             pass
         except Exception as e:
@@ -374,6 +517,96 @@ class EdgeDaemon:
             except Exception:
                 pass
             print("[edge] temp loop stopped")
+
+    def _handle_step_result(self, res: StepResult, *, label: str, sensor: SensorType) -> None:
+        # 상태/UI 업데이트
+        self._status.record_metrics(
+            sensor=sensor,
+            aoi_ms=res.aoi_ms,
+            mae=res.mae_est,
+            rate_bps=res.rate_bps,
+        )
+        if res.event is not None:
+            try:
+                payload = res.event.to_json_bytes()
+                self._status.record_payload(len(payload), res.event.ts)
+                self.outbox.enqueue(
+                    res.event.mqtt_topic(),
+                    payload,
+                    qos=1,
+                    retain=False,
+                    created_ns=res.event.ts,
+                )
+            except Exception as e:
+                print(f"[edge] outbox enqueue error({label} event): {e}")
+        if res.decision is not None:
+            try:
+                payload = res.decision.to_json_bytes()
+                self._status.record_payload(len(payload), res.decision.ts)
+                self.outbox.enqueue(
+                    res.decision.mqtt_topic(),
+                    payload,
+                    qos=1,
+                    retain=False,
+                    created_ns=res.decision.ts,
+                )
+            except Exception as e:
+                print(f"[edge] outbox enqueue error({label} decision): {e}")
+
+    def _build_policy_runtime(
+        self,
+        *,
+        sensor: SensorType,
+        alpha: float,
+        tau: float,
+        kbits: int,
+        heartbeat_s: float | None,
+        min_emit_ms: int,
+        nominal_period_s: float | None,
+    ) -> SensorPolicyRuntime:
+        ewma_cfg = EWMAConfig(
+            device_id=self.device_id,
+            sensor=sensor,
+            alpha=alpha,
+            tau=tau,
+            kbits=kbits,
+            profile=self.profile,
+            heartbeat_s=heartbeat_s,
+            min_emit_interval_ms=min_emit_ms,
+            bootstrap_emit=True,
+        )
+        linucb_cfg = None
+        if self.mode == PolicyMode.ADAPTIVE:
+            linucb_cfg = self._make_linucb_config(sensor)
+        return SensorPolicyRuntime(
+            device_id=self.device_id,
+            sensor=sensor,
+            profile=self.profile,
+            mode=self.mode,
+            ewma_cfg=ewma_cfg,
+            linucb_cfg=linucb_cfg,
+            nominal_period_s=nominal_period_s,
+        )
+
+    def _make_linucb_config(self, sensor: SensorType):
+        cfg = self._arms_cfg or {}
+        arms = cfg.get("arms") or []
+        if not arms:
+            raise ValueError("adaptive mode requires arms in config (see configs/policy.yaml)")
+        mae_scale = max(float(a.get("tau", 1.0)) for a in arms)
+        if mae_scale <= 0:
+            mae_scale = 1.0
+        res_scale = mae_scale
+        resvar_scale = mae_scale * mae_scale
+        return load_linucb_config(
+            cfg,
+            device_id=self.device_id,
+            sensor=sensor,
+            profile=self.profile,
+            mae_scale=mae_scale,
+            res_scale=res_scale,
+            resvar_scale=resvar_scale,
+        )
 
     # ---------- 기타 ----------
 
@@ -401,7 +634,18 @@ def main():
     p = argparse.ArgumentParser(description="Edge daemon: sensors → EWMA(τ) → Outbox → MQTT QoS1")
     # 공통
     p.add_argument("--device-id", required=True)
-    p.add_argument("--profile", choices=[e.value for e in LinkProfile], default=LinkProfile.SLOW_10KBPS.value)
+    p.add_argument(
+        "--profile",
+        choices=[e.value for e in LinkProfile],
+        default=LinkProfile.SLOW_10KBPS.value,
+    )
+    p.add_argument(
+        "--mode",
+        choices=[e.value for e in PolicyMode],
+        default=PolicyMode.FIXED_TAU.value,
+        help="policy mode: periodic | fixed_tau | adaptive (LinUCB)",
+    )
+    p.add_argument("--arms", default="configs/policy.yaml", help="(adaptive) arms YAML path")
     p.add_argument("--run-dir", default=None, help="기록 루트(artifacts/<ts>_<device_id> 기본)")
     p.add_argument("--broker", default="localhost")
     p.add_argument("--port", type=int, default=1883)
@@ -414,7 +658,9 @@ def main():
     # RTC 옵션
     p.add_argument("--rtc-enable", action="store_true", default=False, help="DS3231 RTC 가드 활성화")
     p.add_argument("--rtc-bus", type=int, default=1, help="DS3231 I2C bus 번호")
-    p.add_argument("--rtc-address", type=_parse_int_auto, default=0x68, help="DS3231 I2C 주소(예: 0x68)")
+    p.add_argument(
+        "--rtc-address", type=_parse_int_auto, default=0x68, help="DS3231 I2C 주소(예: 0x68)"
+    )
     p.add_argument("--rtc-drift-guard", type=float, default=2.0, help="RTC와 시스템간 허용 오차(초)")
     p.add_argument("--rtc-resync", type=float, default=900.0, help="재동기화 주기(초), <=0이면 1회만")
     p.add_argument("--rtc-push-system", action="store_true", help="시스템 시간이 앞설 때 RTC에 기록")
@@ -448,11 +694,38 @@ def main():
     p.add_argument("--ui-enable", action="store_true", default=False, help="I2C LCD/OLED 상태 표시")
     p.add_argument("--ui-kind", choices=["auto", "lcd1602", "ssd1306", "console"], default="auto")
     p.add_argument("--ui-bus", type=int, default=1, help="I2C bus 번호 (기본 1)")
-    p.add_argument("--ui-address", type=_parse_int_auto, default=None, help="LCD/OLED I2C 주소 override")
+    p.add_argument(
+        "--ui-address", type=_parse_int_auto, default=None, help="LCD/OLED I2C 주소 override"
+    )
     p.add_argument("--ui-refresh", type=float, default=1.0, help="표시 갱신 주기(초)")
     p.add_argument("--ui-rate-window", type=float, default=10.0, help="전송률 이동 평균 윈도우(초)")
 
+    # 버튼/링크 제어
+    p.add_argument(
+        "--buttons-enable",
+        action="store_true",
+        default=False,
+        help="GPIO 버튼(모드/링크/마커) 사용",
+    )
+    p.add_argument("--btn-mode-pin", type=int, default=17, help="정책 모드 버튼 BCM 핀")
+    p.add_argument("--btn-profile-pin", type=int, default=27, help="링크 프로파일 버튼 BCM 핀")
+    p.add_argument("--btn-marker-pin", type=int, default=22, help="마커 버튼 BCM 핀")
+    p.add_argument("--btn-debounce-ms", type=int, default=200, help="버튼 디바운스(ms)")
+    p.add_argument("--tc-iface", default="eth0", help="tc 적용할 인터페이스 (버튼 프로파일 변경 시)")
+    p.add_argument("--tc-both", action="store_true", help="ingress(ifb0)도 shaping")
+    p.add_argument(
+        "--tc-apply-on-button",
+        action="store_true",
+        help="버튼 프로파일 변경 시 tc 즉시 적용(root 필요)",
+    )
+
     args = p.parse_args()
+
+    policy_mode = PolicyMode(args.mode)
+    profile = LinkProfile(args.profile)
+    arms_cfg: dict | None = None
+    if policy_mode == PolicyMode.ADAPTIVE:
+        arms_cfg = _load_policy_yaml(args.arms)
 
     # 기본 run-dir/outbox
     run_dir = args.run_dir or _default_run_dir(args.device_id)
@@ -495,6 +768,20 @@ def main():
         rate_window_s=args.ui_rate_window,
     )
 
+    buttons_cfg = ButtonsCfg(
+        enable=bool(args.buttons_enable),
+        mode_pin=args.btn_mode_pin,
+        profile_pin=args.btn_profile_pin,
+        marker_pin=args.btn_marker_pin,
+        debounce_ms=args.btn_debounce_ms,
+    )
+
+    link_cfg = LinkCfg(
+        iface=args.tc_iface,
+        both=bool(args.tc_both),
+        apply_on_button=bool(args.tc_apply_on_button),
+    )
+
     if not mic_cfg.enable and not temp_cfg.enable:
         print("[edge] ERROR: at least one sensor must be enabled (--mic-enable / --temp-enable)")
         sys.exit(2)
@@ -510,7 +797,9 @@ def main():
 
     daemon = EdgeDaemon(
         device_id=args.device_id,
-        profile=LinkProfile(args.profile),
+        profile=profile,
+        mode=policy_mode,
+        arms_cfg=arms_cfg,
         outbox_path=outbox_path,
         broker=args.broker,
         port=args.port,
@@ -520,6 +809,8 @@ def main():
         temp=temp_cfg,
         rtc=rtc_cfg,
         ui=ui_cfg,
+        buttons=buttons_cfg,
+        link=link_cfg,
     )
     try:
         daemon.start()
@@ -528,6 +819,22 @@ def main():
 
 
 # 작은 실수 방지: heartbeat 0/음수 → 비활성(None) 변환용 헬퍼 (가독성 위해 분리)
+def _load_policy_yaml(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except FileNotFoundError:
+        print(f"[edge] ERROR: arms config not found: {path}")
+        sys.exit(2)
+    except Exception as e:
+        print(f"[edge] ERROR: failed to load arms config {path}: {e}")
+        sys.exit(2)
+    if not isinstance(data, dict):
+        print(f"[edge] ERROR: arms config must be a mapping")
+        sys.exit(2)
+    return data
+
+
 def _hb_none(x: float | None) -> float | None:
     if x is None:
         return None

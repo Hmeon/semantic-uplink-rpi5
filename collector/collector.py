@@ -60,6 +60,8 @@ class Collector:
         self._events: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
         # policy decisions는 전부 저장(중복 처리 불필요)
         self._decisions: List[Dict[str, Any]] = []
+        # 마커(버튼/실험) 로그
+        self._markers: List[Dict[str, Any]] = []
 
         # 통계/메타
         self._bytes_total = 0
@@ -91,7 +93,11 @@ class Collector:
             return
         client.subscribe("edge/+/+/event", qos=1)
         client.subscribe("policy/+/decision", qos=1)
-        print(f"[collector] connected to mqtt://{self.cfg.broker}:{self.cfg.port}, subscribed topics.")
+        client.subscribe("marker/+", qos=1)
+        print(
+            f"[collector] connected to mqtt://{self.cfg.broker}:{self.cfg.port}, "
+            "subscribed topics."
+        )
 
     def _on_message(self, client: mqtt.Client, userdata, msg: mqtt.MQTTMessage):
         t_recv_ns = time.time_ns()
@@ -104,9 +110,13 @@ class Collector:
         retain = msg.retain
         try:
             if topic.startswith("edge/") and topic.endswith("/event"):
-                self._handle_event_message(topic, payload, qos, dup, retain, t_recv_ns=t_recv_ns)
+                self._handle_event_message(
+                    topic, payload, qos, dup, retain, t_recv_ns=t_recv_ns
+                )
             elif topic.startswith("policy/") and topic.endswith("/decision"):
                 self._handle_decision_message(topic, payload, t_recv_ns=t_recv_ns)
+            elif topic.startswith("marker/"):
+                self._handle_marker_message(topic, payload, t_recv_ns=t_recv_ns)
             else:
                 # 기타 토픽은 무시(명세 외)
                 return
@@ -129,7 +139,19 @@ class Collector:
         data = json.loads(payload_bytes.decode("utf-8"))
         # 필수 필드 검증 (스키마: Event)
         # ts: int64 ns, seq: u64, device_id, sensor, val, pred, res, tau, kbits, profile, policy
-        required = ("ts", "seq", "device_id", "sensor", "val", "pred", "res", "tau", "kbits", "profile", "policy")
+        required = (
+            "ts",
+            "seq",
+            "device_id",
+            "sensor",
+            "val",
+            "pred",
+            "res",
+            "tau",
+            "kbits",
+            "profile",
+            "policy",
+        )
         missing = [k for k in required if k not in data]
         if missing:
             raise ValueError(f"missing fields: {missing}")
@@ -184,7 +206,9 @@ class Collector:
 
     # --------------- 정책결정 처리 ---------------
 
-    def _handle_decision_message(self, topic: str, payload_bytes: bytes, t_recv_ns: int | None = None):
+    def _handle_decision_message(
+        self, topic: str, payload_bytes: bytes, t_recv_ns: int | None = None
+    ):
         if t_recv_ns is None:
             t_recv_ns = time.time_ns()
         data = json.loads(payload_bytes.decode("utf-8"))
@@ -210,6 +234,23 @@ class Collector:
         with self._lock:
             self._decisions.append(rec)
 
+    def _handle_marker_message(
+        self, topic: str, payload_bytes: bytes, t_recv_ns: int | None = None
+    ):
+        if t_recv_ns is None:
+            t_recv_ns = time.time_ns()
+        data = json.loads(payload_bytes.decode("utf-8"))
+        rec = {
+            "ts": int(data.get("ts", t_recv_ns)),
+            "t_recv_ns": int(t_recv_ns),
+            "device_id": str(data.get("device_id", "unknown")),
+            "note": str(data.get("note", "")),
+            "topic": topic,
+        }
+        with self._lock:
+            self._markers.append(rec)
+        print(f"[marker] {rec['device_id']} {rec['note']} @ {rec['ts']}")
+
     # --------------- 저장/플러시 ---------------
 
     def _flush(self):
@@ -217,6 +258,7 @@ class Collector:
         with self._lock:
             events_list = list(self._events.values())
             decisions_list = list(self._decisions)
+            markers_list = list(self._markers)
             bytes_total = int(self._bytes_total)
             dup_msgs = int(self._dup_messages)
             dup_bytes = int(self._dup_bytes)
@@ -260,6 +302,13 @@ class Collector:
             df_d.to_parquet(tmp, index=False)
             os.replace(tmp, dst)
 
+        if markers_list:
+            df_m = pd.DataFrame.from_records(markers_list)
+            tmp = os.path.join(self._logs_dir, "markers.parquet.tmp")
+            dst = os.path.join(self._logs_dir, "markers.parquet")
+            df_m.to_parquet(tmp, index=False)
+            os.replace(tmp, dst)
+
         # 메타 저장
         meta = {
             "run_id": os.path.basename(self.cfg.run_dir.rstrip("/")),
@@ -272,6 +321,7 @@ class Collector:
             "dup_bytes_dropped": dup_bytes,
             "events_unique": len(events_list),
             "decisions_count": len(decisions_list),
+            "markers_count": len(markers_list),
         }
         tmp = os.path.join(self._logs_dir, "collector_meta.json.tmp")
         dst = os.path.join(self._logs_dir, "collector_meta.json")
@@ -279,11 +329,15 @@ class Collector:
             json.dump(meta, f, ensure_ascii=False, indent=2)
         os.replace(tmp, dst)
 
-        print(f"[collector] flush: events={len(events_list)} decisions={len(decisions_list)} "
-              f"bytes_total={bytes_total} dup_msgs={dup_msgs}")
+        print(
+            f"[collector] flush: events={len(events_list)} decisions={len(decisions_list)} "
+            f"markers={len(markers_list)} bytes_total={bytes_total} dup_msgs={dup_msgs}"
+        )
 
     def start(self):
-        self._client = mqtt.Client(client_id=self.cfg.client_id, clean_session=True, protocol=mqtt.MQTTv311)
+        self._client = mqtt.Client(
+            client_id=self.cfg.client_id, clean_session=True, protocol=mqtt.MQTTv311
+        )
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message
         # subscriber side는 username/password 필요시 환경변수 등으로 확장
@@ -338,7 +392,9 @@ class Collector:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Semantic Uplink Collector (QoS1 de-dup, Parquet sink)")
+    parser = argparse.ArgumentParser(
+        description="Semantic Uplink Collector (QoS1 de-dup, Parquet sink)"
+    )
     parser.add_argument("--run-dir", required=True, help="artifacts/{run_id} 경로(사전 생성 권장)")
     parser.add_argument("--broker", default="localhost")
     parser.add_argument("--port", type=int, default=1883)
