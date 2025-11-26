@@ -424,6 +424,7 @@ See `configs/` YAML files to change experiment settings without touching code.
 ├── tests/ — unit & integration coverage for policies, quantization, webhooks, etc.
 ├── configs/ — reproducible YAML profiles for devices, policies, and link shapes
 ├── docs/figma/ — architecture and sequence diagrams embedded in this README
+├── docs/hardware.md — RPi5 wiring (LCD/buttons/buzzer/DS18B20)
 ├── infra/mosquitto/ — broker configuration templates
 ├── models/ — (reserved) ML artefacts and checkpoints
 ├── data/, logs/ — experiment outputs and runtime diagnostics
