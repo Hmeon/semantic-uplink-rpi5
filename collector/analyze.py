@@ -584,6 +584,8 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
     for (run_id, prof, pol, sensor), g in df.groupby(keys, sort=False):
         # 시간축: 수집기 수신 시각이 있으면 그 기준으로 AoI/Rate를 계산(논문/보고서 관점에 더 적합)
         use_recv = "t_recv_ns" in g.columns and g["t_recv_ns"].notna().any()
+        rx_delay_mean_ms = float("nan")
+        rx_delay_p95_ms = float("nan")
         if use_recv:
             g = g.sort_values("t_recv_ns", kind="mergesort")
             recv = g["t_recv_ns"].astype("int64").to_numpy()
@@ -598,6 +600,10 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
                 total_bytes = float(g["mqtt_bytes"].sum())
                 rate = (total_bytes / dur_s) if dur_s > 0 else np.nan
                 aoi_mean, aoi_p95 = aoi_mean_and_p95_from_rx(gen, recv)
+                rx_delay_ms = np.maximum((recv - gen).astype("float64") / 1e6, 0.0)
+                if rx_delay_ms.size > 0:
+                    rx_delay_mean_ms = float(np.mean(rx_delay_ms))
+                    rx_delay_p95_ms = float(np.quantile(rx_delay_ms, 0.95))
         else:
             ts = np.sort(g["ts"].astype("int64").to_numpy())
             if ts.size < 2:
@@ -627,13 +633,32 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
         mae_mean = float(g["res"].abs().mean())
         mae_p95 = float(g["res"].abs().quantile(0.95)) if len(g) > 0 else np.nan
 
+        # seq gap 기반 샘플 수/전송 비율 추정 (per-sensor seq가 매 샘플 +1 된다는 가정)
+        g_seq = g.sort_values("ts", kind="mergesort")
+        seq = g_seq["seq"].astype("int64").to_numpy()
+        if seq.size == 0:
+            n_samples_est = 0
+            n_suppressed_est = 0
+            send_ratio = float("nan")
+        else:
+            diffs = np.diff(seq)
+            n_suppressed_est = int(np.sum(np.maximum(diffs - 1, 0)))
+            n_samples_est = int(seq.size + n_suppressed_est)
+            send_ratio = float(seq.size / n_samples_est) if n_samples_est > 0 else float("nan")
+
+        event_rate_hz = float(len(g) / dur_s) if math.isfinite(dur_s) and dur_s > 0 else float("nan")
+
         rows.append({
             "run_id": str(run_id),
             "profile": str(prof),
             "policy": str(pol),
             "sensor": str(sensor),
             "n_events": int(len(g)),
+            "n_samples_est": int(n_samples_est),
+            "n_suppressed_est": int(n_suppressed_est),
+            "send_ratio": float(send_ratio),
             "duration_s": dur_s,
+            "event_rate_hz": float(event_rate_hz),
             "rate_Bps": rate,
             "aoi_mean_ms": aoi_mean,
             "aoi_p95_ms": aoi_p95,
@@ -641,6 +666,8 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
             "mae_event_p95": mae_p95,
             "kbits_mean": float(g["kbits"].mean()),
             "time_base": time_base,
+            "rx_delay_mean_ms": float(rx_delay_mean_ms),
+            "rx_delay_p95_ms": float(rx_delay_p95_ms),
         })
 
     out = pd.DataFrame(rows)
@@ -688,6 +715,9 @@ def summarize(summary_by_run: pd.DataFrame) -> pd.DataFrame:
         "mae_event_p95",
         "kbits_mean",
     ]
+    for c in ["event_rate_hz", "send_ratio", "rx_delay_mean_ms", "rx_delay_p95_ms"]:
+        if c in summary_by_run.columns:
+            metric_cols.append(c)
 
     rows = []
     for (prof, pol, sensor), g in summary_by_run.groupby(
@@ -701,6 +731,9 @@ def summarize(summary_by_run: pd.DataFrame) -> pd.DataFrame:
             "n_runs": n_runs,
             "n_events": int(g["n_events"].sum()),
         }
+        for c in ["n_samples_est", "n_suppressed_est"]:
+            if c in g.columns:
+                row[c] = int(g[c].sum())
         for c in metric_cols:
             row[c] = float(g[c].mean())
             row[f"{c}_std"] = float(g[c].std(ddof=1)) if n_runs >= 2 else float("nan")

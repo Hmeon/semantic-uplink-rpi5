@@ -33,7 +33,7 @@
 - GitHub Actions CI를 Python 3.11로 조정하고, 의존성 설치 실패를 숨기던 `|| true`를 제거했습니다.
 
 ### ✅ 새 문서 추가
-- `CODEX.md`: Codex로 열었을 때 1~3분 내 프로젝트 전체를 파악하고 실행/디버깅할 수 있도록 만든 “Start Here” 메뉴얼
+- `CODEX.md`: Codex로 열었을 때 1~3분 내 프로젝트 전체를 파악하고 실행/디버깅할 수 있도록 만든 “Start Here” 메뉴얼 (Git에 포함하려면 `git add CODEX.md`)
 
 ### ✅ 평가/분석 파이프라인 강화(논문/최종보고서용)
 - `collector/analyze.py`를 “3개 정책 비교(Periodic / Fixed τ / Adaptive)”에 맞춰 강화했습니다.
@@ -41,6 +41,7 @@
   - AoI/Rate 계산을 **수집기 수신 시각(`t_recv_ns`)** 기준으로 수행(없으면 `ts` 폴백)
   - AoI P95 계산 로직을 세그먼트 기반으로 일반화하여 정확도/안정성을 개선
   - 반복 실험(run replicate) 지원: run 단위 지표(`metrics_by_run.csv`) → 평균/표준편차(`metrics_summary.csv`)
+  - 보조 지표 추가: `event_rate_hz`, `send_ratio`(SEQ gap 기반), `rx_delay_mean_ms/rx_delay_p95_ms`(수신시각 존재 시)
   - baseline 대비 비교표(`metrics_vs_<baseline>.csv`) 자동 생성(기본 baseline=`periodic`)
   - `report.md`에 지표 요약 + baseline 비교 + (옵션) figures 임베드
 - `experiments/run_scenarios.py`를 재현성/자동화 관점에서 정합하게 수정했습니다.
@@ -55,8 +56,8 @@
   - `README.md`, `CODEX.md`: 분석 산출물(3종 CSV + report + figures)과 반복 실험 워크플로우를 반영
 - plotting 의존성 추가
   - `requirements.txt`, `pyproject.toml`에 `matplotlib`을 추가하여 figures 생성이 기본 환경에서 동작하도록 했습니다.
- - 논문용 추가 플롯(`paper_*.png`)
-   - reward over time, predicted regret, LinUCB θ(weight) 수렴, action heatmap, stability(|res|), 타임라인(annotated) 등을 `collector/analyze.py`가 자동 생성합니다.
+- 논문용 추가 플롯(`paper_*.png`)
+  - reward over time, predicted regret, LinUCB θ(weight) 수렴, action heatmap, stability(|res|), 타임라인(annotated) 등을 `collector/analyze.py`가 자동 생성합니다.
 
 ---
 
