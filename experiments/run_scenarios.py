@@ -76,6 +76,8 @@ class ExperimentPlan:
     max_inflight: int = 10
     with_collector: bool = False    # collector 프로세스 병행 (수집기 구현 수준에 따라 False 권장)
     tc_var_period_s: Optional[int] = None  # cellular_var 토글 주기(초); None=프로파일 기본
+    repeats: int = 1                  # 시나리오 반복 횟수(리플리케이트)
+    collector_flush_interval_s: int = 10
 
 
 @dataclass(slots=True)
@@ -124,18 +126,18 @@ class ScenarioRunner:
             # 1) tc 적용
             self._apply_profile(sc.profile)
 
-            # 2) edge_daemon 실행
-            edge_cmd = self._edge_cmd(sc)
-            edge_proc = self._popen(edge_cmd, stdout=log_edge, stderr=subprocess.STDOUT)
-            print(f"[exp] edge_daemon pid={edge_proc.pid}")
-
-            # 3) collector (옵션)
+            # 2) collector (옵션) - 먼저 띄워서 초기 이벤트 누락을 줄임
             col_proc = None
             if p.with_collector:
                 col_cmd = self._collector_cmd(sc)
                 if col_cmd:
                     col_proc = self._popen(col_cmd, stdout=log_col, stderr=subprocess.STDOUT)
                     print(f"[exp] collector pid={col_proc.pid}")
+
+            # 3) edge_daemon 실행
+            edge_cmd = self._edge_cmd(sc)
+            edge_proc = self._popen(edge_cmd, stdout=log_edge, stderr=subprocess.STDOUT)
+            print(f"[exp] edge_daemon pid={edge_proc.pid}")
 
             # 4) Warmup → Run → Cooldown
             self._phase_sleep("warmup", p.warmup_s)
@@ -197,23 +199,37 @@ class ScenarioRunner:
         except Exception:
             print("[exp] WARN: collector module not available; skipping collector.")
             return None
-        out_path = sc.out_dir / "collector.sqlite"
         return [
             sys.executable, "-m", "collector.collector",
+            "--run-dir", str(sc.out_dir),
             "--broker", self.plan.broker,
             "--port", str(self.plan.port),
-            "--out", str(out_path),
+            "--flush-interval-s", str(self.plan.collector_flush_interval_s),
+            "--client-id", f"collector-{self.plan.device_id}",
         ]
 
     # --------- tc 프로파일 적용/해제 ---------
 
     def _apply_profile(self, profile: LinkProfile) -> None:
-        if os.geteuid() != 0:
-            print("[exp] WARN: not running as root; tc shaping may fail.", file=sys.stderr)
-        varp = self.plan.tc_var_period_s
-        tc_apply(self.plan.iface, profile.value, both=self.plan.both, var_period_s=varp)
-        self._active_tc = True
-        print(f"[exp] tc applied: iface={self.plan.iface} both={self.plan.both} profile={profile.value}")
+        geteuid = getattr(os, "geteuid", None)
+        if geteuid is None:
+            print("[exp] WARN: tc shaping is not supported on this OS; skipping.", file=sys.stderr)
+            self._active_tc = False
+            return
+        if geteuid is not None and geteuid() != 0:
+            print("[exp] WARN: not running as root; skipping tc shaping.", file=sys.stderr)
+            self._active_tc = False
+            return
+        try:
+            varp = self.plan.tc_var_period_s
+            tc_apply(self.plan.iface, profile.value, both=self.plan.both, var_period_s=varp)
+            self._active_tc = True
+            print(
+                f"[exp] tc applied: iface={self.plan.iface} both={self.plan.both} profile={profile.value}"
+            )
+        except PermissionError as e:
+            print(f"[exp] WARN: tc apply failed (not root?): {e}", file=sys.stderr)
+            self._active_tc = False
 
     def _clear_profile(self) -> None:
         if self._active_tc:
@@ -277,9 +293,14 @@ def build_scenarios(plan: ExperimentPlan) -> List[Scenario]:
         lp = LinkProfile(prof_s)
         for mode_s in plan.modes:
             pm = PolicyMode(mode_s)
-            name = f"{lp.value}__{pm.value}"
-            out_dir = root / name
-            scenarios.append(Scenario(profile=lp, mode=pm, name=name, out_dir=out_dir))
+            for rep in range(max(1, int(plan.repeats))):
+                name = (
+                    f"{lp.value}__{pm.value}"
+                    if int(plan.repeats) <= 1
+                    else f"{lp.value}__{pm.value}__rep{rep + 1:02d}"
+                )
+                out_dir = root / name
+                scenarios.append(Scenario(profile=lp, mode=pm, name=name, out_dir=out_dir))
     return scenarios
 
 
@@ -338,8 +359,12 @@ def parse_args() -> ExperimentPlan:
     ap.add_argument("--broker", default="localhost")
     ap.add_argument("--port", type=int, default=1883)
 
-    ap.add_argument("--use-mic", action="store_true")
-    ap.add_argument("--use-temp", action="store_true")
+    # 기본은 둘 다 활성(평가/데모 기준). 필요 시 --no-mic / --no-temp 로 비활성.
+    ap.add_argument("--mic", dest="use_mic", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument("--temp", dest="use_temp", action=argparse.BooleanOptionalAction, default=True)
+    # backward compatible(숨김): 예전 플래그
+    ap.add_argument("--use-mic", dest="use_mic", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--use-temp", dest="use_temp", action="store_true", help=argparse.SUPPRESS)
 
     ap.add_argument("--mic-sr", type=int, default=16000)
     ap.add_argument("--mic-frame-ms", type=int, default=100)
@@ -361,6 +386,8 @@ def parse_args() -> ExperimentPlan:
                     help="comma-separated profile names")
     ap.add_argument("--with-collector", action="store_true")
     ap.add_argument("--tc-var-period", type=int, default=None, help="cellular_var toggle period (seconds)")
+    ap.add_argument("--repeats", type=int, default=1, help="scenario repeats (replicates) per profile×mode")
+    ap.add_argument("--collector-flush-interval-s", type=int, default=10)
     args = ap.parse_args()
 
     plan = ExperimentPlan(
@@ -397,10 +424,12 @@ def parse_args() -> ExperimentPlan:
         profiles=tuple(p.strip() for p in args.profiles.split(",") if p.strip()),
         with_collector=bool(args.with_collector),
         tc_var_period_s=args.tc_var_period if args.tc_var_period is not None else None,
+        repeats=max(1, int(args.repeats)),
+        collector_flush_interval_s=max(1, int(args.collector_flush_interval_s)),
     )
     # 안전장치: 최소 한 센서 활성
     if not plan.use_mic and not plan.use_temp:
-        print("[exp] ERROR: enable at least one sensor (--use-mic and/or --use-temp)", file=sys.stderr)
+        print("[exp] ERROR: enable at least one sensor (--mic or --temp)", file=sys.stderr)
         sys.exit(2)
     # 모드/프로파일 유효성
     for m in plan.modes:

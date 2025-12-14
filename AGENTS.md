@@ -13,13 +13,25 @@
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -e .[dev]                # editable install with test/lint tools
-ruff .                               # lint (line length 100; see pyproject.toml)
+ruff check .                         # lint (line length 100; see pyproject.toml)
 pytest -q                            # unit + integration tests (pytest-asyncio enabled)
-python -m link.shaper.tc_profiles apply lo slow_10kbps   # apply link profile
-python -m collector.collector        # start collector
-python -m edge.edge_daemon --mode adaptive --arms configs/policy.yaml
+
+# link shaping (requires root; prefer lo during dev to avoid breaking host connectivity)
+sudo python -m link.shaper.tc_profiles apply --iface lo --profile slow_10kbps
+
+# start collector (run-dir is required)
+python -m collector.collector --run-dir artifacts/run1
+
+# start edge (safe dev example: temp mock + console UI)
+python -m edge.edge_daemon --device-id dev1 --mode periodic \
+  --temp-enable --temp-backend mock \
+  --ui-enable --ui-kind console
 ```
 `scripts/` exposes the same flows if you prefer shell entrypoints; keep the virtualenv active.
+
+## “Start Here” Docs
+- `CODEX.md`: quick manual (repo map, run commands, debugging checklist)
+- `PATCH_NOTES.md`: recent changes + resume guide
 
 ## Coding Style & Naming Conventions
 - Python 3.10+, 4-space indents, target line length 100. Run `ruff` before pushing; primary scope is `edge/policy` and `tests/`.

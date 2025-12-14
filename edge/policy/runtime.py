@@ -82,7 +82,17 @@ class SensorPolicyRuntime:
         if not valid:
             # 센서 오류 시 상태만 갱신하고 종료
             self._predictor.predict_and_maybe_emit(sample)
-            return StepResult(event=None, decision=None, reward=None)
+            last_emit_ns = self._predictor.last_emit_ns
+            aoi_ms = 0.0 if last_emit_ns is None else max(0.0, (ts_ns - last_emit_ns) / 1e6)
+            mae_est = self._estimate_mae(x_raw) if math.isfinite(x_raw) else 0.0
+            return StepResult(
+                event=None,
+                decision=None,
+                reward=None,
+                aoi_ms=float(aoi_ms),
+                mae_est=float(mae_est),
+                rate_bps=0.0,
+            )
 
         self._res_var.update(resid)
         res_var = self._res_var.var
