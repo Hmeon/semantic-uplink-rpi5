@@ -68,7 +68,7 @@
   - `results/run1/metrics_by_run.csv` (run 단위 지표; 리플리케이트/분산 확인용)
   - `results/run1/metrics_vs_periodic.csv` (baseline 대비 변화량/개선율)
   - `results/run1/report.md` (표 + baseline 비교 + (옵션) figures 임베드)
-  - (옵션) `results/run1/figures/*.png` (막대/파레토 이미지; `matplotlib` 설치 시 생성)
+  - (옵션) `results/run1/figures/*.png` (막대/파레토/논문용 `paper_*.png`; `matplotlib` 설치 시 생성)
   - (옵션) `--save-parquet` → `metrics_summary.parquet`
 
 ### 4) 최종 평가 리포트(권장: 논문/발표/데모용)

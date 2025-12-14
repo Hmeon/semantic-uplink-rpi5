@@ -55,6 +55,8 @@
   - `README.md`, `CODEX.md`: 분석 산출물(3종 CSV + report + figures)과 반복 실험 워크플로우를 반영
 - plotting 의존성 추가
   - `requirements.txt`, `pyproject.toml`에 `matplotlib`을 추가하여 figures 생성이 기본 환경에서 동작하도록 했습니다.
+ - 논문용 추가 플롯(`paper_*.png`)
+   - reward over time, predicted regret, LinUCB θ(weight) 수렴, action heatmap, stability(|res|), 타임라인(annotated) 등을 `collector/analyze.py`가 자동 생성합니다.
 
 ---
 
