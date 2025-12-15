@@ -49,7 +49,7 @@ class Config:
     max_runtime_s: float | None = None  # test helper: stop after N seconds
     dedup_cache_max_keys: int = 100_000
     dedup_cache_ttl_s: float = 300.0
-    clock_offset_ns: int = 0   # (옵션) edge→collector 보정치. 검증 단계에서는 0.
+    clock_offset_ns: int = 0   # (옵션) edge→collector 보정치. 검증 단계에서는 0. 
 
 
 class Collector:
@@ -105,7 +105,7 @@ class Collector:
         self._markers_part = self._next_part_index("markers")
 
     def _next_part_index(self, prefix: str) -> int:
-        pat = re.compile(rf"^{re.escape(prefix)}_(\\d+)\\.parquet$")
+        pat = re.compile(rf"^{re.escape(prefix)}_(\d+)\.parquet$")
         max_idx = 0
         try:
             for name in os.listdir(self._logs_dir):
@@ -131,7 +131,7 @@ class Collector:
             while len(self._seen_event_keys) > max_keys:
                 self._seen_event_keys.popitem(last=False)
 
-    # --------------- MQTT 수신 경로 ---------------
+    # --------------- MQTT 수신 경로 --------------- 
 
     def _on_connect(self, client: mqtt.Client, userdata, flags, rc, properties=None):
         if rc != 0:
@@ -170,7 +170,7 @@ class Collector:
             # 수집기는 손실보다 지속성이 중요 — 개별 메시지 실패는 기록만 하고 계속 진행
             print(f"[collector] ERROR processing topic={topic}: {e}")
 
-    # --------------- 이벤트 처리 ---------------
+    # --------------- 이벤트 처리 --------------- 
 
     def _handle_event_message(self, topic: str, payload_bytes: bytes,
                               qos: int, dup: bool, retain: bool,
@@ -265,7 +265,7 @@ class Collector:
         tag = "DUP" if is_dup else "OK"
         print(f"[event:{tag}] {device_id}/{sensor} seq={seq} aoi_ms={aoi_ms:.1f} bytes+={pkt_size}")
 
-    # --------------- 정책결정 처리 ---------------
+    # --------------- 정책결정 처리 --------------- 
 
     def _handle_decision_message(
         self, topic: str, payload_bytes: bytes, t_recv_ns: int | None = None
@@ -314,19 +314,20 @@ class Collector:
             self._markers_total += 1
         print(f"[marker] {rec['device_id']} {rec['note']} @ {rec['ts']}")
 
-    # --------------- 저장/플러시 ---------------
+    # --------------- 저장/플러시 --------------- 
 
     def _flush(self):
         """Write pending buffers to rotated Parquet parts and update collector_meta.json."""
         with self._flush_lock:
             with self._lock:
-                events_list = list(self._pending_events.values())
-                decisions_list = list(self._pending_decisions)
-                markers_list = list(self._pending_markers)
+                pending_events = self._pending_events
+                pending_decisions = self._pending_decisions
+                pending_markers = self._pending_markers
 
-                self._pending_events.clear()
-                self._pending_decisions.clear()
-                self._pending_markers.clear()
+                # swap buffers so we can flush without blocking the MQTT callback path on disk I/O
+                self._pending_events = {}
+                self._pending_decisions = []
+                self._pending_markers = []
 
                 bytes_total = int(self._bytes_total)
                 dup_msgs = int(self._dup_messages)
@@ -340,13 +341,13 @@ class Collector:
                 events_part: int | None = None
                 decisions_part: int | None = None
                 markers_part: int | None = None
-                if events_list:
+                if pending_events:
                     events_part = int(self._events_part)
                     self._events_part += 1
-                if decisions_list:
+                if pending_decisions:
                     decisions_part = int(self._decisions_part)
                     self._decisions_part += 1
-                if markers_list:
+                if pending_markers:
                     markers_part = int(self._markers_part)
                     self._markers_part += 1
 
@@ -356,37 +357,61 @@ class Collector:
                 df.to_parquet(tmp, index=False)
                 os.replace(tmp, dst)
 
-            if events_list and events_part is not None:
-                df_e = pd.DataFrame.from_records(events_list)
-                dtype_map = {
-                    "device_id": "string",
-                    "sensor": "string",
-                    "profile": "string",
-                    "policy": "string",
-                    "seq": "uint64",
-                    "ts_ns": "int64",
-                    "t_recv_ns": "int64",
-                    "val": "float64",
-                    "pred": "float64",
-                    "res": "float64",
-                    "tau": "float32",
-                    "kbits": "int16",
-                    "topic": "string",
-                    "mqtt_size_bytes": "int32",
-                    "dup_flag": "boolean",
-                }
-                for c, dt in dtype_map.items():
-                    if c in df_e.columns:
-                        df_e[c] = df_e[c].astype(dt)
-                _write_parquet(df_e, f"events_{events_part:06d}.parquet")
+            events_written = 0
+            decisions_written = 0
+            markers_written = 0
+            events_ok = False
+            decisions_ok = False
+            markers_ok = False
 
-            if decisions_list and decisions_part is not None:
-                df_d = pd.DataFrame.from_records(decisions_list)
-                _write_parquet(df_d, f"decisions_{decisions_part:06d}.parquet")
+            try:
+                if pending_events and events_part is not None:
+                    df_e = pd.DataFrame.from_records(list(pending_events.values()))
+                    dtype_map = {
+                        "device_id": "string",
+                        "sensor": "string",
+                        "profile": "string",
+                        "policy": "string",
+                        "seq": "uint64",
+                        "ts_ns": "int64",
+                        "t_recv_ns": "int64",
+                        "val": "float64",
+                        "pred": "float64",
+                        "res": "float64",
+                        "tau": "float32",
+                        "kbits": "int16",
+                        "topic": "string",
+                        "mqtt_size_bytes": "int32",
+                        "dup_flag": "boolean",
+                    }
+                    for c, dt in dtype_map.items():
+                        if c in df_e.columns:
+                            df_e[c] = df_e[c].astype(dt)
+                    _write_parquet(df_e, f"events_{events_part:06d}.parquet")
+                    events_written = len(df_e)
+                    events_ok = True
 
-            if markers_list and markers_part is not None:
-                df_m = pd.DataFrame.from_records(markers_list)
-                _write_parquet(df_m, f"markers_{markers_part:06d}.parquet")
+                if pending_decisions and decisions_part is not None:
+                    df_d = pd.DataFrame.from_records(list(pending_decisions))
+                    _write_parquet(df_d, f"decisions_{decisions_part:06d}.parquet")
+                    decisions_written = len(df_d)
+                    decisions_ok = True
+
+                if pending_markers and markers_part is not None:
+                    df_m = pd.DataFrame.from_records(list(pending_markers))
+                    _write_parquet(df_m, f"markers_{markers_part:06d}.parquet")
+                    markers_written = len(df_m)
+                    markers_ok = True
+            except Exception:
+                with self._lock:
+                    if pending_events and not events_ok:
+                        for k, v in pending_events.items():
+                            self._pending_events.setdefault(k, v)
+                    if pending_decisions and not decisions_ok:
+                        self._pending_decisions = list(pending_decisions) + self._pending_decisions
+                    if pending_markers and not markers_ok:
+                        self._pending_markers = list(pending_markers) + self._pending_markers
+                raise
 
             meta = {
                 "run_id": os.path.basename(self.cfg.run_dir.rstrip("/")),
@@ -408,8 +433,8 @@ class Collector:
             os.replace(tmp, dst)
 
             print(
-                f"[collector] flush: events+={len(events_list)} decisions+={len(decisions_list)} "
-                f"markers+={len(markers_list)} total_events_unique={events_unique_total} "
+                f"[collector] flush: events+={events_written} decisions+={decisions_written} "
+                f"markers+={markers_written} total_events_unique={events_unique_total} "
                 f"bytes_total={bytes_total} dup_msgs={dup_msgs}"
             )
 

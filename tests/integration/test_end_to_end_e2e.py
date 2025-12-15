@@ -214,19 +214,23 @@ def test_end_to_end_mqtt_collector_analyze(tmp_path: Path) -> None:
                 policy=policy,
             )
 
-        events: list[EventMsg] = []
-        # periodic: seq 1..5, duplicate seq=2
+        events_unique: list[EventMsg] = []
+        # periodic: seq 1..5
         for seq in range(1, 6):
-            events.append(_ev(seq, PolicyMode.PERIODIC, tau=-1e-9))
-            if seq == 2:
-                events.append(_ev(seq, PolicyMode.PERIODIC, tau=-1e-9))
-        # fixed_tau: seq 6..10, duplicate seq=7
+            events_unique.append(_ev(seq, PolicyMode.PERIODIC, tau=-1e-9))
+        # fixed_tau: seq 6..10
         for seq in range(6, 11):
-            events.append(_ev(seq, PolicyMode.FIXED_TAU, tau=0.2))
-            if seq == 7:
-                events.append(_ev(seq, PolicyMode.FIXED_TAU, tau=0.2))
+            events_unique.append(_ev(seq, PolicyMode.FIXED_TAU, tau=0.2))
 
-        _publish_events(host, port, events)
+        _publish_events(host, port, events_unique)
+
+        # Ensure duplicates are sent after at least one flush (tests cross-flush de-dup).
+        _wait_for_substring(lines, "[collector] flush:", timeout_s=15.0)
+        dup_events = [
+            _ev(2, PolicyMode.PERIODIC, tau=-1e-9),
+            _ev(7, PolicyMode.FIXED_TAU, tau=0.2),
+        ]
+        _publish_events(host, port, dup_events)
 
         try:
             proc.wait(timeout=20.0)
