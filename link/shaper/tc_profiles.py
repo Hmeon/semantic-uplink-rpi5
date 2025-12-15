@@ -2,7 +2,7 @@
 # Python 3.10+
 # 목적: 재현 가능한 링크 제약(저속/손실/지연)을 tc(HTB+netem)로 적용/해제/조회
 # - root 권한 필요. egress(기본) / ingress(ifb0 리다이렉션) 지원(both=True).
-# - 프로파일: slow_10kbps, delay_loss, cellular_var(50↔200kbps 토글)  [과제 제안서와 정합]  # noqa
+# - 프로파일: slow_10kbps, delay_loss, cellular_var(50↔200kbps 토글), lora_sf10/lora_sf12(LoRa-like)  # noqa
 # - 안전성: apply는 replace 사용, clear는 존재하지 않아도 오류 없이 진행, SIGINT에서도 원복을 권장.
 
 from __future__ import annotations
@@ -27,6 +27,7 @@ class TcProfile:
     delay_ms: int
     jitter_ms: int
     loss_pct: float
+    loss_corr_pct: float = 0.0
     reorder_pct: float = 0.0
     # cellular_var 전용
     low_kbit: int | None = None
@@ -41,6 +42,7 @@ PROFILES: dict[str, TcProfile] = {
         delay_ms=300,
         jitter_ms=50,
         loss_pct=3.0,
+        loss_corr_pct=0.0,
         reorder_pct=0.0,
     ),
     # 100kbps, delay 500±100ms, loss 8%, reorder 10%
@@ -50,6 +52,7 @@ PROFILES: dict[str, TcProfile] = {
         delay_ms=500,
         jitter_ms=100,
         loss_pct=8.0,
+        loss_corr_pct=0.0,
         reorder_pct=10.0,
     ),
     # 50↔200kbps 변동, delay 120±80ms, loss 2%
@@ -59,10 +62,31 @@ PROFILES: dict[str, TcProfile] = {
         delay_ms=120,
         jitter_ms=80,
         loss_pct=2.0,
+        loss_corr_pct=0.0,
         reorder_pct=0.0,
         low_kbit=50,
         high_kbit=200,
         var_default_period_s=30,
+    ),
+    # LoRa-like (very low rate, long delay, high + bursty loss)
+    # NOTE: LoRaWAN's duty-cycle/ACK constraints are not modeled; this is an IP-level approximation.
+    "lora_sf10": TcProfile(
+        name="lora_sf10",
+        rate_kbit=5,
+        delay_ms=1200,
+        jitter_ms=400,
+        loss_pct=10.0,
+        loss_corr_pct=40.0,
+        reorder_pct=0.0,
+    ),
+    "lora_sf12": TcProfile(
+        name="lora_sf12",
+        rate_kbit=2,
+        delay_ms=2000,
+        jitter_ms=600,
+        loss_pct=15.0,
+        loss_corr_pct=50.0,
+        reorder_pct=0.0,
     ),
 }
 
@@ -70,7 +94,10 @@ PROFILES: dict[str, TcProfile] = {
 # ---------- 내부 유틸 ----------
 
 def _require_root():
-    if os.geteuid() != 0:
+    geteuid = getattr(os, "geteuid", None)
+    if geteuid is None:
+        raise OSError("tc/netem is supported on Linux only (os.geteuid unavailable).")
+    if geteuid() != 0:
         raise PermissionError("tc_profiles requires root privileges (run as root).")
 
 def _run(cmd: str, check: bool = True) -> subprocess.CompletedProcess:
@@ -94,7 +121,10 @@ def _build_netem_args(p: TcProfile) -> str:
         else:
             parts += ["delay", f"{p.delay_ms}ms"]
     if p.loss_pct > 0:
-        parts += ["loss", "random", f"{p.loss_pct}%"]
+        if p.loss_corr_pct and p.loss_corr_pct > 0:
+            parts += ["loss", "random", f"{p.loss_pct}%", f"{p.loss_corr_pct}%"]
+        else:
+            parts += ["loss", "random", f"{p.loss_pct}%"]
     if p.reorder_pct and p.reorder_pct > 0:
         # reorder는 delay와 함께 사용하는 것이 일반적
         parts += ["reorder", f"{p.reorder_pct}%"]

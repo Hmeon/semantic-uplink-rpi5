@@ -148,6 +148,8 @@ sudo systemctl enable mosquitto && sudo systemctl start mosquitto
 ```bash
 # 적용
 sudo python -m link.shaper.tc_profiles apply --iface eth0 --profile slow_10kbps
+# (LoRa-like 근사)
+# sudo python -m link.shaper.tc_profiles apply --iface eth0 --profile lora_sf12
 
 # 해제
 sudo python -m link.shaper.tc_profiles clear --iface eth0
@@ -173,6 +175,9 @@ python -m experiments.run_scenarios \
   --profiles slow_10kbps,delay_loss,cellular_var \
   --repeats 3 \
   --with-collector
+
+# 더 열악한 링크(LoRa-like)도 추가하려면:
+#   --profiles slow_10kbps,delay_loss,cellular_var,lora_sf10,lora_sf12
 
 # 종료 후 전체 결과를 한 번에 분석(평균/표준편차 + baseline 비교 + figures)
 python -m collector.analyze \

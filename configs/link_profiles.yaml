@@ -1,11 +1,18 @@
-# tc/netem/tbf 프로파일 정의
+# tc/netem/tbf 프로파일 정의 (template)
+# NOTE: 실제 적용/실험은 `link/shaper/tc_profiles.py`의 프로파일을 사용합니다.
 profiles:
   slow_10kbps:
-    tbf:   "tbf rate 10kbit burst 4kbit limit 4k"
+    tbf: "tbf rate 10kbit burst 4kbit limit 4k"
     netem: "netem delay 300ms loss 3%"
   delay_loss:
-    tbf:   "tbf rate 100kbit burst 16kbit limit 32k"
+    tbf: "tbf rate 100kbit burst 16kbit limit 32k"
     netem: "netem delay 500ms loss 8% reorder 10%"
   cellular_var:
-    tbf:   "tbf rate 200kbit burst 32kbit limit 64k"
+    tbf: "tbf rate 200kbit burst 32kbit limit 64k"
     netem: "netem delay 120ms loss 2%"
+  lora_sf10:
+    tbf: "tbf rate 5kbit burst 2kbit limit 4k"
+    netem: "netem delay 1200ms loss 10% 40%"
+  lora_sf12:
+    tbf: "tbf rate 2kbit burst 1kbit limit 2k"
+    netem: "netem delay 2000ms loss 15% 50%"

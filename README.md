@@ -86,7 +86,9 @@
 - **Optional**: Buzzer(BCM 18)
 
 ## 링크/정책 프로파일
-- **Link**: `slow_10kbps`(10 kbps, delay 300 ms, loss 3%), `delay_loss`(100 kbps, delay 500 ms, loss 8%), `cellular_var`(50↔200 kbps 토글)
+- **Link**
+  - baseline: `slow_10kbps`(10 kbps, delay 300 ms, loss 3%), `delay_loss`(100 kbps, delay 500 ms, loss 8%), `cellular_var`(50↔200 kbps 토글)
+  - LoRa-like(근사): `lora_sf10`(5 kbps, delay 1200 ms, loss 10%), `lora_sf12`(2 kbps, delay 2000 ms, loss 15%)
 - **Policies**
   - `PERIODIC` (CLI: `--mode periodic`): 모든 샘플 전송 (대역 상한선 기준선)
   - `FIXED_TAU` (CLI: `--mode fixed_tau`, ETS): EWMA 예측 + 잔차 |e|>τ 이벤트 트리거
@@ -106,7 +108,7 @@
 **구성요소**
 - **Sensors**: 마이크 RMS, 온도  
 - **Edge**: 예측기(EWMA/AR1) → 잔차 → 정책(LinUCB) → 양자화 → 업로더  
-- **Shaper**: `tc/netem/tbf`로 10 kbps·지연·손실 등 가혹한 링크를 에뮬  
+- **Shaper**: `tc/netem/htb`로 저속·지연·손실·(옵션) 버스트 손실을 에뮬  
 - **Broker/Collector**: Mosquitto, 수집/복원, AoI·MAE·Rate 계산  
 - **UI**: LCD/버튼으로 정책·지표 확인 및 간단 제어
 
@@ -137,7 +139,8 @@
 ---
 
 ## 핵심 지표 · Key Metrics
-이 프로젝트는 **3개 정책(Periodic / Fixed τ / Adaptive LinUCB)**을 **3개 링크 프로파일(slow_10kbps / delay_loss / cellular_var)**에서 비교하고,
+이 프로젝트는 **3개 정책(Periodic / Fixed τ / Adaptive LinUCB)**을 기본 **3개 링크 프로파일(slow_10kbps / delay_loss / cellular_var)**에서 비교하고,
+필요 시 **LoRa-like 링크 프로파일(lora_sf10 / lora_sf12)**로 더 열악한 환경을 추가 검증합니다.
 최종 보고서/논문에서 “왜 Adaptive가 우수한가”를 정량/시각화로 증명하는 것을 목표로 합니다.
 
 ### 1) 1차(메인) 지표 — 표/그래프 필수
@@ -249,12 +252,15 @@ python -m edge.edge_daemon \
 
 RTC는 정확한 이벤트 타임스탬프를 제공해 AoI·지연 측정의 신뢰도를 높여 줍니다.
 
-**`configs/link_profiles.yaml`**
+**`configs/link_profiles.yaml` (template)**
+> 런타임 로딩은 아직 연결되어 있지 않습니다. 실제 적용/실험은 `link/shaper/tc_profiles.py`의 프로파일을 사용합니다.
 ```yaml
 profiles:
   slow_10kbps: { tbf: "tbf rate 10kbit burst 4kbit limit 4k",  netem: "netem delay 300ms loss 3%" }
   delay_loss:  { tbf: "tbf rate 100kbit burst 16kbit limit 32k", netem: "netem delay 500ms loss 8% reorder 10%" }
   cellular_var:{ tbf: "tbf rate 200kbit burst 32kbit limit 64k", netem: "netem delay 120ms loss 2%" }
+  lora_sf10:   { tbf: "tbf rate 5kbit burst 2kbit limit 4k",    netem: "netem delay 1200ms loss 10% 40%" }
+  lora_sf12:   { tbf: "tbf rate 2kbit burst 1kbit limit 2k",    netem: "netem delay 2000ms loss 15% 50%" }
 ```
 
 ---

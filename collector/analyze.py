@@ -1539,10 +1539,20 @@ def _try_make_paper_plots(
     aoi_max_ms = float(safety.get("aoi_max_ms", 5000.0))
     mae_max = float(safety.get("mae_max", 2.0))
 
-    # 2) Environment comparison: Reward over time by profile (sensor별 3패널)
-    prof_order = ["slow_10kbps", "delay_loss", "cellular_var"]
+    # 2) Environment comparison: Reward over time by profile (sensor별 패널)
+    present_profiles = set(dec["profile"].astype(str).unique())
+    prof_order = [p.value for p in LinkProfile if p.value in present_profiles]
+    if not prof_order:
+        prof_order = sorted(present_profiles)
     for sensor, ds in dec.groupby("sensor", sort=False):
-        fig, axes = plt.subplots(nrows=1, ncols=len(prof_order), figsize=(15.0, 4.2), sharey=True)
+        fig, axes = plt.subplots(
+            nrows=1,
+            ncols=len(prof_order),
+            figsize=(5.0 * len(prof_order), 4.2),
+            sharey=True,
+        )
+        if len(prof_order) == 1:
+            axes = [axes]
         for ax, prof in zip(axes, prof_order):
             g = ds[ds["profile"] == prof].copy()
             if g.empty:

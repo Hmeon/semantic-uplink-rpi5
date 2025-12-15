@@ -45,6 +45,8 @@ class LinkProfile(str, Enum):
     SLOW_10KBPS = "slow_10kbps"
     DELAY_LOSS = "delay_loss"
     CELLULAR_VAR = "cellular_var"
+    LORA_SF10 = "lora_sf10"
+    LORA_SF12 = "lora_sf12"
 
 # -------------------- 공통 유틸 --------------------
 
