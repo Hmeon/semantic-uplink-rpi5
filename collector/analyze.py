@@ -6,7 +6,8 @@
 # 입력 기대:
 #  - Parquet: *.parquet (권장, 빠름)
 #  - CSV    : *.csv (utf-8, 헤더 포함)
-#  - 파일/디렉터리 모두 허용. 디렉터리는 재귀 검색하며 events_*.parquet(회전) / events.parquet(레거시) 우선.
+#  - 파일/디렉터리 모두 허용. 디렉터리는 재귀 검색하며
+#    events_*.parquet(회전) / events.parquet(레거시) 우선.
 #  - 필수 컬럼(스키마 정합, 표준화 후):
 #      ts(ns), seq, device_id, sensor, val, pred, res, tau, kbits, profile, policy
 #    * Collector가 저장한 events*.parquet는 ts 대신 ts_ns를 쓰는 경우가 있어 자동 변환한다.
@@ -33,26 +34,23 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
-import json
 import math
 import os
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable, List
 
 import numpy as np
 import pandas as pd
-import yaml
 
 from common.config import load_policy_config_dict
 from common.discord_webhook import DiscordWebhookError, send_discord_message
-from common.schema import EventMsg, SensorType, LinkProfile, PolicyMode
 from common.metrics import percent_improvement
-
+from common.schema import EventMsg, LinkProfile, PolicyMode
 
 # ----------------------------- I/O -----------------------------
 
-def _discover_files(inputs: Iterable[str | os.PathLike]) -> List[Path]:
-    files: List[Path] = []
+def _discover_files(inputs: Iterable[str | os.PathLike]) -> list[Path]:
+    files: list[Path] = []
     for inp in inputs:
         p = Path(inp)
         if p.is_dir():
@@ -86,7 +84,7 @@ def _discover_files(inputs: Iterable[str | os.PathLike]) -> List[Path]:
 
 def _discover_named_files(
     inputs: Iterable[str | os.PathLike], *, names: Iterable[str]
-) -> List[Path]:
+) -> list[Path]:
     """
     입력 경로(파일/디렉터리)에서 지정한 파일명들을 재귀적으로 탐색한다.
     - names: 예) ("events_*.parquet", "events.parquet", "events.csv")
@@ -122,7 +120,7 @@ def _discover_named_files(
     return sorted(uniq)
 
 
-def load_events(paths: List[str | os.PathLike]) -> pd.DataFrame:
+def load_events(paths: list[str | os.PathLike]) -> pd.DataFrame:
     """여러 파일에서 Event 레코드를 읽어 단일 DataFrame으로 결합."""
     files = _discover_files(paths)
     if not files:
@@ -197,7 +195,7 @@ def load_events(paths: List[str | os.PathLike]) -> pd.DataFrame:
     return out
 
 
-def load_decisions(paths: List[str | os.PathLike]) -> pd.DataFrame:
+def load_decisions(paths: list[str | os.PathLike]) -> pd.DataFrame:
     """
     decisions.(parquet|csv) 파일들을 읽어 결합한다.
 
@@ -365,7 +363,8 @@ def enrich_decisions_with_events(decisions: pd.DataFrame, events: pd.DataFrame) 
     elif "t_recv_ns" in out.columns and "t_recv_ns_ev" in out.columns:
         out["t_recv_ns"] = out["t_recv_ns"].fillna(out["t_recv_ns_ev"])
 
-    out.drop(columns=[c for c in ["tau_key", "kbits_key", "res_key", "t_recv_ns_ev"] if c in out.columns], inplace=True)
+    drop_cols = [c for c in ("tau_key", "kbits_key", "res_key", "t_recv_ns_ev") if c in out.columns]
+    out.drop(columns=drop_cols, inplace=True)
     return out
 
 
@@ -663,7 +662,10 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
             n_samples_est = int(seq.size + n_suppressed_est)
             send_ratio = float(seq.size / n_samples_est) if n_samples_est > 0 else float("nan")
 
-        event_rate_hz = float(len(g) / dur_s) if math.isfinite(dur_s) and dur_s > 0 else float("nan")
+        if math.isfinite(dur_s) and dur_s > 0:
+            event_rate_hz = float(len(g) / dur_s)
+        else:
+            event_rate_hz = float("nan")
 
         rows.append({
             "run_id": str(run_id),
@@ -778,7 +780,16 @@ def compare_policies(
     if summary.empty:
         return pd.DataFrame()
 
-    required = {"profile", "policy", "sensor", "rate_Bps", "aoi_mean_ms", "aoi_p95_ms", "mae_event_mean", "mae_event_p95"}
+    required = {
+        "profile",
+        "policy",
+        "sensor",
+        "rate_Bps",
+        "aoi_mean_ms",
+        "aoi_p95_ms",
+        "mae_event_mean",
+        "mae_event_p95",
+    }
     if not required.issubset(summary.columns):
         missing = sorted(required - set(summary.columns))
         raise ValueError(f"missing columns for compare_policies: {missing}")
@@ -844,9 +855,15 @@ def _write_report_md(
     lines = []
     lines.append("# 실험 요약 리포트")
     lines.append("")
-    lines.append("본 리포트는 **이벤트 기반 MAE(res)**를 사용합니다. 전체 시계열 MAE가 필요하면 원시 스트림 또는 복원 파이프가 추가로 필요합니다.")
+    lines.append(
+        "본 리포트는 **이벤트 기반 MAE(res)**를 사용합니다. 전체 시계열 MAE가 필요하면 "
+        "원시 스트림 또는 복원 파이프가 추가로 필요합니다."
+    )
     lines.append("")
-    lines.append("- AoI/Rate는 기본적으로 **수집기 수신 시각(`t_recv_ns`)** 기반으로 계산합니다(없으면 `ts` 기반).")
+    lines.append(
+        "- AoI/Rate는 기본적으로 **수집기 수신 시각(`t_recv_ns`)** 기반으로 계산합니다 "
+        "(없으면 `ts` 기반)."
+    )
     if "n_runs" in summary.columns:
         lines.append("- 표의 `mean±std`는 **run(리플리케이트) 단위 지표**의 평균/표준편차입니다.")
         lines.append(f"- 비교 기준(baseline): `{baseline_policy}`")
@@ -877,37 +894,56 @@ def _write_report_md(
     # n_runs가 있으면 함께 표시
     has_runs = "n_runs" in tbl.columns
     if has_runs:
-        lines.append("| profile | policy | sensor | n_runs | n_events | dur[s] | rate[B/s] | AoI_mean[ms] | AoI_p95[ms] | MAE_event_mean | MAE_event_p95 | k̄ |")
+        lines.append(
+            "| profile | policy | sensor | n_runs | n_events | dur[s] | rate[B/s] | AoI_mean[ms] | "
+            "AoI_p95[ms] | MAE_event_mean | MAE_event_p95 | k̄ |"
+        )
         lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
     else:
-        lines.append("| profile | policy | sensor | n_events | dur[s] | rate[B/s] | AoI_mean[ms] | AoI_p95[ms] | MAE_event_mean | MAE_event_p95 | k̄ |")
+        lines.append(
+            "| profile | policy | sensor | n_events | dur[s] | rate[B/s] | AoI_mean[ms] | "
+            "AoI_p95[ms] | MAE_event_mean | MAE_event_p95 | k̄ |"
+        )
         lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|")
+
+    def _fmt_cell(row: pd.Series, col: str) -> str:
+        v = float(row[col])
+        if not np.isfinite(v):
+            return "NaN"
+        return fmt[col](v)
+
     for _, r in tbl.iterrows():
         if has_runs:
-            lines.append("| {profile} | {policy} | {sensor} | {n_runs} | {n_events} | {duration_s} | {rate_Bps} | {aoi_mean_ms} | {aoi_p95_ms} | {mae_event_mean} | {mae_event_p95} | {kbits_mean} |".format(
-                profile=r["profile"], policy=r["policy"], sensor=r["sensor"],
-                n_runs=int(r.get("n_runs", 0)),
-                n_events=int(r["n_events"]),
-                duration_s=_fmt_mean_std("duration_s", ".1f"),
-                rate_Bps=_fmt_mean_std("rate_Bps", ".1f"),
-                aoi_mean_ms=_fmt_mean_std("aoi_mean_ms", ".1f"),
-                aoi_p95_ms=_fmt_mean_std("aoi_p95_ms", ".1f"),
-                mae_event_mean=_fmt_mean_std("mae_event_mean", ".3f"),
-                mae_event_p95=_fmt_mean_std("mae_event_p95", ".3f"),
-                kbits_mean=_fmt_mean_std("kbits_mean", ".2f"),
-            ))
+            cells = [
+                str(r["profile"]),
+                str(r["policy"]),
+                str(r["sensor"]),
+                str(int(r.get("n_runs", 0))),
+                str(int(r["n_events"])),
+                _fmt_mean_std("duration_s", ".1f"),
+                _fmt_mean_std("rate_Bps", ".1f"),
+                _fmt_mean_std("aoi_mean_ms", ".1f"),
+                _fmt_mean_std("aoi_p95_ms", ".1f"),
+                _fmt_mean_std("mae_event_mean", ".3f"),
+                _fmt_mean_std("mae_event_p95", ".3f"),
+                _fmt_mean_std("kbits_mean", ".2f"),
+            ]
         else:
-            lines.append("| {profile} | {policy} | {sensor} | {n_events} | {duration_s} | {rate_Bps} | {aoi_mean_ms} | {aoi_p95_ms} | {mae_event_mean} | {mae_event_p95} | {kbits_mean} |".format(
-                profile=r["profile"], policy=r["policy"], sensor=r["sensor"],
-                n_events=int(r["n_events"]),
-                duration_s=fmt["duration_s"](r["duration_s"]) if np.isfinite(r["duration_s"]) else "NaN",
-                rate_Bps=fmt["rate_Bps"](r["rate_Bps"]) if np.isfinite(r["rate_Bps"]) else "NaN",
-                aoi_mean_ms=fmt["aoi_mean_ms"](r["aoi_mean_ms"]) if np.isfinite(r["aoi_mean_ms"]) else "NaN",
-                aoi_p95_ms=fmt["aoi_p95_ms"](r["aoi_p95_ms"]) if np.isfinite(r["aoi_p95_ms"]) else "NaN",
-                mae_event_mean=fmt["mae_event_mean"](r["mae_event_mean"]) if np.isfinite(r["mae_event_mean"]) else "NaN",
-                mae_event_p95=fmt["mae_event_p95"](r["mae_event_p95"]) if np.isfinite(r["mae_event_p95"]) else "NaN",
-                kbits_mean=fmt["kbits_mean"](r["kbits_mean"]) if np.isfinite(r["kbits_mean"]) else "NaN",
-            ))
+            cells = [
+                str(r["profile"]),
+                str(r["policy"]),
+                str(r["sensor"]),
+                str(int(r["n_events"])),
+                _fmt_cell(r, "duration_s"),
+                _fmt_cell(r, "rate_Bps"),
+                _fmt_cell(r, "aoi_mean_ms"),
+                _fmt_cell(r, "aoi_p95_ms"),
+                _fmt_cell(r, "mae_event_mean"),
+                _fmt_cell(r, "mae_event_p95"),
+                _fmt_cell(r, "kbits_mean"),
+            ]
+
+        lines.append("| " + " | ".join(cells) + " |")
     p.write_text("\n".join(lines), encoding="utf-8")
 
     # --- Baseline 비교(추가) ---
@@ -920,9 +956,15 @@ def _write_report_md(
     lines.append("")
     lines.append(f"## {baseline_policy} 대비 변화(정량 비교)")
     lines.append("")
-    lines.append("개선율(%) 정의(낮을수록 좋은 지표 기준): `improvement = (baseline - candidate) / baseline * 100`")
+    lines.append(
+        "개선율(%) 정의(낮을수록 좋은 지표 기준): "
+        "`improvement = (baseline - candidate) / baseline * 100`"
+    )
     lines.append("")
-    lines.append("| profile | sensor | policy | ΔRate[B/s] | Rate 개선율[%] | ΔAoIμ[ms] | AoIμ 개선율[%] | ΔMAE | MAE 개선율[%] |")
+    lines.append(
+        "| profile | sensor | policy | ΔRate[B/s] | Rate 개선율[%] | ΔAoIμ[ms] | AoIμ 개선율[%] | "
+        "ΔMAE | MAE 개선율[%] |"
+    )
     lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|")
 
     def _pct(v: float) -> str:
@@ -936,19 +978,25 @@ def _write_report_md(
         return format(v, fmt_s)
 
     for _, r in comparisons.iterrows():
-        lines.append(
-            "| {profile} | {sensor} | {policy} | {d_rate} | {p_rate} | {d_aoi} | {p_aoi} | {d_mae} | {p_mae} |".format(
-                profile=r["profile"],
-                sensor=r["sensor"],
-                policy=r["policy"],
-                d_rate=_num(float(r.get("rate_Bps_delta_Bps", float("nan"))), "+.1f"),
-                p_rate=_pct(float(r.get("rate_Bps_improvement_pct", float("nan")))),
-                d_aoi=_num(float(r.get("aoi_mean_ms_delta_ms", float("nan"))), "+.1f"),
-                p_aoi=_pct(float(r.get("aoi_mean_ms_improvement_pct", float("nan")))),
-                d_mae=_num(float(r.get("mae_event_mean_delta_mae", float("nan"))), "+.3f"),
-                p_mae=_pct(float(r.get("mae_event_mean_improvement_pct", float("nan")))),
-            )
-        )
+        d_rate = _num(float(r.get("rate_Bps_delta_Bps", float("nan"))), "+.1f")
+        p_rate = _pct(float(r.get("rate_Bps_improvement_pct", float("nan"))))
+        d_aoi = _num(float(r.get("aoi_mean_ms_delta_ms", float("nan"))), "+.1f")
+        p_aoi = _pct(float(r.get("aoi_mean_ms_improvement_pct", float("nan"))))
+        d_mae = _num(float(r.get("mae_event_mean_delta_mae", float("nan"))), "+.3f")
+        p_mae = _pct(float(r.get("mae_event_mean_improvement_pct", float("nan"))))
+
+        cells = [
+            str(r["profile"]),
+            str(r["sensor"]),
+            str(r["policy"]),
+            d_rate,
+            p_rate,
+            d_aoi,
+            p_aoi,
+            d_mae,
+            p_mae,
+        ]
+        lines.append("| " + " | ".join(cells) + " |")
 
     # --- Figures (추가) ---
     figs_path = out_dir / figures_dir
@@ -1252,7 +1300,7 @@ def _reconstruct_linucb_trace(
     rvs = float(resvar_scale) if resvar_scale is not None else max(1e-9, rs * rs)
 
     d_dim = 6  # [bias, aoi, res, res_var, loss, q_len]
-    A = [np.eye(d_dim, dtype=np.float64) * float(lambda_ridge) for _ in arm_keys]
+    a_mats = [np.eye(d_dim, dtype=np.float64) * float(lambda_ridge) for _ in arm_keys]
     b = [np.zeros((d_dim,), dtype=np.float64) for _ in arm_keys]
     theta = [np.zeros((d_dim,), dtype=np.float64) for _ in arm_keys]
     counts = [0 for _ in arm_keys]
@@ -1303,7 +1351,7 @@ def _reconstruct_linucb_trace(
         reward = float(row["reward"])
 
         # update
-        a_old = A[chosen_i]
+        a_old = a_mats[chosen_i]
         b_old = b[chosen_i]
         theta_old = theta[chosen_i]
         count_old = counts[chosen_i]
@@ -1315,7 +1363,7 @@ def _reconstruct_linucb_trace(
         except np.linalg.LinAlgError:
             theta_new = theta_old
 
-        A[chosen_i] = a_new
+        a_mats[chosen_i] = a_new
         b[chosen_i] = b_new
         theta[chosen_i] = theta_new
         counts[chosen_i] = count_old + 1
@@ -1513,10 +1561,17 @@ def _try_make_paper_plots(
                 ax.set_yticks(np.arange(pivot.shape[0]))
                 ax.set_yticklabels(pivot.index.tolist())
                 ax.set_xticks(np.arange(pivot.shape[1]))
-                ax.set_xticklabels([str(c) for c in pivot.columns.tolist()], rotation=35, ha="right")
+                ax.set_xticklabels(
+                    [str(c) for c in pivot.columns.tolist()],
+                    rotation=35,
+                    ha="right",
+                )
                 ax.set_xlabel("|residual| bin")
                 ax.set_ylabel("chosen action (τ,k)")
-                ax.set_title(f"Action distribution vs |residual| · profile={prof} · sensor={sensor}")
+                ax.set_title(
+                    f"Action distribution vs |residual| · profile={prof} · "
+                    f"sensor={sensor}"
+                )
                 cbar = fig.colorbar(im, ax=ax)
                 cbar.set_label("count")
                 fig.tight_layout()
@@ -1563,7 +1618,11 @@ def _try_make_paper_plots(
             for run_id, gr in g.groupby("run_id", sort=False):
                 gr = gr.sort_values("ts", kind="mergesort").reset_index(drop=True)
                 y = gr["reward"].astype("float64").to_numpy()
-                y_ma = pd.Series(y).rolling(window=reward_window, min_periods=max(3, reward_window // 4)).mean()
+                y_ma = (
+                    pd.Series(y)
+                    .rolling(window=reward_window, min_periods=max(3, reward_window // 4))
+                    .mean()
+                )
                 series.append(y_ma.to_numpy())
                 ax.plot(y_ma.to_numpy(), color="#9CA3AF", alpha=0.25, linewidth=1.0)
             max_len = max(len(s) for s in series)
@@ -1663,7 +1722,13 @@ def _try_make_paper_plots(
         )
         fig, ax = plt.subplots(figsize=(9.8, 4.4))
         ax.plot(trace["step"], y, color="#9CA3AF", alpha=0.35, linewidth=1.0, label="reward")
-        ax.plot(trace["step"], y_ma, color="#111827", linewidth=2.2, label=f"moving avg (w={reward_window})")
+        ax.plot(
+            trace["step"],
+            y_ma,
+            color="#111827",
+            linewidth=2.2,
+            label=f"moving avg (w={reward_window})",
+        )
         ax.axvline(0, color="#2563EB", linestyle="--", linewidth=1.2)
         ax.text(0, y_top, "start", color="#2563EB", fontsize=9, va="bottom")
         if warmup_end is not None:
@@ -1705,12 +1770,22 @@ def _try_make_paper_plots(
 
         # 3-4) Stability: rolling |res|
         evr = events.copy()
-        evr = evr[(evr["run_id"] == rep_run) & (evr["profile"] == prof) & (evr["sensor"] == sensor)].copy()
+        evr = evr[
+            (evr["run_id"] == rep_run) & (evr["profile"] == prof) & (evr["sensor"] == sensor)
+        ].copy()
         if not evr.empty and "res" in evr.columns:
-            tcol = "t_recv_ns" if "t_recv_ns" in evr.columns and evr["t_recv_ns"].notna().any() else "ts"
+            if "t_recv_ns" in evr.columns and evr["t_recv_ns"].notna().any():
+                tcol = "t_recv_ns"
+            else:
+                tcol = "ts"
             evr = evr.sort_values(tcol, kind="mergesort").reset_index(drop=True)
             abs_res = evr["res"].astype("float64").abs().to_numpy()
-            abs_ma = pd.Series(abs_res).rolling(window=max(10, reward_window // 2), min_periods=5).mean().to_numpy()
+            abs_ma = (
+                pd.Series(abs_res)
+                .rolling(window=max(10, reward_window // 2), min_periods=5)
+                .mean()
+                .to_numpy()
+            )
             fig, ax = plt.subplots(figsize=(9.8, 3.8))
             ax.plot(abs_res, color="#9CA3AF", alpha=0.25, linewidth=1.0, label="|res|")
             ax.plot(abs_ma, color="#111827", linewidth=2.0, label="rolling mean")
@@ -1736,12 +1811,18 @@ def _try_make_paper_plots(
             t_s = (recv.astype("float64") - t0_ns) / 1e9
 
             gr_t = gr.copy()
-            d_tcol = "t_recv_ns" if "t_recv_ns" in gr_t.columns and gr_t["t_recv_ns"].notna().any() else "ts"
+            if "t_recv_ns" in gr_t.columns and gr_t["t_recv_ns"].notna().any():
+                d_tcol = "t_recv_ns"
+            else:
+                d_tcol = "ts"
             gr_t = gr_t.sort_values(d_tcol, kind="mergesort").reset_index(drop=True)
             # 같은 기준(t0_ns)으로 time-align (reward/AoI 축 일치)
             dt_s = (gr_t[d_tcol].astype("float64").to_numpy() - t0_ns) / 1e9
             reward_t = gr_t["reward"].astype("float64").to_numpy()
-            actions = gr_t.apply(lambda r: _format_action(r["tau"], int(r["kbits"])), axis=1).tolist()
+            actions = gr_t.apply(
+                lambda r: _format_action(r["tau"], int(r["kbits"])),
+                axis=1,
+            ).tolist()
             tau_min = float(gr_t["tau"].min())
             k_max = int(gr_t["kbits"].max())
             safe_action = _format_action(tau_min, k_max)
@@ -1772,7 +1853,13 @@ def _try_make_paper_plots(
                     ax1.axvline(dt_s[i], color="#9CA3AF", linestyle="--", linewidth=1.0, alpha=0.7)
             # warmup end marker
             if warmup_end is not None and warmup_end < len(dt_s):
-                ax1.axvline(dt_s[warmup_end], color="#10B981", linestyle="--", linewidth=1.2, alpha=0.8)
+                ax1.axvline(
+                    dt_s[warmup_end],
+                    color="#10B981",
+                    linestyle="--",
+                    linewidth=1.2,
+                    alpha=0.8,
+                )
                 ax1.text(
                     dt_s[warmup_end],
                     float(np.nanmax(reward_t)) if np.isfinite(reward_t).any() else 0.0,
@@ -1840,18 +1927,9 @@ def format_summary_for_discord(summary: pd.DataFrame, *, limit: int = 10) -> str
         mae_p95 = _fmt_num(row.get("mae_event_p95"), ".3f")
         kbits = _fmt_num(row.get("kbits_mean"), ".2f")
         lines.append(
-            "- `{}/{}` sensor={} · events={} · rate={} B/s · AoIμ={} ms (p95={} ms) · MAE={} (p95={}) · k̄={}".format(
-                profile,
-                policy,
-                sensor,
-                events,
-                rate,
-                aoi_mean,
-                aoi_p95,
-                mae_mean,
-                mae_p95,
-                kbits,
-            )
+            f"- `{profile}/{policy}` sensor={sensor} · events={events} · rate={rate} B/s · "
+            f"AoIμ={aoi_mean} ms (p95={aoi_p95} ms) · "
+            f"MAE={mae_mean} (p95={mae_p95}) · k̄={kbits}"
         )
 
     if len(summary) > limit:
@@ -1970,7 +2048,8 @@ def main():
 
     _write_report_md(out_dir, summary, comparisons=comparisons, baseline_policy=baseline_policy)
 
-    print(f"[analyze] rows={len(df)} scenarios={summary[['profile','policy','sensor']].drop_duplicates().shape[0]}")
+    scenarios = summary[["profile", "policy", "sensor"]].drop_duplicates().shape[0]
+    print(f"[analyze] rows={len(df)} scenarios={scenarios}")
     print(f"[analyze] saved: {csv_path}")
     print(f"[analyze] saved: {by_run_path}")
     print(f"[analyze] saved: {cmp_path}")

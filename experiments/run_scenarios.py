@@ -13,21 +13,22 @@ import hashlib
 import json
 import os
 import platform
-import shlex
 import signal
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, asdict
+from collections.abc import Iterable
+from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
 
 from common.config import load_device_config, load_link_profiles_config, load_policy_config_dict
 from common.schema import LinkProfile, PolicyMode
 
 # link.shaper.tc_profiles의 함수 직접 호출 (cellular_var 토글 스레드가 CLI 블로킹을 유발하므로)
 try:
-    from link.shaper.tc_profiles import apply_profile as tc_apply, clear as tc_clear, get_profiles as tc_get
+    from link.shaper.tc_profiles import apply_profile as tc_apply
+    from link.shaper.tc_profiles import clear as tc_clear
+    from link.shaper.tc_profiles import get_profiles as tc_get
 except Exception as e:  # pragma: no cover
     print(f"[exp] FATAL: cannot import tc_profiles: {e}", file=sys.stderr)
     sys.exit(2)
@@ -72,14 +73,14 @@ class ExperimentPlan:
     arms_path: str = "configs/policy.yaml"
 
     # 모드/프로파일
-    modes: Tuple[str, ...] = ("periodic", "fixed_tau", "adaptive")
-    profiles: Tuple[str, ...] = ("slow_10kbps", "delay_loss", "cellular_var")
+    modes: tuple[str, ...] = ("periodic", "fixed_tau", "adaptive")
+    profiles: tuple[str, ...] = ("slow_10kbps", "delay_loss", "cellular_var")
 
     # 실행 옵션
     claim_batch: int = 10
     max_inflight: int = 10
     with_collector: bool = False    # collector 프로세스 병행 (수집기 구현 수준에 따라 False 권장)
-    tc_var_period_s: Optional[int] = None  # cellular_var 토글 주기(초); None=프로파일 기본
+    tc_var_period_s: int | None = None  # cellular_var 토글 주기(초); None=프로파일 기본
     repeats: int = 1                  # 시나리오 반복 횟수(리플리케이트)
     collector_flush_interval_s: int = 10
 
@@ -97,7 +98,7 @@ class ScenarioRunner:
         self.plan = plan
         self._stop = False
         self._active_tc = False
-        self._procs: List[subprocess.Popen] = []
+        self._procs: list[subprocess.Popen] = []
         # 신호 처리
         signal.signal(signal.SIGINT, self._on_signal)
         signal.signal(signal.SIGTERM, self._on_signal)
@@ -158,7 +159,7 @@ class ScenarioRunner:
 
     # --------- 명령 생성 ---------
 
-    def _edge_cmd(self, sc: Scenario) -> List[str]:
+    def _edge_cmd(self, sc: Scenario) -> list[str]:
         """edge.edge_daemon CLI 인자 구성 (periodic은 τ<0으로 에뮬레이션)."""
         p = self.plan
         run_dir = sc.out_dir
@@ -194,7 +195,7 @@ class ScenarioRunner:
 
         return base
 
-    def _collector_cmd(self, sc: Scenario) -> Optional[List[str]]:
+    def _collector_cmd(self, sc: Scenario) -> list[str] | None:
         """
         collector가 모듈로 제공되는 경우에만 실행.
         구현/CLI가 상이할 수 있으므로 최소 인자만 제공(브로커/출력경로).
@@ -230,7 +231,8 @@ class ScenarioRunner:
             tc_apply(self.plan.iface, profile.value, both=self.plan.both, var_period_s=varp)
             self._active_tc = True
             print(
-                f"[exp] tc applied: iface={self.plan.iface} both={self.plan.both} profile={profile.value}"
+                f"[exp] tc applied: iface={self.plan.iface} both={self.plan.both} "
+                f"profile={profile.value}"
             )
         except PermissionError as e:
             print(f"[exp] WARN: tc apply failed (not root?): {e}", file=sys.stderr)
@@ -247,7 +249,7 @@ class ScenarioRunner:
 
     # --------- 유틸 ---------
 
-    def _popen(self, cmd: List[str], **kw) -> subprocess.Popen:
+    def _popen(self, cmd: list[str], **kw) -> subprocess.Popen:
         env = dict(os.environ)
         user_env = kw.pop("env", None)
         if isinstance(user_env, dict):
@@ -298,9 +300,9 @@ class ScenarioRunner:
 
 # ---------- 헬퍼 ----------
 
-def build_scenarios(plan: ExperimentPlan) -> List[Scenario]:
+def build_scenarios(plan: ExperimentPlan) -> list[Scenario]:
     root = _run_root(plan)
-    scenarios: List[Scenario] = []
+    scenarios: list[Scenario] = []
     for prof_s in plan.profiles:
         lp = LinkProfile(prof_s)
         for mode_s in plan.modes:
@@ -324,7 +326,8 @@ def _run_root(plan: ExperimentPlan) -> Path:
     (root / "plan.json").write_text(json.dumps(_asdict_plan(plan), indent=2, ensure_ascii=False))
     # 사용 가능한 tc 프로파일 목록 기록(참고)
     try:
-        (root / "tc_profiles.json").write_text(json.dumps({k: asdict(v) for k, v in tc_get().items()}, indent=2))
+        tc_profiles = {k: asdict(v) for k, v in tc_get().items()}
+        (root / "tc_profiles.json").write_text(json.dumps(tc_profiles, indent=2))
     except Exception:
         pass
     _write_run_meta(root, plan)
@@ -401,7 +404,9 @@ def _env_snapshot() -> dict:
 # ---------- CLI ----------
 
 def parse_args() -> ExperimentPlan:
-    ap = argparse.ArgumentParser(description="Run profile×mode matrix experiments (edge_daemon orchestrator)")
+    ap = argparse.ArgumentParser(
+        description="Run profile×mode matrix experiments (edge_daemon orchestrator)"
+    )
     ap.add_argument("--device-id", default="rpi5-01")
     ap.add_argument("--iface", default="eth0")
     ap.add_argument("--both", action="store_true")
@@ -441,8 +446,18 @@ def parse_args() -> ExperimentPlan:
     ap.add_argument("--profiles", default="slow_10kbps,delay_loss,cellular_var",
                     help="comma-separated profile names")
     ap.add_argument("--with-collector", action="store_true")
-    ap.add_argument("--tc-var-period", type=int, default=None, help="cellular_var toggle period (seconds)")
-    ap.add_argument("--repeats", type=int, default=1, help="scenario repeats (replicates) per profile×mode")
+    ap.add_argument(
+        "--tc-var-period",
+        type=int,
+        default=None,
+        help="cellular_var toggle period (seconds)",
+    )
+    ap.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help="scenario repeats (replicates) per profile×mode",
+    )
     ap.add_argument("--collector-flush-interval-s", type=int, default=10)
     args = ap.parse_args()
 

@@ -11,7 +11,7 @@ import json
 import math
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, Optional
+from typing import Any
 
 # mqttutil은 schema를 참조하지 않으므로 순환 의존 없음
 try:
@@ -109,14 +109,17 @@ class EventMsg:
     kbits: int
     profile: LinkProfile
     policy: PolicyMode
-    aoi_ms: Optional[int] = None  # 선택 필드(로그용)
+    aoi_ms: int | None = None  # 선택 필드(로그용)
 
     # ---- 검증/정규화 ----
     def __post_init__(self):
         # 타입/범위 강제(불변 dataclass라서 object.__setattr__ 사용)
-        ts = int(self.ts);  seq = int(self.seq)
-        if not (0 <= ts <= INT64_MAX): raise ValueError("ts out of int64 range")
-        if not (0 <= seq <= UINT64_MAX): raise ValueError("seq out of uint64 range")
+        ts = int(self.ts)
+        seq = int(self.seq)
+        if not (0 <= ts <= INT64_MAX):
+            raise ValueError("ts out of int64 range")
+        if not (0 <= seq <= UINT64_MAX):
+            raise ValueError("seq out of uint64 range")
 
         device_id = _ensure_nonempty_str("device_id", self.device_id)
         # 토픽 안전: 슬래시 금지(토픽 구분자와 충돌)
@@ -153,8 +156,8 @@ class EventMsg:
         object.__setattr__(self, "aoi_ms", aoi_ms)
 
     # ---- 직렬화/역직렬화 ----
-    def to_dict(self) -> Dict[str, Any]:
-        d: Dict[str, Any] = {
+    def to_dict(self) -> dict[str, Any]:
+        d: dict[str, Any] = {
             "ts": self.ts,
             "seq": self.seq,
             "device_id": self.device_id,
@@ -176,9 +179,21 @@ class EventMsg:
         return json.dumps(self.to_dict(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "EventMsg":
+    def from_dict(cls, d: dict[str, Any]) -> EventMsg:
         # 필수 필드 확인
-        required = ("ts", "seq", "device_id", "sensor", "val", "pred", "res", "tau", "kbits", "profile", "policy")
+        required = (
+            "ts",
+            "seq",
+            "device_id",
+            "sensor",
+            "val",
+            "pred",
+            "res",
+            "tau",
+            "kbits",
+            "profile",
+            "policy",
+        )
         missing = [k for k in required if k not in d]
         if missing:
             raise ValueError(f"missing fields: {missing}")
@@ -198,7 +213,7 @@ class EventMsg:
         )
 
     @classmethod
-    def from_json_bytes(cls, b: bytes) -> "EventMsg":
+    def from_json_bytes(cls, b: bytes) -> EventMsg:
         try:
             d = json.loads(b.decode("utf-8"))
         except Exception as e:
@@ -279,7 +294,7 @@ class PolicyDecisionMsg:
         object.__setattr__(self, "reward", reward)
 
     # 직렬화/역직렬화
-    def to_dict(self) -> Dict[str, Any]:
+    def to_dict(self) -> dict[str, Any]:
         return {
             "ts": self.ts,
             "device_id": self.device_id,
@@ -297,7 +312,7 @@ class PolicyDecisionMsg:
         return json.dumps(self.to_dict(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
 
     @classmethod
-    def from_dict(cls, d: Dict[str, Any]) -> "PolicyDecisionMsg":
+    def from_dict(cls, d: dict[str, Any]) -> PolicyDecisionMsg:
         required = ("ts", "device_id", "state_aoi", "state_res", "state_res_var",
                     "state_loss", "state_q_len", "tau", "kbits", "reward")
         missing = [k for k in required if k not in d]
@@ -317,7 +332,7 @@ class PolicyDecisionMsg:
         )
 
     @classmethod
-    def from_json_bytes(cls, b: bytes) -> "PolicyDecisionMsg":
+    def from_json_bytes(cls, b: bytes) -> PolicyDecisionMsg:
         try:
             d = json.loads(b.decode("utf-8"))
         except Exception as e:

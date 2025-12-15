@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Tuple
 
 import numpy as np
 
@@ -71,7 +70,13 @@ class UniformQuantizer:
     vmax: float
     kbits: int
 
-    def __init__(self, vmin: float | None = None, vmax: float | None = None, kbits: int | None = None, **kwargs) -> None:
+    def __init__(
+        self,
+        vmin: float | None = None,
+        vmax: float | None = None,
+        kbits: int | None = None,
+        **kwargs,
+    ) -> None:
         if vmin is None and "xmin" in kwargs:
             vmin = kwargs.pop("xmin")
         if vmax is None and "xmax" in kwargs:
@@ -104,7 +109,7 @@ class UniformQuantizer:
         # L==2일 때도 엔드포인트 포함을 보장(Δ = range/1)
         return (self.vmax - self.vmin) / (self.levels - 1)
 
-    def _to_code(self, x: float) -> Tuple[int, bool]:
+    def _to_code(self, x: float) -> tuple[int, bool]:
         if not math.isfinite(x):
             raise ValueError("x must be finite")
         # 포화

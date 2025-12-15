@@ -10,11 +10,11 @@ JSON, and raises rich exceptions when Discord returns an error response.
 from __future__ import annotations
 
 import json
-import socket
 import urllib.error
 import urllib.request
+from collections.abc import Iterable, Mapping, MutableMapping
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, MutableMapping
+from typing import Any
 
 __all__ = ["DiscordWebhookError", "WebhookPayload", "send_discord_message"]
 
@@ -112,6 +112,6 @@ def send_discord_message(
         ) from exc
     except urllib.error.URLError as exc:  # pragma: no cover - exercised in tests
         raise DiscordWebhookError(f"Discord webhook request error: {exc.reason}") from exc
-    except socket.timeout as exc:  # pragma: no cover
+    except TimeoutError as exc:  # pragma: no cover
         raise DiscordWebhookError("Discord webhook request timed out") from exc
 

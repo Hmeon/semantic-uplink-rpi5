@@ -9,8 +9,8 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Iterable, List, Sequence, Tuple
 
 # 선택적 의존: 공통 모듈(존재 시 사용, 없으면 폴백 로직 사용)
 try:  # EventMsg는 타입 힌트/편의용, 런타임 순환의존 방지
@@ -40,7 +40,7 @@ _NS_PER_MS = 1_000_000
 # AoI (Age of Information) - 연속시간 정확식
 # ---------------------------------------------------------------------------
 
-def _aoi_deltas_ms(ts_ns: Sequence[int]) -> List[float]:
+def _aoi_deltas_ms(ts_ns: Sequence[int]) -> list[float]:
     """
     오름차순 타임스탬프 배열로부터 Δ_i(ms) 목록을 계산한다.
     입력이 정렬되지 않았다면 정렬 후 계산.
@@ -104,7 +104,7 @@ def aoi_percentile(ts_ns: Sequence[int], p: float = 0.95) -> float:
     return float(d_sorted[-1])
 
 
-def aoi_mean_and_p95(ts_ns: Sequence[int]) -> Tuple[float, float]:
+def aoi_mean_and_p95(ts_ns: Sequence[int]) -> tuple[float, float]:
     """편의 함수: 평균·P95(ms) 동시 계산."""
     return aoi_mean(ts_ns), aoi_percentile(ts_ns, 0.95)
 
@@ -119,7 +119,7 @@ class AoIAggregator:
     _last_ts_ns: int | None = None
     _sum_ms: float = 0.0
     _sum_sq_ms2: float = 0.0
-    _deltas_ms: List[float] | None = None  # 분위수 계산용(옵션 저장)
+    _deltas_ms: list[float] | None = None  # 분위수 계산용(옵션 저장)
     _n: int = 0
 
     def __init__(self, keep_deltas: bool = True):
@@ -155,7 +155,7 @@ class AoIAggregator:
             return float("nan")
         return aoi_percentile_from_deltas(self._deltas_ms, p)
 
-    def finalize(self, p: float = 0.95) -> Tuple[float, float]:
+    def finalize(self, p: float = 0.95) -> tuple[float, float]:
         """(mean_ms, p_ms(p))"""
         return self.mean_ms(), self.p_ms(p)
 
@@ -227,7 +227,7 @@ def _mqtt_remaining_length_nbytes(remaining: int) -> int:
     return n
 
 
-def mqtt_bytes_of_event(event: "EventMsg", qos: int = 1) -> int:
+def mqtt_bytes_of_event(event: EventMsg, qos: int = 1) -> int:
     """
     EventMsg 한 건의 MQTT PUBLISH 총 바이트 수(헤더 포함)를 계산.
     (토픽은 스키마 규칙 'edge/{device}/{sensor}/event' 사용)
@@ -258,7 +258,8 @@ def percent_improvement(baseline: float, candidate: float) -> float:
     개선율(%) = (baseline - candidate) / baseline * 100
     baseline<=0이면 NaN.
     """
-    b = float(baseline); c = float(candidate)
+    b = float(baseline)
+    c = float(candidate)
     if not math.isfinite(b) or b <= 0:
         return float("nan")
     return (b - c) / b * 100.0

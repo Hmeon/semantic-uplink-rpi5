@@ -108,7 +108,7 @@ class DeviceSensorsConfig(BaseModel):
     temp: DeviceTempConfig | None = None
 
     @model_validator(mode="after")
-    def _at_least_one_sensor(self) -> "DeviceSensorsConfig":
+    def _at_least_one_sensor(self) -> DeviceSensorsConfig:
         if self.mic is None and self.temp is None:
             raise ValueError("at least one of sensors.mic or sensors.temp must be set")
         return self

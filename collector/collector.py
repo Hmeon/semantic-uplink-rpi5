@@ -4,19 +4,20 @@
 # 내부 의존: common.mqttutil.mqtt_v311_publish_size (이전 단계에 합의된 함수)
 
 from __future__ import annotations
+
 import argparse
-import re
 import json
 import os
+import re
 import signal
 import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Dict, Tuple, Any, List
+from typing import Any
 
-import pandas as pd
 import paho.mqtt.client as mqtt
+import pandas as pd
 
 # MQTT PUBLISH 패킷 크기 계산(브로커 수신 기준; 헤더 포함)
 try:
@@ -63,14 +64,14 @@ class Collector:
         self._flush_lock = threading.Lock()
 
         # dedup된 이벤트를 key→row(dict)로 축적
-        self._pending_events: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+        self._pending_events: dict[tuple[str, str, int], dict[str, Any]] = {}
         # policy decisions는 전부 저장(중복 처리 불필요)
-        self._pending_decisions: List[Dict[str, Any]] = []
+        self._pending_decisions: list[dict[str, Any]] = []
         # 마커(버튼/실험) 로그
-        self._pending_markers: List[Dict[str, Any]] = []
+        self._pending_markers: list[dict[str, Any]] = []
 
         # bounded de-dup cache across flushes: (device_id, sensor, seq) -> last_seen_ns
-        self._seen_event_keys: "OrderedDict[Tuple[str, str, int], int]" = OrderedDict()
+        self._seen_event_keys: OrderedDict[tuple[str, str, int], int] = OrderedDict()
 
         # totals for meta/reporting (monotonic)
         self._events_unique_total = 0
@@ -474,7 +475,10 @@ class Collector:
             while not self._stop_event.is_set():
                 if self.cfg.max_runtime_s is not None:
                     if (time.time() - t0) >= float(self.cfg.max_runtime_s):
-                        print(f"[collector] max_runtime_s={self.cfg.max_runtime_s} reached; stopping...")
+                        print(
+                            f"[collector] max_runtime_s={self.cfg.max_runtime_s} reached; "
+                            "stopping..."
+                        )
                         break
                 time.sleep(0.2)
         finally:
