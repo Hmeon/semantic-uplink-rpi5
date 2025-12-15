@@ -44,6 +44,7 @@ class Config:
     port: int = 1883
     flush_interval_s: int = 10
     client_id: str = "collector"
+    max_runtime_s: float | None = None  # test helper: stop after N seconds
     clock_offset_ns: int = 0   # (옵션) edge→collector 보정치. 검증 단계에서는 0.
 
 
@@ -335,6 +336,7 @@ class Collector:
         )
 
     def start(self):
+        t0 = time.time()
         self._client = mqtt.Client(
             client_id=self.cfg.client_id, clean_session=True, protocol=mqtt.MQTTv311
         )
@@ -367,6 +369,10 @@ class Collector:
         # 메인 스레드는 단순 대기
         try:
             while not self._stop_event.is_set():
+                if self.cfg.max_runtime_s is not None:
+                    if (time.time() - t0) >= float(self.cfg.max_runtime_s):
+                        print(f"[collector] max_runtime_s={self.cfg.max_runtime_s} reached; stopping...")
+                        break
                 time.sleep(0.2)
         finally:
             # 외부 stop 호출 없이도 안전 정리
@@ -401,11 +407,17 @@ def main():
     parser.add_argument("--flush-interval-s", type=int, default=10)
     parser.add_argument("--client-id", default="collector")
     parser.add_argument("--clock-offset-ns", type=int, default=0)
+    parser.add_argument(
+        "--max-runtime-s",
+        type=float,
+        default=None,
+        help="Stop automatically after N seconds (useful for tests).",
+    )
     args = parser.parse_args()
 
     cfg = Config(run_dir=args.run_dir, broker=args.broker, port=args.port,
                  flush_interval_s=args.flush_interval_s, client_id=args.client_id,
-                 clock_offset_ns=args.clock_offset_ns)
+                 clock_offset_ns=args.clock_offset_ns, max_runtime_s=args.max_runtime_s)
     os.makedirs(cfg.run_dir, exist_ok=True)
     Collector(cfg).start()
 
