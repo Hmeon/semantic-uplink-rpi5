@@ -36,6 +36,7 @@ class LinUCBConfig:
     device_id: str
     sensor: SensorType
     profile: LinkProfile
+    seed: int | None = None
 
     # 팔 그리드 (명시하지 않으면 센서별 권장 디폴트 사용; 12~18개 범위)
     arms: Sequence[Arm] | None = None
@@ -104,6 +105,8 @@ class LinUCBPolicy:
 
     def __init__(self, cfg: LinUCBConfig):
         self.cfg = cfg
+        if cfg.seed is not None:
+            print(f"[linucb] seed={int(cfg.seed)}")
         self.arms: list[Arm] = list(cfg.arms) if cfg.arms is not None else _default_arms(cfg.sensor)
         if not self.arms:
             raise ValueError("arms must not be empty")
@@ -141,6 +144,7 @@ class LinUCBPolicy:
         # 직전 결정(학습용) 버퍼
         self._last_x: np.ndarray | None = None
         self._last_arm_idx: int | None = None
+        self._last_logged_arm_idx: int | None = None
 
     # ---------------- 공개 API ----------------
 
@@ -157,6 +161,12 @@ class LinUCBPolicy:
             arm_idx = self._select_arm_ucb(state)
 
         arm = self.arms[arm_idx]
+        if arm_idx != self._last_logged_arm_idx:
+            print(
+                f"[linucb] select arm_idx={arm_idx} tau={arm.tau} kbits={arm.kbits} "
+                f"device_id={self.cfg.device_id} sensor={self.cfg.sensor.value}"
+            )
+            self._last_logged_arm_idx = arm_idx
         x = self._context(state)
 
         # 학습용 버퍼에 기록(직전 결정)

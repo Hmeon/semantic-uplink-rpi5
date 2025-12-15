@@ -9,8 +9,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import platform
 import shlex
 import signal
 import subprocess
@@ -45,6 +47,7 @@ class ExperimentPlan:
     # 브로커
     broker: str = "localhost"
     port: int = 1883
+    seed: int = 0
 
     # 센서 사용
     use_mic: bool = True
@@ -167,6 +170,7 @@ class ScenarioRunner:
             "--port", str(p.port),
             "--client-id", f"edge-{p.device_id}",
             "--run-dir", str(run_dir),
+            "--seed", str(p.seed),
             "--arms", p.arms_path,
         ]
 
@@ -243,6 +247,13 @@ class ScenarioRunner:
     # --------- 유틸 ---------
 
     def _popen(self, cmd: List[str], **kw) -> subprocess.Popen:
+        env = dict(os.environ)
+        user_env = kw.pop("env", None)
+        if isinstance(user_env, dict):
+            env.update(user_env)
+        env.setdefault("PYTHONHASHSEED", str(self.plan.seed))
+        env.setdefault("SEMUP_SEED", str(self.plan.seed))
+        kw["env"] = env
         proc = subprocess.Popen(cmd, **kw)
         self._procs.append(proc)
         return proc
@@ -315,11 +326,57 @@ def _run_root(plan: ExperimentPlan) -> Path:
         (root / "tc_profiles.json").write_text(json.dumps({k: asdict(v) for k, v in tc_get().items()}, indent=2))
     except Exception:
         pass
+    _write_run_meta(root, plan)
     return root
 
 
 def _utc_ts() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _git_commit() -> str | None:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], timeout=2).decode().strip()
+    except Exception:
+        return None
+
+
+def _read_text_snapshot(path: Path) -> dict:
+    snap = {"path": str(path), "exists": path.exists()}
+    if not path.exists():
+        snap["sha256"] = None
+        snap["text"] = None
+        return snap
+    data = path.read_bytes()
+    snap["sha256"] = hashlib.sha256(data).hexdigest()
+    snap["text"] = path.read_text(encoding="utf-8", errors="replace")
+    return snap
+
+
+def _write_run_meta(root: Path, plan: ExperimentPlan) -> None:
+    meta = {
+        "created_utc": _utc_ts(),
+        "git_commit": _git_commit(),
+        "seed": int(plan.seed),
+        "python": {"version": sys.version, "executable": sys.executable},
+        "platform": {
+            "platform": platform.platform(),
+            "system": platform.system(),
+            "release": platform.release(),
+            "version": platform.version(),
+            "machine": platform.machine(),
+            "processor": platform.processor(),
+        },
+        "configs": {
+            "policy_yaml": _read_text_snapshot(Path(plan.arms_path)),
+            "device_yaml": _read_text_snapshot(Path("configs/device.yaml")),
+            "link_profiles_yaml": _read_text_snapshot(Path("configs/link_profiles.yaml")),
+        },
+    }
+    tmp = root / "run_meta.json.tmp"
+    out = root / "run_meta.json"
+    tmp.write_text(json.dumps(meta, indent=2, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(out)
 
 
 def _asdict_plan(plan: ExperimentPlan) -> dict:
@@ -335,11 +392,8 @@ def _env_snapshot() -> dict:
         "cwd": str(Path.cwd()),
     }
     # git 커밋(옵션)
-    try:
-        sha = subprocess.check_output(["git", "rev-parse", "HEAD"], timeout=2).decode().strip()
-        info["git_commit"] = sha
-    except Exception:
-        info["git_commit"] = None
+    info["git_commit"] = _git_commit()
+    info["platform"] = platform.platform()
     return info
 
 
@@ -358,6 +412,7 @@ def parse_args() -> ExperimentPlan:
 
     ap.add_argument("--broker", default="localhost")
     ap.add_argument("--port", type=int, default=1883)
+    ap.add_argument("--seed", type=int, default=0, help="random seed for reproducibility")
 
     # 기본은 둘 다 활성(평가/데모 기준). 필요 시 --no-mic / --no-temp 로 비활성.
     ap.add_argument("--mic", dest="use_mic", action=argparse.BooleanOptionalAction, default=True)
@@ -402,6 +457,7 @@ def parse_args() -> ExperimentPlan:
 
         broker=args.broker,
         port=args.port,
+        seed=int(args.seed),
 
         use_mic=bool(args.use_mic),
         use_temp=bool(args.use_temp),
@@ -436,6 +492,7 @@ def parse_args() -> ExperimentPlan:
         _ = PolicyMode(m)
     for p in plan.profiles:
         _ = LinkProfile(p)
+
     return plan
 
 

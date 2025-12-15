@@ -113,6 +113,7 @@ class EdgeDaemon:
         port: int = 1883,
         client_id: str = "edge-pub",
         keepalive: int = 30,
+        seed: int | None = None,
         mic: MicCfg | None = None,
         temp: TempCfg | None = None,
         rtc: RTCCfg | None = None,
@@ -124,6 +125,7 @@ class EdgeDaemon:
         self.profile = profile
         self.outbox_path = outbox_path
         self.mode = mode
+        self.seed = seed
         self._arms_cfg = arms_cfg or {}
         self.broker = broker
         self.port = int(port)
@@ -603,6 +605,7 @@ class EdgeDaemon:
             device_id=self.device_id,
             sensor=sensor,
             profile=self.profile,
+            seed=self.seed,
             mae_scale=mae_scale,
             res_scale=res_scale,
             resvar_scale=resvar_scale,
@@ -651,6 +654,7 @@ def main():
     p.add_argument("--port", type=int, default=1883)
     p.add_argument("--client-id", default="edge-pub")
     p.add_argument("--keepalive", type=int, default=30)
+    p.add_argument("--seed", type=int, default=None, help="random seed (reproducibility)")
 
     # Outbox
     p.add_argument("--outbox", default=None, help="SQLite 경로(기본: <run-dir>/outbox.sqlite)")
@@ -721,10 +725,23 @@ def main():
 
     args = p.parse_args()
 
+    seed = args.seed
+    if seed is None:
+        seed_env = os.environ.get("SEMUP_SEED")
+        if seed_env:
+            try:
+                seed = int(seed_env)
+            except ValueError:
+                seed = None
+    if seed is None:
+        seed = 0
+    _seed_everything(int(seed))
+
     policy_mode = PolicyMode(args.mode)
     profile = LinkProfile(args.profile)
     arms_cfg: dict | None = None
     if policy_mode == PolicyMode.ADAPTIVE:
+        print(f"[edge] adaptive seed={seed}")
         arms_cfg = _load_policy_yaml(args.arms)
 
     # 기본 run-dir/outbox
@@ -805,6 +822,7 @@ def main():
         port=args.port,
         client_id=args.client_id,
         keepalive=args.keepalive,
+        seed=int(seed),
         mic=mic_cfg,
         temp=temp_cfg,
         rtc=rtc_cfg,
@@ -843,6 +861,18 @@ def _hb_none(x: float | None) -> float | None:
     except Exception:
         return None
     return None if xv <= 0 else xv
+
+
+def _seed_everything(seed: int) -> None:
+    import random
+
+    random.seed(seed)
+    try:
+        import numpy as np
+
+        np.random.seed(seed)
+    except Exception:
+        return None
 
 
 def _parse_int_auto(val: str) -> int:
