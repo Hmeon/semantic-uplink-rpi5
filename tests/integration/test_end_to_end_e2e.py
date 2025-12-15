@@ -235,12 +235,17 @@ def test_end_to_end_mqtt_collector_analyze(tmp_path: Path) -> None:
             raise
         assert proc.returncode == 0
 
-    events_path = run_dir / "logs" / "events.parquet"
+    logs_dir = run_dir / "logs"
     meta_path = run_dir / "logs" / "collector_meta.json"
-    assert events_path.exists()
+    events_paths = sorted(logs_dir.glob("events_*.parquet"))
+    if not events_paths:
+        legacy = logs_dir / "events.parquet"
+        if legacy.exists():
+            events_paths = [legacy]
+    assert events_paths
     assert meta_path.exists()
 
-    df = pd.read_parquet(events_path)
+    df = pd.concat([pd.read_parquet(p) for p in events_paths], ignore_index=True)
     assert len(df) == 10  # unique seq only
 
     meta = json.loads(meta_path.read_text(encoding="utf-8"))

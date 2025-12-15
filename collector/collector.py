@@ -5,11 +5,13 @@
 
 from __future__ import annotations
 import argparse
+import re
 import json
 import os
 import signal
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from typing import Dict, Tuple, Any, List
 
@@ -45,6 +47,8 @@ class Config:
     flush_interval_s: int = 10
     client_id: str = "collector"
     max_runtime_s: float | None = None  # test helper: stop after N seconds
+    dedup_cache_max_keys: int = 100_000
+    dedup_cache_ttl_s: float = 300.0
     clock_offset_ns: int = 0   # (옵션) edge→collector 보정치. 검증 단계에서는 0.
 
 
@@ -56,13 +60,22 @@ class Collector:
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self._lock = threading.Lock()
+        self._flush_lock = threading.Lock()
 
         # dedup된 이벤트를 key→row(dict)로 축적
-        self._events: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
+        self._pending_events: Dict[Tuple[str, str, int], Dict[str, Any]] = {}
         # policy decisions는 전부 저장(중복 처리 불필요)
-        self._decisions: List[Dict[str, Any]] = []
+        self._pending_decisions: List[Dict[str, Any]] = []
         # 마커(버튼/실험) 로그
-        self._markers: List[Dict[str, Any]] = []
+        self._pending_markers: List[Dict[str, Any]] = []
+
+        # bounded de-dup cache across flushes: (device_id, sensor, seq) -> last_seen_ns
+        self._seen_event_keys: "OrderedDict[Tuple[str, str, int], int]" = OrderedDict()
+
+        # totals for meta/reporting (monotonic)
+        self._events_unique_total = 0
+        self._decisions_total = 0
+        self._markers_total = 0
 
         # 통계/메타
         self._bytes_total = 0
@@ -85,6 +98,38 @@ class Collector:
         os.makedirs(self._figures_dir, exist_ok=True)
         self._configs_dir = os.path.join(self.cfg.run_dir, "configs")
         os.makedirs(self._configs_dir, exist_ok=True)
+
+        # parquet rotation indices
+        self._events_part = self._next_part_index("events")
+        self._decisions_part = self._next_part_index("decisions")
+        self._markers_part = self._next_part_index("markers")
+
+    def _next_part_index(self, prefix: str) -> int:
+        pat = re.compile(rf"^{re.escape(prefix)}_(\\d+)\\.parquet$")
+        max_idx = 0
+        try:
+            for name in os.listdir(self._logs_dir):
+                m = pat.match(name)
+                if m:
+                    max_idx = max(max_idx, int(m.group(1)))
+        except FileNotFoundError:
+            return 1
+        return max_idx + 1
+
+    def _prune_seen(self, now_ns: int) -> None:
+        ttl_ns = int(max(0.0, float(self.cfg.dedup_cache_ttl_s)) * 1e9)
+        if ttl_ns > 0 and self._seen_event_keys:
+            cutoff = int(now_ns) - ttl_ns
+            while self._seen_event_keys:
+                _key, last_seen_ns = next(iter(self._seen_event_keys.items()))
+                if int(last_seen_ns) >= cutoff:
+                    break
+                self._seen_event_keys.popitem(last=False)
+
+        max_keys = int(self.cfg.dedup_cache_max_keys)
+        if max_keys > 0:
+            while len(self._seen_event_keys) > max_keys:
+                self._seen_event_keys.popitem(last=False)
 
     # --------------- MQTT 수신 경로 ---------------
 
@@ -175,16 +220,23 @@ class Collector:
 
         key = (device_id, sensor, seq)
 
+        is_dup = False
         with self._lock:
+            self._prune_seen(int(t_recv_ns))
             self._bytes_total += pkt_size
-            if key in self._events:
-                # 중복: 최초 레코드의 mqtt_size_bytes에 누적만(데이터는 그대로)
+            if key in self._pending_events:
+                # duplicate within current pending batch: keep first row but accumulate bytes
+                is_dup = True
                 self._dup_messages += 1
                 self._dup_bytes += pkt_size
-                self._events[key]["mqtt_size_bytes"] += pkt_size
-                # AoI는 최초 도착 기준 유지(엄격 재현성)
+                self._pending_events[key]["mqtt_size_bytes"] += pkt_size
+            elif key in self._seen_event_keys:
+                # duplicate across flush boundaries: count/drop without rewriting old parquet parts
+                is_dup = True
+                self._dup_messages += 1
+                self._dup_bytes += pkt_size
             else:
-                self._events[key] = {
+                self._pending_events[key] = {
                     "device_id": device_id,
                     "sensor": sensor,
                     "profile": profile,
@@ -201,9 +253,17 @@ class Collector:
                     "mqtt_size_bytes": int(pkt_size),
                     "dup_flag": False,  # dedup 결과는 항상 False(중복 레코드는 저장하지 않음)
                 }
+                self._events_unique_total += 1
+
+            # bounded de-dup cache across flushes (LRU-ish by last seen time)
+            if int(self.cfg.dedup_cache_max_keys) > 0 or float(self.cfg.dedup_cache_ttl_s) > 0.0:
+                self._seen_event_keys.pop(key, None)
+                self._seen_event_keys[key] = int(t_recv_ns)
+                self._prune_seen(int(t_recv_ns))
 
         # 경량 실시간 로그(빈도 제한 없음; 외부 rate-limit 필요시 조정)
-        print(f"[event] {device_id}/{sensor} seq={seq} aoi_ms={aoi_ms:.1f} bytes+={pkt_size}")
+        tag = "DUP" if is_dup else "OK"
+        print(f"[event:{tag}] {device_id}/{sensor} seq={seq} aoi_ms={aoi_ms:.1f} bytes+={pkt_size}")
 
     # --------------- 정책결정 처리 ---------------
 
@@ -233,7 +293,8 @@ class Collector:
             "topic": topic,
         }
         with self._lock:
-            self._decisions.append(rec)
+            self._pending_decisions.append(rec)
+            self._decisions_total += 1
 
     def _handle_marker_message(
         self, topic: str, payload_bytes: bytes, t_recv_ns: int | None = None
@@ -249,91 +310,108 @@ class Collector:
             "topic": topic,
         }
         with self._lock:
-            self._markers.append(rec)
+            self._pending_markers.append(rec)
+            self._markers_total += 1
         print(f"[marker] {rec['device_id']} {rec['note']} @ {rec['ts']}")
 
     # --------------- 저장/플러시 ---------------
 
     def _flush(self):
-        """events.parquet / decisions.parquet / collector_meta.json 저장(원자적 교체)"""
-        with self._lock:
-            events_list = list(self._events.values())
-            decisions_list = list(self._decisions)
-            markers_list = list(self._markers)
-            bytes_total = int(self._bytes_total)
-            dup_msgs = int(self._dup_messages)
-            dup_bytes = int(self._dup_bytes)
-            first_ns = int(self._first_ns)
-            last_ns = int(self._last_ns)
+        """Write pending buffers to rotated Parquet parts and update collector_meta.json."""
+        with self._flush_lock:
+            with self._lock:
+                events_list = list(self._pending_events.values())
+                decisions_list = list(self._pending_decisions)
+                markers_list = list(self._pending_markers)
 
-        # DataFrame 변환 및 dtype 고정
-        if events_list:
-            df_e = pd.DataFrame.from_records(events_list)
-            # dtype 지정(스키마 불변 강제)
-            dtype_map = {
-                "device_id": "string",
-                "sensor": "string",
-                "profile": "string",
-                "policy": "string",
-                "seq": "uint64",
-                "ts_ns": "int64",
-                "t_recv_ns": "int64",
-                "val": "float64",
-                "pred": "float64",
-                "res": "float64",
-                "tau": "float32",
-                "kbits": "int16",
-                "topic": "string",
-                "mqtt_size_bytes": "int32",
-                "dup_flag": "boolean",
+                self._pending_events.clear()
+                self._pending_decisions.clear()
+                self._pending_markers.clear()
+
+                bytes_total = int(self._bytes_total)
+                dup_msgs = int(self._dup_messages)
+                dup_bytes = int(self._dup_bytes)
+                first_ns = int(self._first_ns)
+                last_ns = int(self._last_ns)
+                events_unique_total = int(self._events_unique_total)
+                decisions_total = int(self._decisions_total)
+                markers_total = int(self._markers_total)
+
+                events_part: int | None = None
+                decisions_part: int | None = None
+                markers_part: int | None = None
+                if events_list:
+                    events_part = int(self._events_part)
+                    self._events_part += 1
+                if decisions_list:
+                    decisions_part = int(self._decisions_part)
+                    self._decisions_part += 1
+                if markers_list:
+                    markers_part = int(self._markers_part)
+                    self._markers_part += 1
+
+            def _write_parquet(df: pd.DataFrame, fname: str) -> None:
+                tmp = os.path.join(self._logs_dir, f"{fname}.tmp")
+                dst = os.path.join(self._logs_dir, fname)
+                df.to_parquet(tmp, index=False)
+                os.replace(tmp, dst)
+
+            if events_list and events_part is not None:
+                df_e = pd.DataFrame.from_records(events_list)
+                dtype_map = {
+                    "device_id": "string",
+                    "sensor": "string",
+                    "profile": "string",
+                    "policy": "string",
+                    "seq": "uint64",
+                    "ts_ns": "int64",
+                    "t_recv_ns": "int64",
+                    "val": "float64",
+                    "pred": "float64",
+                    "res": "float64",
+                    "tau": "float32",
+                    "kbits": "int16",
+                    "topic": "string",
+                    "mqtt_size_bytes": "int32",
+                    "dup_flag": "boolean",
+                }
+                for c, dt in dtype_map.items():
+                    if c in df_e.columns:
+                        df_e[c] = df_e[c].astype(dt)
+                _write_parquet(df_e, f"events_{events_part:06d}.parquet")
+
+            if decisions_list and decisions_part is not None:
+                df_d = pd.DataFrame.from_records(decisions_list)
+                _write_parquet(df_d, f"decisions_{decisions_part:06d}.parquet")
+
+            if markers_list and markers_part is not None:
+                df_m = pd.DataFrame.from_records(markers_list)
+                _write_parquet(df_m, f"markers_{markers_part:06d}.parquet")
+
+            meta = {
+                "run_id": os.path.basename(self.cfg.run_dir.rstrip("/")),
+                "broker": f"{self.cfg.broker}:{self.cfg.port}",
+                "clock_offset_ns": int(self.cfg.clock_offset_ns),
+                "first_recv_ns": first_ns,
+                "last_recv_ns": last_ns,
+                "bytes_total_including_dups": bytes_total,
+                "dup_messages_dropped": dup_msgs,
+                "dup_bytes_dropped": dup_bytes,
+                "events_unique": events_unique_total,
+                "decisions_count": decisions_total,
+                "markers_count": markers_total,
             }
-            for c, dt in dtype_map.items():
-                if c in df_e.columns:
-                    df_e[c] = df_e[c].astype(dt)
-            tmp = os.path.join(self._logs_dir, "events.parquet.tmp")
-            dst = os.path.join(self._logs_dir, "events.parquet")
-            df_e.to_parquet(tmp, index=False)
+            tmp = os.path.join(self._logs_dir, "collector_meta.json.tmp")
+            dst = os.path.join(self._logs_dir, "collector_meta.json")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(meta, f, ensure_ascii=False, indent=2)
             os.replace(tmp, dst)
 
-        if decisions_list:
-            df_d = pd.DataFrame.from_records(decisions_list)
-            # 결정 로그는 비교적 유연 — 필수 컬럼 위주로 저장
-            tmp = os.path.join(self._logs_dir, "decisions.parquet.tmp")
-            dst = os.path.join(self._logs_dir, "decisions.parquet")
-            df_d.to_parquet(tmp, index=False)
-            os.replace(tmp, dst)
-
-        if markers_list:
-            df_m = pd.DataFrame.from_records(markers_list)
-            tmp = os.path.join(self._logs_dir, "markers.parquet.tmp")
-            dst = os.path.join(self._logs_dir, "markers.parquet")
-            df_m.to_parquet(tmp, index=False)
-            os.replace(tmp, dst)
-
-        # 메타 저장
-        meta = {
-            "run_id": os.path.basename(self.cfg.run_dir.rstrip("/")),
-            "broker": f"{self.cfg.broker}:{self.cfg.port}",
-            "clock_offset_ns": int(self.cfg.clock_offset_ns),
-            "first_recv_ns": first_ns,
-            "last_recv_ns": last_ns,
-            "bytes_total_including_dups": bytes_total,
-            "dup_messages_dropped": dup_msgs,
-            "dup_bytes_dropped": dup_bytes,
-            "events_unique": len(events_list),
-            "decisions_count": len(decisions_list),
-            "markers_count": len(markers_list),
-        }
-        tmp = os.path.join(self._logs_dir, "collector_meta.json.tmp")
-        dst = os.path.join(self._logs_dir, "collector_meta.json")
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(meta, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, dst)
-
-        print(
-            f"[collector] flush: events={len(events_list)} decisions={len(decisions_list)} "
-            f"markers={len(markers_list)} bytes_total={bytes_total} dup_msgs={dup_msgs}"
-        )
+            print(
+                f"[collector] flush: events+={len(events_list)} decisions+={len(decisions_list)} "
+                f"markers+={len(markers_list)} total_events_unique={events_unique_total} "
+                f"bytes_total={bytes_total} dup_msgs={dup_msgs}"
+            )
 
     def start(self):
         t0 = time.time()
@@ -407,6 +485,8 @@ def main():
     parser.add_argument("--flush-interval-s", type=int, default=10)
     parser.add_argument("--client-id", default="collector")
     parser.add_argument("--clock-offset-ns", type=int, default=0)
+    parser.add_argument("--dedup-cache-max-keys", type=int, default=100_000)
+    parser.add_argument("--dedup-cache-ttl-s", type=float, default=300.0)
     parser.add_argument(
         "--max-runtime-s",
         type=float,
@@ -415,9 +495,17 @@ def main():
     )
     args = parser.parse_args()
 
-    cfg = Config(run_dir=args.run_dir, broker=args.broker, port=args.port,
-                 flush_interval_s=args.flush_interval_s, client_id=args.client_id,
-                 clock_offset_ns=args.clock_offset_ns, max_runtime_s=args.max_runtime_s)
+    cfg = Config(
+        run_dir=args.run_dir,
+        broker=args.broker,
+        port=args.port,
+        flush_interval_s=args.flush_interval_s,
+        client_id=args.client_id,
+        max_runtime_s=args.max_runtime_s,
+        dedup_cache_max_keys=args.dedup_cache_max_keys,
+        dedup_cache_ttl_s=args.dedup_cache_ttl_s,
+        clock_offset_ns=args.clock_offset_ns,
+    )
     os.makedirs(cfg.run_dir, exist_ok=True)
     Collector(cfg).start()
 

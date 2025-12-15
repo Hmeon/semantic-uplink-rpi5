@@ -6,10 +6,10 @@
 # 입력 기대:
 #  - Parquet: *.parquet (권장, 빠름)
 #  - CSV    : *.csv (utf-8, 헤더 포함)
-#  - 파일/디렉터리 모두 허용. 디렉터리는 재귀 검색하며 events.(parquet|csv) 우선.
+#  - 파일/디렉터리 모두 허용. 디렉터리는 재귀 검색하며 events_*.parquet(회전) / events.parquet(레거시) 우선.
 #  - 필수 컬럼(스키마 정합, 표준화 후):
 #      ts(ns), seq, device_id, sensor, val, pred, res, tau, kbits, profile, policy
-#    * Collector가 저장한 events.parquet는 ts 대신 ts_ns를 쓰는 경우가 있어 자동 변환한다.
+#    * Collector가 저장한 events*.parquet는 ts 대신 ts_ns를 쓰는 경우가 있어 자동 변환한다.
 #  - (권장) 수집기 기준 AoI/Rate 계산을 위해 t_recv_ns가 있으면 사용한다.
 #  - (선택) 네트워크 사용량 추정을 위해 mqtt_bytes 또는 mqtt_size_bytes가 있으면 사용한다.
 #
@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import json
 import math
 import os
@@ -55,17 +56,21 @@ def _discover_files(inputs: Iterable[str | os.PathLike]) -> List[Path]:
     for inp in inputs:
         p = Path(inp)
         if p.is_dir():
-            # 우선순위: events.(parquet|csv) > (events 외 parquet) > (events 외 csv)
-            cands = list(p.rglob("events.parquet"))
+            # 우선순위: events_*.parquet (rotated) > events.parquet (legacy) > csv > fallback
+            cands = list(p.rglob("events_*.parquet"))
+            if not cands:
+                cands = list(p.rglob("events.parquet"))
+            if not cands:
+                cands = list(p.rglob("events_*.csv"))
             if not cands:
                 cands = list(p.rglob("events.csv"))
             if not cands:
                 # 디렉터리에 parquet가 있어도 decisions/markers 같은 비-이벤트 로그는 제외
-                skip = {"decisions.parquet", "markers.parquet"}
-                cands = [f for f in p.rglob("*.parquet") if f.name not in skip]
+                skip_prefixes = ("decisions", "markers")
+                cands = [f for f in p.rglob("*.parquet") if not f.name.startswith(skip_prefixes)]
             if not cands:
-                skip = {"decisions.csv", "markers.csv"}
-                cands = [f for f in p.rglob("*.csv") if f.name not in skip]
+                skip_prefixes = ("decisions", "markers")
+                cands = [f for f in p.rglob("*.csv") if not f.name.startswith(skip_prefixes)]
             files.extend(sorted(set(cands)))
         elif p.is_file():
             files.append(p)
@@ -79,12 +84,15 @@ def _discover_files(inputs: Iterable[str | os.PathLike]) -> List[Path]:
     return uniq
 
 
-def _discover_named_files(inputs: Iterable[str | os.PathLike], *, names: Iterable[str]) -> List[Path]:
+def _discover_named_files(
+    inputs: Iterable[str | os.PathLike], *, names: Iterable[str]
+) -> List[Path]:
     """
     입력 경로(파일/디렉터리)에서 지정한 파일명들을 재귀적으로 탐색한다.
-    - names: 예) ("events.parquet", "events.csv")
+    - names: 예) ("events_*.parquet", "events.parquet", "events.csv")
     """
-    wanted = set(str(n) for n in names)
+    patterns = [str(n) for n in names]
+    wanted = set(patterns)
     files: list[Path] = []
     for inp in inputs:
         p = Path(inp)
@@ -94,7 +102,7 @@ def _discover_named_files(inputs: Iterable[str | os.PathLike], *, names: Iterabl
         elif p.is_file():
             # 파일을 직접 지정한 경우: 본인이 wanted면 포함,
             # 아니면 sibling에 원하는 파일이 있을 수 있으므로 parent를 탐색 루트로 추가.
-            if p.name in wanted:
+            if any(fnmatch.fnmatch(p.name, pat) for pat in patterns):
                 files.append(p)
             else:
                 parent = p.parent
@@ -197,7 +205,15 @@ def load_decisions(paths: List[str | os.PathLike]) -> pd.DataFrame:
     - ts(ns), device_id, state_aoi, state_res, state_res_var, state_loss, state_q_len,
       tau, kbits, reward
     """
-    files = _discover_named_files(paths, names=("decisions.parquet", "decisions.csv"))
+    files = _discover_named_files(
+        paths,
+        names=(
+            "decisions_*.parquet",
+            "decisions.parquet",
+            "decisions_*.csv",
+            "decisions.csv",
+        ),
+    )
     if not files:
         return pd.DataFrame()
 
@@ -395,8 +411,8 @@ def _infer_run_id_from_path(p: Path) -> str:
     분석 입력이 여러 run/시나리오를 섞는 경우를 대비해, 파일 경로에서 run_id를 추론한다.
 
     우선순위(휴리스틱):
-    - .../<scenario>/logs/events.parquet  → "<run_root>/<scenario>" (run_root가 artifacts가 아니면)
-    - artifacts/<run_id>/logs/events.parquet → "<run_id>"
+    - .../<scenario>/logs/events*.parquet  → "<run_root>/<scenario>" (run_root가 artifacts가 아니면)
+    - artifacts/<run_id>/logs/events*.parquet → "<run_id>"
     - 그 외: "<parent_dir>"
 
     목적:

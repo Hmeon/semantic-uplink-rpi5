@@ -61,7 +61,7 @@
 ### 3) 실험 로그/지표/리포트(파일 산출물)
 실행하면 기본적으로 아래 결과물이 생성됩니다(경로는 예시).
 - **Outbox(DB)**: `artifacts/run1/outbox.sqlite` (오프라인/재전송 보장 큐)
-- **Collector logs(Parquet)**: `artifacts/run1/logs/events.parquet`, `decisions.parquet`, `markers.parquet`
+- **Collector logs(Parquet)**: `artifacts/run1/logs/events_*.parquet`, `decisions_*.parquet`, `markers_*.parquet`
 - **Collector meta(JSON)**: `artifacts/run1/logs/collector_meta.json`
 - **Analysis outputs**
   - `results/run1/metrics_summary.csv` (profile×policy×sensor 요약; `mean±std` + 주요 컬럼: `rate_Bps`, `aoi_*`, `mae_event_*`)
@@ -482,7 +482,7 @@ python -m collector.analyze --input artifacts/run1/logs --out results/run1
 - 버튼(BCM): 모드(17), 프로파일(27), 마커(22). `--buttons-enable`로 활성화.
   - 버튼1: 정책 모드 순환 (PER→ETS→LINUCB)
   - 버튼2: 링크 프로파일 순환 (SLOW_10K→DELAY_LOSS→CELLULAR_VAR), `--tc-apply-on-button` 시 즉시 tc 적용
-  - 버튼3: 마커 전송(`marker/<device_id>`) → collector `markers.parquet`에 기록
+  - 버튼3: 마커 전송(`marker/<device_id>`) → collector `markers_*.parquet`에 기록
 - 0.96\" SSD1306: `--ui-kind ssd1306 --ui-address 0x3C` (추가 의존: `pip install luma.oled pillow`)
 
 ## Configuration
@@ -511,9 +511,9 @@ Current status:
 ```
 
 ### Collector Outputs
-- `logs/events.parquet` — deduped sensor events (seq-based)
-- `logs/decisions.parquet` — policy decisions/rewards (adaptive)
-- `logs/markers.parquet` — button/marker events for timeline alignment
+- `logs/events_*.parquet` — deduped sensor events (seq-based)
+- `logs/decisions_*.parquet` — policy decisions/rewards (adaptive)
+- `logs/markers_*.parquet` — button/marker events for timeline alignment
 - `collector_meta.json` — bytes, duplicates, counts for the run
 
 ## 7‑week Roadmap
