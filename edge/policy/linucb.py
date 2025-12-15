@@ -119,11 +119,11 @@ class LinUCBPolicy:
 
         # 세이프 팔 인덱스
         if cfg.safe_arm is None:
-            # tau 최소, kbits 최대 조합
-            tau_min = min(a.tau for a in self.arms)
-            k_max = max(a.kbits for a in self.arms)
-            safe_idx = next(
-                i for i, a in enumerate(self.arms) if a.tau == tau_min and a.kbits == k_max
+            # Conservative default that works even when `arms` is not a full grid:
+            # pick the smallest tau; if multiple exist, pick the largest kbits among them.
+            safe_idx = min(
+                range(len(self.arms)),
+                key=lambda i: (float(self.arms[i].tau), -int(self.arms[i].kbits)),
             )
         else:
             safe_idx = next(

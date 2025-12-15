@@ -25,6 +25,25 @@ def test_linucb_policy_safe_guard_selects_safe_arm() -> None:
     assert msg.reward == 0.0
 
 
+def test_linucb_policy_safe_guard_works_without_full_grid() -> None:
+    # This mirrors the default example in configs/policy.yaml: a "diagonal" (not full grid).
+    arms = [Arm(tau=1.5, kbits=6), Arm(tau=3.0, kbits=8), Arm(tau=6.0, kbits=10)]
+    cfg = LinUCBConfig(
+        device_id="dev1",
+        sensor=SensorType.TEMP,
+        profile=LinkProfile.SLOW_10KBPS,
+        seed=None,
+        arms=arms,
+        aoi_max_ms=1.0,
+        mae_max=999.0,
+    )
+    pol = LinUCBPolicy(cfg)
+
+    state = PolicyState(ts_ns=1, aoi_ms=10.0, res=0.0, res_var=0.0, loss=0.0, q_len=0)
+    (tau, kbits), _msg = pol.decide(state)
+    assert (tau, kbits) == (1.5, 6)
+
+
 def test_linucb_policy_warmup_cycles_arms_in_order() -> None:
     arms = [Arm(tau=0.1, kbits=6), Arm(tau=0.2, kbits=6), Arm(tau=0.3, kbits=6)]
     cfg = LinUCBConfig(
@@ -60,4 +79,3 @@ def test_linucb_policy_observe_outcome_without_decide_is_noop() -> None:
     )
     pol = LinUCBPolicy(cfg)
     assert pol.observe_outcome(aoi_ms=1.0, mae=1.0, rate_bps=1.0) == 0.0
-
