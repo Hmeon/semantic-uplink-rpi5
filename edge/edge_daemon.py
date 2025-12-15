@@ -21,6 +21,7 @@ from typing import Optional
 
 import yaml
 
+from common.config import load_policy_config_dict
 from common.schema import LinkProfile, PolicyMode, SensorType
 from edge.sensors.mic_rms import MicRMS
 from edge.sensors.temp import TempSensor
@@ -839,18 +840,10 @@ def main():
 # 작은 실수 방지: heartbeat 0/음수 → 비활성(None) 변환용 헬퍼 (가독성 위해 분리)
 def _load_policy_yaml(path: str) -> dict:
     try:
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-    except FileNotFoundError:
-        print(f"[edge] ERROR: arms config not found: {path}")
-        sys.exit(2)
+        return load_policy_config_dict(path)
     except Exception as e:
-        print(f"[edge] ERROR: failed to load arms config {path}: {e}")
+        print(f"[edge] ERROR: invalid arms config {path}: {e}")
         sys.exit(2)
-    if not isinstance(data, dict):
-        print(f"[edge] ERROR: arms config must be a mapping")
-        sys.exit(2)
-    return data
 
 
 def _hb_none(x: float | None) -> float | None:

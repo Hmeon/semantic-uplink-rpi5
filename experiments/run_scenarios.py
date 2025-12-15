@@ -22,6 +22,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
+from common.config import load_device_config, load_link_profiles_config, load_policy_config_dict
 from common.schema import LinkProfile, PolicyMode
 
 # link.shaper.tc_profiles의 함수 직접 호출 (cellular_var 토글 스레드가 CLI 블로킹을 유발하므로)
@@ -492,6 +493,20 @@ def parse_args() -> ExperimentPlan:
         _ = PolicyMode(m)
     for p in plan.profiles:
         _ = LinkProfile(p)
+
+    if "adaptive" in plan.modes:
+        try:
+            load_policy_config_dict(plan.arms_path)
+        except Exception as e:
+            print(f"[exp] ERROR: invalid arms config {plan.arms_path}: {e}", file=sys.stderr)
+            sys.exit(2)
+
+    try:
+        load_device_config("configs/device.yaml")
+        load_link_profiles_config("configs/link_profiles.yaml")
+    except Exception as e:
+        print(f"[exp] ERROR: invalid YAML config: {e}", file=sys.stderr)
+        sys.exit(2)
 
     return plan
 

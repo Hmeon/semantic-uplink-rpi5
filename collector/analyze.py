@@ -42,6 +42,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
+from common.config import load_policy_config_dict
 from common.discord_webhook import DiscordWebhookError, send_discord_message
 from common.schema import EventMsg, SensorType, LinkProfile, PolicyMode
 from common.metrics import percent_improvement
@@ -1182,11 +1183,8 @@ def _try_make_plots(out_dir: Path, summary: pd.DataFrame) -> list[Path]:
 
 def _load_policy_yaml(path: str) -> dict:
     try:
-        p = Path(path)
-        if not p.exists():
-            return {}
-        return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
-    except Exception:
+        return load_policy_config_dict(path)
+    except FileNotFoundError:
         return {}
 
 
