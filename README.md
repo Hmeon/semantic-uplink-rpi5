@@ -305,7 +305,7 @@ profiles:
 │   ├── metrics.py             # AoI·MAE·전송량 계산 유틸
 │   ├── mqttutil.py            # MQTT QoS1 업로드 & Outbox 헬퍼
 │   ├── quantize.py            # 센서 값 양자화/복원 도구
-│   └── schema.py              # 이벤트/정책 Pydantic 스키마
+│   └── schema.py              # 이벤트/정책 메시지 스키마(+검증/직렬화)
 ├── edge/
 │   ├── edge_daemon.py         # 센서→정책→업로더 제어 메인 엔트리포인트
 │   ├── sensors/               # 마이크 RMS·온도 센서 파이프라인
@@ -316,7 +316,7 @@ profiles:
 ├── collector/
 │   ├── collector.py           # 브로커 구독·수집·저장 루프
 │   ├── analyze.py             # 지표 분석 CLI & Discord 알림 옵션
-│   └── store_sqlite.py        # 경량 SQLite 스토리지 백엔드
+│   └── store_sqlite.py        # (옵션) SQLite 스토리지 백엔드(스키마 생성)
 ├── link/
 │   └── shaper/
 │       └── tc_profiles.py     # tc/netem 링크 제약 프로파일 적용기
@@ -328,7 +328,7 @@ profiles:
 │   └── start_edge.sh          # 엣지 데몬 실행 스크립트
 ├── tests/
 │   ├── integration/
-│   │   └── test_end_to_end_placeholder.py  # 엔드투엔드 자리표시자
+│   │   └── test_end_to_end_e2e.py          # MQTT 브로커 포함 E2E 테스트
 │   └── unit/
 │       ├── test_discord_webhook.py         # Discord 웹훅 단위 테스트
 │       ├── test_linucb.py                  # LinUCB 정책 검증

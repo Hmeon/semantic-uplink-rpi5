@@ -72,8 +72,8 @@
   - 선택지 B: 실제로 YAML 로딩을 구현하여 “재현 가능한 설정 외부화”를 완성
 
 ### P2 (기능 미완/스텁)
-- `collector/store_sqlite.py`는 스텁입니다(현재 미사용).
-- `edge/predict/ar1_rls.py`는 스텁입니다(현재 미사용).
+- `collector/store_sqlite.py`는 (옵션) SQLite 스토리지 백엔드용 스키마 생성만 제공합니다(현재 기본 경로는 Parquet).
+- `edge/predict/ar1_rls.py`는 AR(1)+RLS 예측기 베이스라인 코드이며, 현재 `edge.edge_daemon`에는 연결되지 않았습니다.
 
 ---
 
