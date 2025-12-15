@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from common.config import load_policy_config_dict
+from common.config import load_device_config, load_link_profiles_config, load_policy_config_dict
+from common.schema import LinkProfile
 
 
 def test_load_policy_config_dict_parses_repo_config() -> None:
@@ -23,3 +24,16 @@ def test_load_policy_config_dict_rejects_invalid_yaml(tmp_path: Path) -> None:
     assert "invalid policy config" in msg
     assert ("tau" in msg) or ("kbits" in msg)
 
+
+def test_load_device_config_parses_repo_config() -> None:
+    cfg = load_device_config("configs/device.yaml")
+    assert cfg.device_id
+    assert cfg.mqtt.host
+    assert cfg.sensors.mic is not None or cfg.sensors.temp is not None
+
+
+def test_load_link_profiles_config_covers_link_profiles_enum() -> None:
+    cfg = load_link_profiles_config("configs/link_profiles.yaml")
+    keys = set(cfg.profiles.keys())
+    for p in LinkProfile:
+        assert p.value in keys
