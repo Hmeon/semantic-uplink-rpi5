@@ -27,4 +27,4 @@ jobs:
 
       - name: Pytest
         run: |
-          pytest -q
+          pytest -q --cov=common --cov=collector --cov=edge --cov=link --cov-report=term-missing --cov-fail-under=20

@@ -386,8 +386,10 @@ Codex(또는 다른 에이전트형 도구)로 이 저장소를 열었을 때 �
 ## 기여 · Contributing
 ```bash
 pip install -e .[dev]
-ruff check . && pytest -q
+ruff check .
+pytest -q --cov=common --cov=collector --cov=edge --cov=link --cov-report=term-missing --cov-fail-under=20
 ```
+Note: `tests/integration/test_end_to_end_e2e.py`는 Docker로 로컬 Mosquitto 브로커를 실행합니다.
 - 브랜치: `feat/*`, `fix/*`, `chore/*`  
 - 커밋: `type(scope): subject` (예: `feat(edge): add AR(1) predictor`)
 
@@ -531,8 +533,10 @@ Current status:
 ## Contributing
 ```bash
 pip install -e .[dev]
-ruff check . && pytest -q
+ruff check .
+pytest -q --cov=common --cov=collector --cov=edge --cov=link --cov-report=term-missing --cov-fail-under=20
 ```
+Note: `tests/integration/test_end_to_end_e2e.py` starts a local Mosquitto broker via Docker.
 
 ## License
 TBD
