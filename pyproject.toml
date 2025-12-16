@@ -34,6 +34,7 @@ include = [
     "collector/**/*.py",
     "experiments/**/*.py",
     "link/**/*.py",
+    "stack/**/*.py",
     "edge/policy/**/*.py",
     "tests/**/*.py",
 ]

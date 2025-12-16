@@ -6,7 +6,8 @@
 - `link/`: `tc`/`netem` profiles and helpers to shape constrained links.
 - `common/`: shared schemas, quantization, time/MQTT helpers.
 - `configs/`: YAML for device, policy, and link profiles; tweak here to change runs without code edits.
-- `scripts/`: thin wrappers for typical flows (`apply_profile.sh`, `start_collector.sh`, `start_edge.sh`).
+- `stack/`: single-Pi supervisor for broker+collector+edge (`stack.pi_stack`).
+- `scripts/`: thin wrappers for typical flows (`run_stack.sh`, `apply_profile.sh`, `start_collector.sh`, `start_edge.sh`).
 - `tests/`: `unit/` and `integration/`; `data/` and `logs/` hold run artifacts.
 
 ## Build, Test, and Development Commands
@@ -16,7 +17,7 @@ pip install -e .[dev]                # editable install with test/lint tools
 ruff check .                         # lint (line length 100; see pyproject.toml)
 pytest -q                            # unit + integration tests (pytest-asyncio enabled)
 
-# link shaping (requires root; prefer lo during dev to avoid breaking host connectivity)
+# link shaping (requires root or CAP_NET_ADMIN; prefer lo during dev to avoid breaking host connectivity)
 sudo python -m link.shaper.tc_profiles apply --iface lo --profile slow_10kbps
 
 # start collector (run-dir is required)
@@ -26,6 +27,9 @@ python -m collector.collector --run-dir artifacts/run1
 python -m edge.edge_daemon --device-id dev1 --mode periodic \
   --temp-enable --temp-backend mock \
   --ui-enable --ui-kind console
+
+# single-Pi all-in-one stack (broker+collector+edge)
+bash scripts/run_stack.sh
 ```
 `scripts/` exposes the same flows if you prefer shell entrypoints; keep the virtualenv active.
 

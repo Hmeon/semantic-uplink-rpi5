@@ -16,6 +16,8 @@
 - 기존 유닛 테스트(`pytest tests/unit`)가 모두 통과함을 확인했습니다.
 - 새롭게 추가된 `test_buttons.py`가 통과함을 확인했습니다.
 - `edge/sensors/temp.py` 등 다른 하드웨어 모듈이 표준 Linux 커널 인터페이스(`/sys/class/...`, `smbus2`)를 사용하여 RPi 5에서도 호환됨을 확인했습니다.
+- 단일 Pi “올인원 스택” 실행기를 추가했습니다: `python -m stack.pi_stack` / `scripts/run_stack.sh` / `scripts/install_systemd_stack.sh`.
+- `tc/netem`을 systemd capability 기반으로도 실행할 수 있도록 `CAP_NET_ADMIN` 허용 체크를 추가했고, edge에서 `--tc-apply-on-start`로 시작 즉시 링크 에뮬레이션을 강제할 수 있습니다.
 
 ---
 

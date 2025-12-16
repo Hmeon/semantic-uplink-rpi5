@@ -99,6 +99,7 @@ class LinkCfg:
     iface: str = "eth0"
     both: bool = False            # ingress 포함 여부
     apply_on_button: bool = False # 버튼으로 프로파일 변경 시 tc 적용 여부 (root 필요)
+    apply_on_start: bool = False  # 시작 시 현재 profile을 1회 tc 적용 (권한 필요)
     profiles_config: str | None = None  # YAML로 tc profile override (옵션)
 
 
@@ -177,6 +178,8 @@ class EdgeDaemon:
     def start(self):
         self._install_signals()
         self._maybe_start_rtc()
+        if self.link_cfg.apply_on_start:
+            self._apply_link_profile()
         self.publisher.start()
 
         if self.mic_cfg.enable:
@@ -403,7 +406,7 @@ class EdgeDaemon:
             print(f"[buttons] marker enqueue failed: {e}")
 
     def _apply_link_profile(self):
-        if not self.link_cfg.apply_on_button:
+        if not (self.link_cfg.apply_on_button or self.link_cfg.apply_on_start):
             return
         try:
             profiles_override = None
@@ -833,6 +836,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="버튼 프로파일 변경 시 tc 즉시 적용(root 필요)",
     )
     p.add_argument(
+        "--tc-apply-on-start",
+        action="store_true",
+        help="시작 시 현재 profile을 tc로 1회 적용(권한 필요)",
+    )
+    p.add_argument(
         "--tc-profiles-config",
         default=None,
         help="YAML path for overriding tc profiles (e.g., configs/link_profiles.yaml)",
@@ -930,6 +938,7 @@ def main(argv: list[str] | None = None):
         iface=args.tc_iface,
         both=bool(args.tc_both),
         apply_on_button=bool(args.tc_apply_on_button),
+        apply_on_start=bool(args.tc_apply_on_start),
         profiles_config=args.tc_profiles_config,
     )
 

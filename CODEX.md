@@ -118,7 +118,8 @@ Edge는 기본적으로 `artifacts/<ts>_<device_id>/` 형태의 run-dir를 만�
 
 **브로커**
 - 로컬에 Mosquitto가 있으면 `--broker localhost --port 1883`
-- 없다면, 사내 MQTT 브로커 주소를 사용하거나 Docker로 구동하세요.
+- 단일 Pi 올인원 구성이라면 `bash scripts/run_stack.sh`가 필요 시 mosquitto를 자동 기동할 수 있습니다.
+- 그 외에는 사내 MQTT 브로커 주소를 사용하거나 Docker로 구동하세요.
 
 ### 4.2 Raspberry Pi 5(실장)
 필수 패키지(예시):
@@ -128,6 +129,20 @@ sudo apt install -y mosquitto mosquitto-clients iproute2 python3-venv python3-de
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 sudo systemctl enable mosquitto && sudo systemctl start mosquitto
+```
+
+**단일 Pi 통합 실행(브로커+수집기+엣지)**
+```bash
+# foreground 실행(권장): artifacts/live/stack_logs/* 에 로그 저장
+# - 기본값: buttons enable, tc enable, 시작 시 tc 1회 적용(--tc-apply-on-start)
+bash scripts/run_stack.sh
+
+# (선택) 부팅 자동 시작(systemd)
+sudo bash scripts/install_systemd_stack.sh
+sudo systemctl start semantic-uplink-stack
+
+# (선택) 오버라이드: /etc/semantic-uplink-stack.env
+# 예시: infra/systemd/semantic-uplink-stack.env.example
 ```
 
 **온도 센서(DS18B20)**
@@ -143,7 +158,7 @@ sudo systemctl enable mosquitto && sudo systemctl start mosquitto
 
 ## 5) 링크 셰이핑(tc/netem) 사용법
 
-`link/shaper/tc_profiles.py`는 **root 권한이 필요**합니다.
+`link/shaper/tc_profiles.py`는 **root 또는 CAP_NET_ADMIN 권한이 필요**합니다.
 
 ```bash
 # 적용
@@ -223,7 +238,7 @@ PY
 ```
 
 ### 흔한 문제
-- `tc` 적용 실패: root 권한 필요 + 인터페이스 이름 확인(`ip link`)
+- `tc` 적용 실패: root 또는 `CAP_NET_ADMIN` 권한 필요 + 인터페이스 이름 확인(`ip link`)
 - 오디오 입력 실패: `arecord` 설치/장치 선택, 또는 `--mic-enable` 끄기
 - Windows 콘솔 한글/특수문자 깨짐: `chcp 65001` 또는 `PYTHONIOENCODING=utf-8`
 

@@ -124,8 +124,30 @@ def _require_root():
     geteuid = getattr(os, "geteuid", None)
     if geteuid is None:
         raise OSError("tc/netem is supported on Linux only (os.geteuid unavailable).")
-    if geteuid() != 0:
-        raise PermissionError("tc_profiles requires root privileges (run as root).")
+
+    # Prefer capability-based checks so systemd can run this as a non-root user with
+    # `AmbientCapabilities=CAP_NET_ADMIN` (safer than running the full stack as root).
+    if geteuid() == 0:
+        return
+
+    cap_eff = 0
+    try:
+        with open("/proc/self/status", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("CapEff:"):
+                    _, hexv = line.split(":", 1)
+                    cap_eff = int(hexv.strip(), 16)
+                    break
+    except Exception:
+        cap_eff = 0
+
+    cap_net_admin = 12
+    if (cap_eff >> cap_net_admin) & 1:
+        return
+
+    raise PermissionError(
+        "tc_profiles requires CAP_NET_ADMIN (run as root or grant CAP_NET_ADMIN to the process)."
+    )
 
 def _run(cmd: str, check: bool = True) -> subprocess.CompletedProcess:
     # 모든 명령은 쉘 로그에 보이도록 출력

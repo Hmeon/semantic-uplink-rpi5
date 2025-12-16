@@ -171,21 +171,47 @@
 # OS & 필수 패키지
 sudo apt update && sudo apt full-upgrade -y
 sudo apt install -y mosquitto mosquitto-clients iproute2 python3-venv python3-dev build-essential libportaudio2
+ 
+ # 파이썬 가상환경
+ python3 -m venv .venv && source .venv/bin/activate
+ pip install -r requirements.txt
+ 
+ # 브로커 실행(옵션)
+ # - (A) systemd로 상시 실행
+ sudo systemctl enable mosquitto && sudo systemctl start mosquitto
+ # - (B) 단일 Pi 올인원 스택이 필요 시 자동 기동(broker-mode=auto/subprocess)
+ ```
 
-# 파이썬 가상환경
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+---
 
-# 브로커 실행(개발용)
-sudo systemctl enable mosquitto && sudo systemctl start mosquitto
+## 단일 Pi 통합 실행 (브로커+수집기+엣지) · Single-Pi All-in-One
+
+**라즈베리파이 5 한 대에서 broker/collector/edge를 함께 실행**하는 기본 구동 경로입니다.
+`edge`의 **버튼(모드/링크/마커)** 을 켜고, (권한이 있으면) **시작 시 1회 + 버튼으로 즉시 tc 링크 프로파일 적용**을 수행합니다.
+
+```bash
+# (권장) foreground 실행: 로그는 artifacts/live/stack_logs/* 로 저장
+bash scripts/run_stack.sh
+
+# (선택) systemd 서비스로 설치(부팅 시 자동 시작)
+sudo bash scripts/install_systemd_stack.sh
+sudo systemctl start semantic-uplink-stack
+
+# (선택) 설정 오버라이드: /etc/semantic-uplink-stack.env
+# 예시: infra/systemd/semantic-uplink-stack.env.example
 ```
+
+> tc/netem은 `CAP_NET_ADMIN` 권한이 필요합니다. systemd로 실행 시에는 설치 스크립트가 capability를 부여합니다.
+>
+> Loopback(`lo`) + `tc/netem`은 커널 TCP/IP 스택과 qdisc를 그대로 통과하는 **통제된 네트워크 에뮬레이션(IP 계층)** 이며,
+> 단일 장치 구성은 송신/수신이 동일 클럭이어서 AoI 측정의 clock offset 이슈가 사실상 제거됩니다.
 
 ---
 
 ## 실행 순서 · Run Order
 
 ```bash
-# 0) (선택) 링크 프로파일 적용 (root 필요)
+# 0) (선택) 링크 프로파일 적용 (root 또는 CAP_NET_ADMIN 필요)
 # - 개발 중에는 host 네트워크를 망가뜨리지 않도록 loopback(lo) 권장
 sudo python -m link.shaper.tc_profiles apply --iface lo --profile slow_10kbps
 
@@ -335,7 +361,12 @@ profiles:
 │       └── tc_profiles.py     # tc/netem 링크 제약 프로파일 적용기
 ├── experiments/
 │   └── run_scenarios.py       # 시나리오 일괄 실행 스크립트
+├── stack/
+│   └── pi_stack.py            # 단일 Pi 올인원 실행기(broker+collector+edge)
 ├── scripts/
+│   ├── run_stack.sh           # 단일 Pi 올인원 실행(권장)
+│   ├── install_systemd_stack.sh   # systemd 서비스 설치
+│   ├── uninstall_systemd_stack.sh # systemd 서비스 제거
 │   ├── apply_profile.sh       # tc 프로파일 CLI 래퍼
 │   ├── start_collector.sh     # 수집기 실행 스크립트
 │   └── start_edge.sh          # 엣지 데몬 실행 스크립트
@@ -351,7 +382,8 @@ profiles:
 ├── docs/
 │   └── figma/                 # 아키텍처/시퀀스 다이어그램 자산
 ├── infra/
-│   └── mosquitto/             # 브로커 설정 템플릿
+│   ├── mosquitto/             # 브로커 설정 템플릿
+│   └── systemd/               # systemd env 예시(올인원 스택)
 ├── models/                    # (추후 확장용) ML 모델 아티팩트
 ├── data/, logs/               # 실험 결과 & 런타임 로그 출력
 └── requirements.txt, pyproject.toml 등 프로젝트 메타데이터
@@ -464,7 +496,7 @@ sudo systemctl enable mosquitto && sudo systemctl start mosquitto
 
 ## Run Order (1 회 실험)
 ```bash
-# 0) 링크 프로파일 적용 (root 필요)
+# 0) 링크 프로파일 적용 (root 또는 CAP_NET_ADMIN 필요)
 sudo python -m link.shaper.tc_profiles apply --iface eth0 --profile slow_10kbps
 
 # 1) 수집기(브로커 구독 → Parquet 적재)
@@ -513,12 +545,14 @@ Current status:
 ├── collector/ — MQTT subscriber, analytics CLI, and storage adapters
 ├── link/shaper/ — tc/netem profile orchestration utilities
 ├── experiments/ — batch scenario runner for reproducible studies
+├── stack/ — single-Pi supervisor for broker+collector+edge
 ├── scripts/ — convenience launchers for edge/collector/link shaping
 ├── tests/ — unit & integration coverage for policies, quantization, webhooks, etc.
 ├── configs/ — reproducible YAML profiles for devices, policies, and link shapes
 ├── docs/figma/ — architecture and sequence diagrams embedded in this README
 ├── docs/hardware.md — RPi5 wiring (LCD/buttons/buzzer/DS18B20)
 ├── infra/mosquitto/ — broker configuration templates
+├── infra/systemd/ — systemd env example for all-in-one stack
 ├── models/ — (reserved) ML artefacts and checkpoints
 ├── data/, logs/ — experiment outputs and runtime diagnostics
 └── requirements.txt, pyproject.toml — Python dependencies & packaging metadata
