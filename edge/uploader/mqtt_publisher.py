@@ -142,7 +142,14 @@ class MQTTPublisher:
 
     def start(self):
         # MQTT I/O 루프 시작
-        self._cli.connect(self.broker, self.port, keepalive=self.keepalive)
+        #
+        # connect_async는 **네트워크 I/O를 즉시 수행하지 않고** 접속 파라미터만 설정한다.
+        # 따라서 브로커가 아직 뜨지 않았거나(서비스 재시작), 링크가 단절된 상태에서도
+        # EdgeDaemon은 안전하게 실행을 계속하고 Outbox에 누적할 수 있다(offline-first).
+        #
+        # paho-mqtt(loop_start)는 내부적으로 loop_forever(retry_first_connection=True)를 사용하므로
+        # 첫 연결 실패도 자동 재시도된다.
+        self._cli.connect_async(self.broker, self.port, keepalive=self.keepalive)
         self._cli.loop_start()
 
         # 작업 스레드: (1) 송신 워커 (2) stuck 재큐잉 워커
@@ -183,7 +190,7 @@ class MQTTPublisher:
         sleep_s = 0.05
         while not self._stop.is_set():
             if not self._connected:
-                time.sleep(0.2)
+                self._stop.wait(timeout=0.2)
                 continue
 
             # 인플라이트 여유 계산
@@ -191,7 +198,7 @@ class MQTTPublisher:
                 inflight_local = len(self._mid2oid)
             budget = max(0, self.max_inflight - inflight_local)
             if budget <= 0:
-                time.sleep(sleep_s)
+                self._stop.wait(timeout=sleep_s)
                 continue
 
             # Outbox에서 ready 메시지 인출
@@ -199,11 +206,11 @@ class MQTTPublisher:
                 batch = self.outbox.claim_next(limit=min(self.claim_batch, budget))
             except Exception as e:
                 print(f"[pub] claim_next error: {e}")
-                time.sleep(0.5)
+                self._stop.wait(timeout=0.5)
                 continue
 
             if not batch:
-                time.sleep(sleep_s)
+                self._stop.wait(timeout=sleep_s)
                 continue
 
             # 송신
@@ -226,7 +233,7 @@ class MQTTPublisher:
             except Exception:
                 pass
             print(f"[pub] publish exception for id={it.id}: {e}")
-            time.sleep(0.2)
+            self._stop.wait(timeout=0.2)
             return
 
         # paho는 큐에 성공적으로 적재되면 rc==MQTT_ERR_SUCCESS(0)과 mid 부여
@@ -239,7 +246,7 @@ class MQTTPublisher:
             except Exception:
                 pass
             print(f"[pub] publish rc={rc} mid={mid} → nack id={it.id}")
-            time.sleep(0.05)
+            self._stop.wait(timeout=0.05)
             return
 
         # mid↔outbox id 매핑(ACK에서 삭제)
@@ -256,7 +263,7 @@ class MQTTPublisher:
             except Exception as e:
                 print(f"[pub] requeue_stuck error: {e}")
             # 주기 슬립
-            time.sleep(max(1, self.requeue_period_s))
+            self._stop.wait(timeout=max(1, self.requeue_period_s))
 
 
 # ---------------------- CLI ----------------------

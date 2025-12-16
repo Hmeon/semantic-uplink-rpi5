@@ -149,8 +149,44 @@ def load_device_config(path: str | Path) -> DeviceConfig:
 class LinkProfileConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    tbf: str
-    netem: str
+    # Structured profile (preferred). This matches `link/shaper/tc_profiles.py::TcProfile`.
+    rate_kbit: int | None = None
+    delay_ms: int = 0
+    jitter_ms: int = 0
+    loss_pct: float = 0.0
+    loss_corr_pct: float = 0.0
+    reorder_pct: float = 0.0
+
+    # cellular_var-like (rate_kbit is None) toggling parameters.
+    low_kbit: int | None = None
+    high_kbit: int | None = None
+    var_default_period_s: int = 30
+
+    @model_validator(mode="after")
+    def _validate(self) -> LinkProfileConfig:
+        if self.rate_kbit is None:
+            if self.low_kbit is None or self.high_kbit is None:
+                raise ValueError("when rate_kbit is null, low_kbit and high_kbit are required")
+            if int(self.low_kbit) <= 0 or int(self.high_kbit) <= 0:
+                raise ValueError("low_kbit/high_kbit must be > 0")
+        else:
+            if int(self.rate_kbit) <= 0:
+                raise ValueError("rate_kbit must be > 0")
+
+        if int(self.delay_ms) < 0 or int(self.jitter_ms) < 0:
+            raise ValueError("delay_ms/jitter_ms must be >= 0")
+        for name, v in [
+            ("loss_pct", self.loss_pct),
+            ("loss_corr_pct", self.loss_corr_pct),
+            ("reorder_pct", self.reorder_pct),
+        ]:
+            fv = float(v)
+            if fv < 0.0 or fv > 100.0:
+                raise ValueError(f"{name} must be in [0, 100]")
+
+        if int(self.var_default_period_s) < 2:
+            raise ValueError("var_default_period_s must be >= 2")
+        return self
 
 
 class LinkProfilesConfig(BaseModel):

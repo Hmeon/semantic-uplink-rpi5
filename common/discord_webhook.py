@@ -9,12 +9,13 @@ JSON, and raises rich exceptions when Discord returns an error response.
 
 from __future__ import annotations
 
-import json
 import urllib.error
 import urllib.request
 from collections.abc import Iterable, Mapping, MutableMapping
 from dataclasses import dataclass
 from typing import Any
+
+from .jsonutil import dumps as _json_dumps
 
 __all__ = ["DiscordWebhookError", "WebhookPayload", "send_discord_message"]
 
@@ -46,8 +47,7 @@ class WebhookPayload:
 
 
 def _encode_payload(payload: WebhookPayload) -> bytes:
-    data = json.dumps(payload.to_dict(), ensure_ascii=False).encode("utf-8")
-    return data
+    return _json_dumps(payload.to_dict())
 
 
 def send_discord_message(

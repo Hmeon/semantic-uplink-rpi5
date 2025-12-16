@@ -3,11 +3,10 @@
 # 목적: MQTT 메시지 스키마(Event/PolicyDecision)를 단일 출처로 정의하고,
 #       엄격한 검증 + 직렬화 + MQTT PUBLISH 크기 산정까지 지원한다.
 # - 과제/동결안의 스키마/토픽/프로파일/정의와 정확히 일치. (헤더 포함 Rate 산정과 정합)
-# - 외부 의존성 없음(표준 라이브러리만).  [과제 제안서 준수]
+# - 직렬화는 표준 라이브러리 기반이며, 설치된 경우 msgspec로 가속한다.  [과제 제안서 준수]
 
 from __future__ import annotations
 
-import json
 import math
 from dataclasses import dataclass
 from enum import Enum
@@ -18,6 +17,9 @@ try:
     from .mqttutil import mqtt_v311_publish_size  # 패키지 내부 상대 import
 except Exception:  # collector 등에서만 사용하므로, 없으면 기능만 비활성
     mqtt_v311_publish_size = None  # type: ignore[assignment]
+
+from .jsonutil import dumps as _json_dumps
+from .jsonutil import loads as _json_loads
 
 __all__ = [
     "SensorType", "PolicyMode", "LinkProfile",
@@ -176,7 +178,7 @@ class EventMsg:
 
     def to_json_bytes(self) -> bytes:
         # 공백 없는 JSON (Rate 산정시 payload_len 최소화)
-        return json.dumps(self.to_dict(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return _json_dumps(self.to_dict())
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> EventMsg:
@@ -215,9 +217,11 @@ class EventMsg:
     @classmethod
     def from_json_bytes(cls, b: bytes) -> EventMsg:
         try:
-            d = json.loads(b.decode("utf-8"))
+            d = _json_loads(b)
         except Exception as e:
             raise ValueError(f"invalid JSON: {e}") from e
+        if not isinstance(d, dict):
+            raise ValueError("invalid JSON: expected an object")
         return cls.from_dict(d)
 
     # ---- 토픽/크기 ----
@@ -309,7 +313,7 @@ class PolicyDecisionMsg:
         }
 
     def to_json_bytes(self) -> bytes:
-        return json.dumps(self.to_dict(), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        return _json_dumps(self.to_dict())
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> PolicyDecisionMsg:
@@ -334,9 +338,11 @@ class PolicyDecisionMsg:
     @classmethod
     def from_json_bytes(cls, b: bytes) -> PolicyDecisionMsg:
         try:
-            d = json.loads(b.decode("utf-8"))
+            d = _json_loads(b)
         except Exception as e:
             raise ValueError(f"invalid JSON: {e}") from e
+        if not isinstance(d, dict):
+            raise ValueError("invalid JSON: expected an object")
         return cls.from_dict(d)
 
     # 토픽/크기

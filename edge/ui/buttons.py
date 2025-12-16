@@ -1,16 +1,17 @@
 # edge/ui/buttons.py
-# 목적: GPIO 버튼 3개(모드/프로파일/마커) 처리. RPi.GPIO 없으면 안전 폴백.
+# Purpose: Handle 3 GPIO buttons (Mode/Profile/Marker).
+# Refactored for RPi 5 compatibility using gpiozero (works on RPi 4/5).
 
 from __future__ import annotations
 
-import threading
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-try:  # pragma: no cover - 하드웨어 환경에서만 의미 있음
-    import RPi.GPIO as GPIO  # type: ignore
-except Exception:  # pragma: no cover
-    GPIO = None  # type: ignore
+try:
+    from gpiozero import Button
+    from gpiozero.exc import BadPinFactory, PinFactoryFallback
+except ImportError:
+    Button = None
 
 __all__ = ["ButtonsConfig", "Buttons", "ButtonsInitError"]
 
@@ -39,7 +40,7 @@ class _DummyButtons:
         return
 
 
-class Buttons:  # pragma: no cover - 하드웨어 스코프
+class Buttons:
     def __init__(
         self,
         cfg: ButtonsConfig,
@@ -47,65 +48,57 @@ class Buttons:  # pragma: no cover - 하드웨어 스코프
         on_profile: Callable[[], None],
         on_marker: Callable[[], None],
     ):
-        if GPIO is None:
-            raise ButtonsInitError("RPi.GPIO not available")
+        if Button is None:
+            raise ButtonsInitError("gpiozero library not installed")
+        
         self.cfg = cfg
         self._on_mode = on_mode
         self._on_profile = on_profile
         self._on_marker = on_marker
-        self._started = False
-        self._lock = threading.Lock()
+        
+        # Hold references to Button objects
+        self._btn_mode: Optional[Button] = None
+        self._btn_profile: Optional[Button] = None
+        self._btn_marker: Optional[Button] = None
 
     def start(self) -> None:
-        with self._lock:
-            if self._started:
-                return
-            GPIO.setmode(GPIO.BCM)
-            for pin in (self.cfg.mode_pin, self.cfg.profile_pin, self.cfg.marker_pin):
-                GPIO.setup(pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-            GPIO.add_event_detect(
-                self.cfg.mode_pin,
-                GPIO.FALLING,
-                callback=self._wrap(self._on_mode),
-                bouncetime=self.cfg.debounce_ms,
-            )
-            GPIO.add_event_detect(
-                self.cfg.profile_pin,
-                GPIO.FALLING,
-                callback=self._wrap(self._on_profile),
-                bouncetime=self.cfg.debounce_ms,
-            )
-            GPIO.add_event_detect(
-                self.cfg.marker_pin,
-                GPIO.FALLING,
-                callback=self._wrap(self._on_marker),
-                bouncetime=self.cfg.debounce_ms,
-            )
-            self._started = True
-            print("[buttons] started (mode/profile/marker)")
+        if self._btn_mode is not None:
+            return  # Already started
+
+        try:
+            # bounce_time in seconds for gpiozero
+            bounce = self.cfg.debounce_ms / 1000.0
+            
+            self._btn_mode = Button(self.cfg.mode_pin, pull_up=True, bounce_time=bounce)
+            self._btn_mode.when_pressed = self._wrap(self._on_mode)
+
+            self._btn_profile = Button(self.cfg.profile_pin, pull_up=True, bounce_time=bounce)
+            self._btn_profile.when_pressed = self._wrap(self._on_profile)
+
+            self._btn_marker = Button(self.cfg.marker_pin, pull_up=True, bounce_time=bounce)
+            self._btn_marker.when_pressed = self._wrap(self._on_marker)
+            
+            print("[buttons] started (mode/profile/marker) via gpiozero")
+        
+        except (BadPinFactory, PinFactoryFallback, OSError) as e:
+            # This might happen if running on non-Pi hardware or without permissions
+            self.stop() # Cleanup any partially created buttons
+            raise ButtonsInitError(f"Failed to initialize GPIO: {e}")
 
     def stop(self) -> None:
-        with self._lock:
-            if not self._started:
-                return
-            for pin in (self.cfg.mode_pin, self.cfg.profile_pin, self.cfg.marker_pin):
-                try:
-                    GPIO.remove_event_detect(pin)
-                except Exception:
-                    pass
-            try:
-                GPIO.cleanup()
-            except Exception:
-                pass
-            self._started = False
-            print("[buttons] stopped")
+        for btn in (self._btn_mode, self._btn_profile, self._btn_marker):
+            if btn is not None:
+                btn.close()
+        self._btn_mode = None
+        self._btn_profile = None
+        self._btn_marker = None
+        print("[buttons] stopped")
 
     def _wrap(self, fn: Callable[[], None]):
-        def _cb(channel: Optional[int] = None):
+        def _cb(btn):
             try:
                 fn()
             except Exception as e:
-                # 콜백에서 예외가 나도 GPIO 쓰레드를 죽이지 않도록 로그만.
                 print(f"[buttons] handler error: {e}")
         return _cb
 
@@ -118,7 +111,12 @@ def build_buttons(
 ):
     if not cfg.enable:
         return _DummyButtons("disabled by config")
+    
     try:
+        # Check if we can import gpiozero (handled at top level but good to double check safety)
+        if Button is None:
+             return _DummyButtons("gpiozero not installed")
+        
         return Buttons(cfg, on_mode, on_profile, on_marker)
     except ButtonsInitError as e:
         return _DummyButtons(str(e))

@@ -19,6 +19,8 @@ from typing import Any
 import paho.mqtt.client as mqtt
 import pandas as pd
 
+from common.jsonutil import loads as _json_loads
+
 # MQTT PUBLISH 패킷 크기 계산(브로커 수신 기준; 헤더 포함)
 try:
     from common.mqttutil import mqtt_v311_publish_size
@@ -156,20 +158,52 @@ class Collector:
         dup = msg.dup
         retain = msg.retain
         try:
-            if topic.startswith("edge/") and topic.endswith("/event"):
-                self._handle_event_message(
-                    topic, payload, qos, dup, retain, t_recv_ns=t_recv_ns
-                )
-            elif topic.startswith("policy/") and topic.endswith("/decision"):
-                self._handle_decision_message(topic, payload, t_recv_ns=t_recv_ns)
-            elif topic.startswith("marker/"):
-                self._handle_marker_message(topic, payload, t_recv_ns=t_recv_ns)
-            else:
-                # 기타 토픽은 무시(명세 외)
-                return
+            self.ingest_message(
+                topic=topic,
+                payload=payload,
+                qos=qos,
+                dup=dup,
+                retain=retain,
+                t_recv_ns=t_recv_ns,
+            )
         except Exception as e:
             # 수집기는 손실보다 지속성이 중요 — 개별 메시지 실패는 기록만 하고 계속 진행
             print(f"[collector] ERROR processing topic={topic}: {e}")
+
+    def ingest_message(
+        self,
+        *,
+        topic: str,
+        payload: bytes,
+        qos: int = 1,
+        dup: bool = False,
+        retain: bool = False,
+        t_recv_ns: int | None = None,
+    ) -> None:
+        """
+        MQTT 메시지를 Collector에 주입한다.
+
+        - 테스트/리플레이/대체 전송(예: 파일/HTTP)에서 브로커 없이도 동일한 처리 경로를 재사용한다.
+        - 오류는 호출자에게 예외로 전파(런타임 MQTT 콜백에서는 try/except로 감싸 로그만 남김).
+        """
+        if t_recv_ns is None:
+            t_recv_ns = time.time_ns()
+        self._last_ns = int(t_recv_ns)
+
+        if topic.startswith("edge/") and topic.endswith("/event"):
+            self._handle_event_message(
+                topic, payload, qos, dup, retain, t_recv_ns=int(t_recv_ns)
+            )
+        elif topic.startswith("policy/") and topic.endswith("/decision"):
+            self._handle_decision_message(topic, payload, t_recv_ns=int(t_recv_ns))
+        elif topic.startswith("marker/"):
+            self._handle_marker_message(topic, payload, t_recv_ns=int(t_recv_ns))
+        else:
+            return
+
+    def flush_once(self) -> None:
+        """현재 pending 버퍼를 1회 flush한다(테스트/운영 트러블슈팅 용)."""
+        self._flush()
 
     # --------------- 이벤트 처리 --------------- 
 
@@ -183,7 +217,9 @@ class Collector:
         payload_len = len(payload_bytes)
         pkt_size = mqtt_v311_publish_size(topic, payload_len, qos=qos, dup=dup, retain=retain)
 
-        data = json.loads(payload_bytes.decode("utf-8"))
+        data = _json_loads(payload_bytes)
+        if not isinstance(data, dict):
+            raise ValueError("invalid JSON: expected an object")
         # 필수 필드 검증 (스키마: Event)
         # ts: int64 ns, seq: u64, device_id, sensor, val, pred, res, tau, kbits, profile, policy
         required = (
@@ -273,7 +309,9 @@ class Collector:
     ):
         if t_recv_ns is None:
             t_recv_ns = time.time_ns()
-        data = json.loads(payload_bytes.decode("utf-8"))
+        data = _json_loads(payload_bytes)
+        if not isinstance(data, dict):
+            raise ValueError("invalid JSON: expected an object")
         required = ("ts", "device_id", "state_aoi", "state_res", "state_res_var",
                     "state_loss", "state_q_len", "tau", "kbits", "reward")
         missing = [k for k in required if k not in data]
@@ -302,7 +340,9 @@ class Collector:
     ):
         if t_recv_ns is None:
             t_recv_ns = time.time_ns()
-        data = json.loads(payload_bytes.decode("utf-8"))
+        data = _json_loads(payload_bytes)
+        if not isinstance(data, dict):
+            raise ValueError("invalid JSON: expected an object")
         rec = {
             "ts": int(data.get("ts", t_recv_ns)),
             "t_recv_ns": int(t_recv_ns),

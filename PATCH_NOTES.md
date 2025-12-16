@@ -4,6 +4,21 @@
 
 ---
 
+## 2025-12-17 — RPi 5 호환성 패치 (Hardware Compatibility)
+
+### ✅ RPi 5 호환성 해결
+- `edge/ui/buttons.py`가 더 이상 지원되지 않는 `RPi.GPIO`를 사용하는 문제를 해결했습니다.
+  - `gpiozero` 라이브러리(LGPLv3)로 마이그레이션하여 RPi 4와 5(RP1 칩셋) 모두에서 동작하도록 수정했습니다.
+  - `requirements.txt`에 `gpiozero`, `rpi-lgpio`를 추가하여 의존성을 확보했습니다.
+- 하드웨어 의존성이 있는 `buttons.py`에 대한 단위 테스트 `tests/unit/test_buttons.py`를 추가하여 로직(debounce, callback 등)을 검증했습니다.
+
+### ✅ 검증 완료
+- 기존 유닛 테스트(`pytest tests/unit`)가 모두 통과함을 확인했습니다.
+- 새롭게 추가된 `test_buttons.py`가 통과함을 확인했습니다.
+- `edge/sensors/temp.py` 등 다른 하드웨어 모듈이 표준 Linux 커널 인터페이스(`/sys/class/...`, `smbus2`)를 사용하여 RPi 5에서도 호환됨을 확인했습니다.
+
+---
+
 ## 2025-12-14 — 안정화/문서 정리(디버깅 + 실행 메뉴얼)
 
 ### ✅ 테스트/런타임 안정화
@@ -67,9 +82,10 @@
 - (해결) `scripts/apply_profile.sh` / `scripts/start_collector.sh` / `AGENTS.md` / CI Python 버전/설치 단계 정합성 문제를 수정했습니다.
 
 ### P1 (설계/문서-구현 불일치)
-- `configs/device.yaml`, `configs/link_profiles.yaml`이 README에 등장하지만, 현재 런타임에서 로딩되지 않습니다(템플릿 상태).
-  - 선택지 A: 문서에서 “템플릿”으로 명확화(현재 진행 중)
-  - 선택지 B: 실제로 YAML 로딩을 구현하여 “재현 가능한 설정 외부화”를 완성
+- (해결) `configs/device.yaml`, `configs/link_profiles.yaml` 런타임 로딩을 연결했습니다(옵션).
+  - Edge: `python -m edge.edge_daemon --device-config configs/device.yaml`
+  - Link shaper: `python -m link.shaper.tc_profiles --profiles-config configs/link_profiles.yaml ...`
+  - Edge 버튼 기반 tc 적용: `python -m edge.edge_daemon ... --tc-apply-on-button --tc-profiles-config configs/link_profiles.yaml`
 
 ### P2 (기능 미완/스텁)
 - `collector/store_sqlite.py`는 (옵션) SQLite 스토리지 백엔드용 스키마 생성만 제공합니다(현재 기본 경로는 Parquet).
@@ -88,8 +104,8 @@
   - `pip install -r requirements.txt || true` 제거(실패 은폐 금지)
 
 ### 2) 설정 외부화(P1)
-- `edge.edge_daemon`에 `--device-config configs/device.yaml` 지원(옵션)
-- `link.shaper.tc_profiles`에 YAML 기반 프로파일 로딩(옵션)
+- (완료) `edge.edge_daemon`에 `--device-config configs/device.yaml` 지원
+- (완료) `link.shaper.tc_profiles`에 YAML 기반 프로파일 로딩(`--profiles-config`)
 
 ### 3) 연구/평가 산출물 강화(P1~P2)
 - 분석 결과에 “개선율(%)”, “Pareto 산출” 등을 자동 생성/저장
@@ -114,3 +130,4 @@ ruff check .
 - Collector/Analyze: `collector/collector.py`, `collector/analyze.py`
 - tc 셰이퍼: `link/shaper/tc_profiles.py`
 - 문서/실행 가이드: `README.md`, `CODEX.md`, `AGENTS.md`
+- RPi 5 Hardware: `edge/ui/buttons.py`, `edge/sensors/temp.py`

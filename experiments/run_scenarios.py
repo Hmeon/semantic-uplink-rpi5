@@ -29,6 +29,7 @@ try:
     from link.shaper.tc_profiles import apply_profile as tc_apply
     from link.shaper.tc_profiles import clear as tc_clear
     from link.shaper.tc_profiles import get_profiles as tc_get
+    from link.shaper.tc_profiles import load_profiles_config as tc_load_profiles
 except Exception as e:  # pragma: no cover
     print(f"[exp] FATAL: cannot import tc_profiles: {e}", file=sys.stderr)
     sys.exit(2)
@@ -37,9 +38,11 @@ except Exception as e:  # pragma: no cover
 @dataclass(slots=True)
 class ExperimentPlan:
     device_id: str = "rpi5-01"
+    device_config: str | None = "configs/device.yaml"
     iface: str = "eth0"
     both: bool = False            # ingress(ifb0) 포함 여부
     run_root: Path = Path("artifacts/experiments")
+    link_profiles_config: str | None = "configs/link_profiles.yaml"
 
     # 시간(초)
     warmup_s: int = 10
@@ -99,6 +102,7 @@ class ScenarioRunner:
         self._stop = False
         self._active_tc = False
         self._procs: list[subprocess.Popen] = []
+        self._tc_profiles_override = self._load_tc_profiles_override()
         # 신호 처리
         signal.signal(signal.SIGINT, self._on_signal)
         signal.signal(signal.SIGTERM, self._on_signal)
@@ -174,7 +178,13 @@ class ScenarioRunner:
             "--run-dir", str(run_dir),
             "--seed", str(p.seed),
             "--arms", p.arms_path,
+            # 실험 러너는 headless가 기본: device.yaml에서 UI가 켜져 있어도 비활성화한다.
+            "--ui-disable",
+            "--buttons-disable",
         ]
+
+        if p.device_config:
+            base += ["--device-config", p.device_config]
 
         if p.use_mic:
             base += ["--mic-enable",
@@ -184,6 +194,8 @@ class ScenarioRunner:
                      "--mic-kbits", str(p.mic_kbits),
                      "--mic-heartbeat", str(p.mic_heartbeat_s)]
             base += ["--mic-tau", str(p.mic_tau_fixed)]
+        else:
+            base += ["--mic-disable"]
 
         if p.use_temp:
             base += ["--temp-enable",
@@ -192,6 +204,8 @@ class ScenarioRunner:
                      "--temp-kbits", str(p.temp_kbits),
                      "--temp-heartbeat", str(p.temp_heartbeat_s)]
             base += ["--temp-tau", str(p.temp_tau_fixed)]
+        else:
+            base += ["--temp-disable"]
 
         return base
 
@@ -228,7 +242,13 @@ class ScenarioRunner:
             return
         try:
             varp = self.plan.tc_var_period_s
-            tc_apply(self.plan.iface, profile.value, both=self.plan.both, var_period_s=varp)
+            tc_apply(
+                self.plan.iface,
+                profile.value,
+                both=self.plan.both,
+                var_period_s=varp,
+                profiles=self._tc_profiles_override,
+            )
             self._active_tc = True
             print(
                 f"[exp] tc applied: iface={self.plan.iface} both={self.plan.both} "
@@ -237,6 +257,23 @@ class ScenarioRunner:
         except PermissionError as e:
             print(f"[exp] WARN: tc apply failed (not root?): {e}", file=sys.stderr)
             self._active_tc = False
+
+    def _load_tc_profiles_override(self):
+        """
+        link_profiles_config가 지정된 경우, tc 프로파일을 YAML에서 로딩한다.
+        - 실패 시 None으로 폴백(내장 PROFILES 사용).
+        """
+        path = self.plan.link_profiles_config
+        if not path:
+            return None
+        p = Path(path)
+        if not p.exists():
+            return None
+        try:
+            return tc_load_profiles(p)
+        except Exception as e:
+            print(f"[exp] WARN: failed to load link profiles: {p}: {e}", file=sys.stderr)
+            return None
 
     def _clear_profile(self) -> None:
         if self._active_tc:
@@ -326,7 +363,13 @@ def _run_root(plan: ExperimentPlan) -> Path:
     (root / "plan.json").write_text(json.dumps(_asdict_plan(plan), indent=2, ensure_ascii=False))
     # 사용 가능한 tc 프로파일 목록 기록(참고)
     try:
-        tc_profiles = {k: asdict(v) for k, v in tc_get().items()}
+        tc_src = tc_get()
+        if plan.link_profiles_config and Path(plan.link_profiles_config).exists():
+            try:
+                tc_src = tc_load_profiles(plan.link_profiles_config)
+            except Exception:
+                tc_src = tc_get()
+        tc_profiles = {k: asdict(v) for k, v in tc_src.items()}
         (root / "tc_profiles.json").write_text(json.dumps(tc_profiles, indent=2))
     except Exception:
         pass
@@ -358,6 +401,8 @@ def _read_text_snapshot(path: Path) -> dict:
 
 
 def _write_run_meta(root: Path, plan: ExperimentPlan) -> None:
+    device_cfg_path = Path(plan.device_config) if plan.device_config else None
+    link_cfg_path = Path(plan.link_profiles_config) if plan.link_profiles_config else None
     meta = {
         "created_utc": _utc_ts(),
         "git_commit": _git_commit(),
@@ -373,8 +418,12 @@ def _write_run_meta(root: Path, plan: ExperimentPlan) -> None:
         },
         "configs": {
             "policy_yaml": _read_text_snapshot(Path(plan.arms_path)),
-            "device_yaml": _read_text_snapshot(Path("configs/device.yaml")),
-            "link_profiles_yaml": _read_text_snapshot(Path("configs/link_profiles.yaml")),
+            "device_yaml": (
+                _read_text_snapshot(device_cfg_path) if device_cfg_path is not None else None
+            ),
+            "link_profiles_yaml": (
+                _read_text_snapshot(link_cfg_path) if link_cfg_path is not None else None
+            ),
         },
     }
     tmp = root / "run_meta.json.tmp"
@@ -403,11 +452,68 @@ def _env_snapshot() -> dict:
 
 # ---------- CLI ----------
 
-def parse_args() -> ExperimentPlan:
+def parse_args(argv: list[str] | None = None) -> ExperimentPlan:
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--device-config", default="configs/device.yaml")
+    pre.add_argument("--link-profiles-config", default="configs/link_profiles.yaml")
+    pre_args, _ = pre.parse_known_args(argv)
+
+    device_config = _opt_path(pre_args.device_config)
+    link_profiles_config = _opt_path(pre_args.link_profiles_config)
+
+    device_cfg = None
+    if device_config:
+        try:
+            device_cfg = load_device_config(device_config)
+        except Exception as e:
+            print(f"[exp] ERROR: invalid device config {device_config}: {e}", file=sys.stderr)
+            sys.exit(2)
+
+    if link_profiles_config:
+        try:
+            load_link_profiles_config(link_profiles_config)
+        except Exception as e:
+            print(
+                f"[exp] ERROR: invalid link profiles config {link_profiles_config}: {e}",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    device_id_default = device_cfg.device_id if device_cfg is not None else "rpi5-01"
+    broker_default = device_cfg.mqtt.host if device_cfg is not None else "localhost"
+    port_default = int(device_cfg.mqtt.port) if device_cfg is not None else 1883
+    use_mic_default = bool(device_cfg.sensors.mic is not None) if device_cfg is not None else True
+    use_temp_default = bool(device_cfg.sensors.temp is not None) if device_cfg is not None else True
+    mic_sr_default = (
+        int(device_cfg.sensors.mic.samplerate)
+        if device_cfg is not None and device_cfg.sensors.mic is not None
+        else 16000
+    )
+    mic_frame_ms_default = (
+        int(device_cfg.sensors.mic.frame_ms)
+        if device_cfg is not None and device_cfg.sensors.mic is not None
+        else 100
+    )
+    temp_hz_default = (
+        float(device_cfg.sensors.temp.period_hz)
+        if device_cfg is not None and device_cfg.sensors.temp is not None
+        else 1.0
+    )
+
     ap = argparse.ArgumentParser(
         description="Run profile×mode matrix experiments (edge_daemon orchestrator)"
     )
-    ap.add_argument("--device-id", default="rpi5-01")
+    ap.add_argument(
+        "--device-config",
+        default=device_config,
+        help="device YAML (used to fill defaults)",
+    )
+    ap.add_argument(
+        "--link-profiles-config",
+        default=link_profiles_config,
+        help="tc profile YAML (used to override built-in PROFILES when applying shaping)",
+    )
+    ap.add_argument("--device-id", default=device_id_default)
     ap.add_argument("--iface", default="eth0")
     ap.add_argument("--both", action="store_true")
     ap.add_argument("--run-root", default="artifacts/experiments")
@@ -416,25 +522,29 @@ def parse_args() -> ExperimentPlan:
     ap.add_argument("--run-s", type=int, default=120)
     ap.add_argument("--cooldown-s", type=int, default=5)
 
-    ap.add_argument("--broker", default="localhost")
-    ap.add_argument("--port", type=int, default=1883)
+    ap.add_argument("--broker", default=broker_default)
+    ap.add_argument("--port", type=int, default=port_default)
     ap.add_argument("--seed", type=int, default=0, help="random seed for reproducibility")
 
     # 기본은 둘 다 활성(평가/데모 기준). 필요 시 --no-mic / --no-temp 로 비활성.
-    ap.add_argument("--mic", dest="use_mic", action=argparse.BooleanOptionalAction, default=True)
-    ap.add_argument("--temp", dest="use_temp", action=argparse.BooleanOptionalAction, default=True)
+    ap.add_argument(
+        "--mic", dest="use_mic", action=argparse.BooleanOptionalAction, default=use_mic_default
+    )
+    ap.add_argument(
+        "--temp", dest="use_temp", action=argparse.BooleanOptionalAction, default=use_temp_default
+    )
     # backward compatible(숨김): 예전 플래그
     ap.add_argument("--use-mic", dest="use_mic", action="store_true", help=argparse.SUPPRESS)
     ap.add_argument("--use-temp", dest="use_temp", action="store_true", help=argparse.SUPPRESS)
 
-    ap.add_argument("--mic-sr", type=int, default=16000)
-    ap.add_argument("--mic-frame-ms", type=int, default=100)
+    ap.add_argument("--mic-sr", type=int, default=mic_sr_default)
+    ap.add_argument("--mic-frame-ms", type=int, default=mic_frame_ms_default)
     ap.add_argument("--mic-alpha", type=float, default=0.2)
     ap.add_argument("--mic-tau-fixed", type=float, default=3.0)
     ap.add_argument("--mic-kbits", type=int, default=6)
     ap.add_argument("--mic-heartbeat", type=float, default=10.0)
 
-    ap.add_argument("--temp-hz", type=float, default=1.0)
+    ap.add_argument("--temp-hz", type=float, default=temp_hz_default)
     ap.add_argument("--temp-alpha", type=float, default=0.5)
     ap.add_argument("--temp-tau-fixed", type=float, default=0.2)
     ap.add_argument("--temp-kbits", type=int, default=8)
@@ -459,13 +569,15 @@ def parse_args() -> ExperimentPlan:
         help="scenario repeats (replicates) per profile×mode",
     )
     ap.add_argument("--collector-flush-interval-s", type=int, default=10)
-    args = ap.parse_args()
+    args = ap.parse_args(argv)
 
     plan = ExperimentPlan(
         device_id=args.device_id,
+        device_config=args.device_config,
         iface=args.iface,
         both=bool(args.both),
         run_root=Path(args.run_root),
+        link_profiles_config=args.link_profiles_config,
 
         warmup_s=args.warmup_s,
         run_s=args.run_s,
@@ -516,14 +628,26 @@ def parse_args() -> ExperimentPlan:
             print(f"[exp] ERROR: invalid arms config {plan.arms_path}: {e}", file=sys.stderr)
             sys.exit(2)
 
-    try:
-        load_device_config("configs/device.yaml")
-        load_link_profiles_config("configs/link_profiles.yaml")
-    except Exception as e:
-        print(f"[exp] ERROR: invalid YAML config: {e}", file=sys.stderr)
-        sys.exit(2)
+    # baseline 비교(collector.analyze의 기본 baseline=periodic) 관점에서 경고 제공
+    if "periodic" not in plan.modes:
+        print(
+            "[exp] WARN: periodic baseline is not in modes; "
+            "analyze baseline comparisons may be NaN.",
+            file=sys.stderr,
+        )
 
     return plan
+
+
+def _opt_path(value: str | None) -> str | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    if s.lower() in {"none", "null", "nil"}:
+        return None
+    return s
 
 
 def main():

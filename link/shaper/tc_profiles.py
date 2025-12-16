@@ -16,6 +16,9 @@ import sys
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
+
+from common.config import load_link_profiles_config
 
 
 # ---------- 프로파일 정의 (동결안과 동일) ----------
@@ -89,6 +92,30 @@ PROFILES: dict[str, TcProfile] = {
         reorder_pct=0.0,
     ),
 }
+
+def load_profiles_config(path: str | os.PathLike) -> dict[str, TcProfile]:
+    """
+    configs/link_profiles.yaml 같은 YAML에서 프로파일을 로딩한다.
+
+    - 이 함수는 "옵션"이며, 파일이 없거나 형식이 맞지 않더라도 PROFILES 상수를 계속 사용 가능하다.
+    - 스키마는 common.config.LinkProfilesConfig (pydantic)로 검증한다.
+    """
+    cfg = load_link_profiles_config(Path(path))
+    out: dict[str, TcProfile] = {}
+    for name, p in cfg.profiles.items():
+        out[str(name)] = TcProfile(
+            name=str(name),
+            rate_kbit=None if p.rate_kbit is None else int(p.rate_kbit),
+            delay_ms=int(p.delay_ms),
+            jitter_ms=int(p.jitter_ms),
+            loss_pct=float(p.loss_pct),
+            loss_corr_pct=float(p.loss_corr_pct),
+            reorder_pct=float(p.reorder_pct),
+            low_kbit=None if p.low_kbit is None else int(p.low_kbit),
+            high_kbit=None if p.high_kbit is None else int(p.high_kbit),
+            var_default_period_s=int(p.var_default_period_s),
+        )
+    return out
 
 
 # ---------- 내부 유틸 ----------
@@ -229,16 +256,18 @@ def apply_profile(
     profile: str,
     both: bool = False,
     var_period_s: int | None = None,
+    profiles: dict[str, TcProfile] | None = None,
 ) -> None:
     """
     지정 인터페이스(iface)에 프로파일을 적용한다.
     both=True면 ifb0를 사용해 ingress에도 동일 제약을 건다.
     """
     _require_root()
-    if profile not in PROFILES:
-        choices = ", ".join(PROFILES)
+    profiles_map = profiles if profiles is not None else PROFILES
+    if profile not in profiles_map:
+        choices = ", ".join(profiles_map)
         raise ValueError(f"unknown profile: {profile} (choices: {choices})")
-    p = PROFILES[profile]
+    p = profiles_map[profile]
     netem_args = _build_netem_args(p)
 
     # egress
@@ -329,6 +358,11 @@ def _install_signal_handlers(iface: str, both: bool):
 
 def main():
     parser = argparse.ArgumentParser(description="tc profile applier (HTB+netem)")
+    parser.add_argument(
+        "--profiles-config",
+        default=None,
+        help="YAML path for overriding profiles (e.g., configs/link_profiles.yaml)",
+    )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p_apply = sub.add_parser("apply", help="apply a link profile")
@@ -353,9 +387,25 @@ def main():
     args = parser.parse_args()
     _install_signal_handlers(iface=getattr(args, "iface", ""), both=getattr(args, "both", False))
 
+    profiles_override = None
+    if args.profiles_config:
+        try:
+            profiles_override = load_profiles_config(args.profiles_config)
+        except Exception as e:
+            sys.stderr.write(
+                f"[tc] WARN: failed to load profiles_config={args.profiles_config}: {e}\n"
+            )
+            profiles_override = None
+
     try:
         if args.cmd == "apply":
-            apply_profile(args.iface, args.profile, both=args.both, var_period_s=args.var_period)
+            apply_profile(
+                args.iface,
+                args.profile,
+                both=args.both,
+                var_period_s=args.var_period,
+                profiles=profiles_override,
+            )
             print("[tc] profile applied. (Ctrl+C to clear)")
             # apply 모드로 실행된 경우, 셀룰러 토글이 있다면 유지 대기
             if args.profile == "cellular_var":

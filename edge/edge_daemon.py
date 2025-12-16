@@ -10,7 +10,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import signal
 import sys
@@ -21,7 +20,8 @@ from typing import Optional
 
 import yaml
 
-from common.config import load_policy_config_dict
+from common.config import load_device_config, load_policy_config_dict
+from common.jsonutil import dumps as _json_dumps
 from common.schema import LinkProfile, PolicyMode, SensorType
 from edge.sensors.mic_rms import MicRMS
 from edge.sensors.temp import TempSensor
@@ -99,6 +99,7 @@ class LinkCfg:
     iface: str = "eth0"
     both: bool = False            # ingress 포함 여부
     apply_on_button: bool = False # 버튼으로 프로파일 변경 시 tc 적용 여부 (root 필요)
+    profiles_config: str | None = None  # YAML로 tc profile override (옵션)
 
 
 class EdgeDaemon:
@@ -138,6 +139,7 @@ class EdgeDaemon:
         self.ui_cfg = ui or UICfg()
         self.buttons_cfg = buttons or ButtonsCfg()
         self.link_cfg = link or LinkCfg()
+        self._tc_profiles_override = None
 
         # 런타임
         os.makedirs(os.path.dirname(self.outbox_path) or ".", exist_ok=True)
@@ -383,14 +385,14 @@ class EdgeDaemon:
 
     def _emit_marker(self):
         ts = time.time_ns()
-        payload = json.dumps(
+        payload = _json_dumps(
             {
                 "ts": ts,
                 "device_id": self.device_id,
                 "type": "marker",
                 "note": "button_press",
             }
-        ).encode("utf-8")
+        )
         try:
             self._status.record_payload(len(payload), ts)
             self.outbox.enqueue(
@@ -404,8 +406,22 @@ class EdgeDaemon:
         if not self.link_cfg.apply_on_button:
             return
         try:
+            profiles_override = None
+            if self.link_cfg.profiles_config:
+                if self._tc_profiles_override is None:
+                    try:
+                        self._tc_profiles_override = tc_profiles.load_profiles_config(
+                            self.link_cfg.profiles_config
+                        )
+                    except Exception as e:
+                        print(f"[tc] profiles-config load failed: {self.link_cfg.profiles_config}: {e}")
+                        self._tc_profiles_override = None
+                profiles_override = self._tc_profiles_override
             tc_profiles.apply_profile(
-                self.link_cfg.iface, self.profile.value, both=self.link_cfg.both
+                self.link_cfg.iface,
+                self.profile.value,
+                both=self.link_cfg.both,
+                profiles=profiles_override,
             )
             print(f"[tc] applied profile {self.profile.value} on {self.link_cfg.iface}")
         except Exception as e:
@@ -634,10 +650,73 @@ def _default_run_dir(device_id: str) -> str:
     ts = time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
     return os.path.join("artifacts", f"{ts}_{device_id}")
 
-def main():
+def _opt_path(val: str | None) -> str | None:
+    if val is None:
+        return None
+    sv = str(val).strip()
+    if not sv:
+        return None
+    if sv.lower() in {"none", "null"}:
+        return None
+    return sv
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    # device-config를 먼저 파싱해, 나머지 옵션의 default를 동적으로 구성한다.
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--device-config", default=None, help="device YAML path (e.g., configs/device.yaml)")
+    pre.add_argument("--device-id", default=None)
+    pre_args, _ = pre.parse_known_args(argv)
+
+    device_cfg = None
+    device_config_path = _opt_path(pre_args.device_config)
+    if device_config_path:
+        device_cfg = _load_device_yaml(device_config_path)
+
+    device_id_default = (
+        str(pre_args.device_id)
+        if pre_args.device_id
+        else (device_cfg.device_id if device_cfg is not None else None)
+    )
+    broker_default = device_cfg.mqtt.host if device_cfg is not None else "localhost"
+    port_default = int(device_cfg.mqtt.port) if device_cfg is not None else 1883
+    mic_enable_default = bool(device_cfg.sensors.mic is not None) if device_cfg is not None else False
+    temp_enable_default = bool(device_cfg.sensors.temp is not None) if device_cfg is not None else False
+    mic_sr_default = (
+        int(device_cfg.sensors.mic.samplerate)
+        if device_cfg is not None and device_cfg.sensors.mic is not None
+        else 16000
+    )
+    mic_frame_ms_default = (
+        int(device_cfg.sensors.mic.frame_ms)
+        if device_cfg is not None and device_cfg.sensors.mic is not None
+        else 100
+    )
+    temp_hz_default = (
+        float(device_cfg.sensors.temp.period_hz)
+        if device_cfg is not None and device_cfg.sensors.temp is not None
+        else 1.0
+    )
+    ui_enable_default = bool(device_cfg.ui.enabled) if device_cfg is not None and device_cfg.ui else False
+    ui_kind_default = "auto"
+    if device_cfg is not None and device_cfg.ui is not None:
+        backend = str(device_cfg.ui.backend).strip().lower()
+        # configs/device.yaml은 "lcd|console" 형태를 사용한다.
+        if backend in {"lcd", "lcd1602"}:
+            ui_kind_default = "lcd1602"
+        elif backend in {"console"}:
+            ui_kind_default = "console"
+        elif backend in {"ssd1306", "auto"}:
+            ui_kind_default = backend
+
     p = argparse.ArgumentParser(description="Edge daemon: sensors → EWMA(τ) → Outbox → MQTT QoS1")
     # 공통
-    p.add_argument("--device-id", required=True)
+    p.add_argument(
+        "--device-config",
+        default=device_config_path,
+        help="device YAML path (maps to broker/port/sensors/ui defaults)",
+    )
+    p.add_argument("--device-id", default=device_id_default)
     p.add_argument(
         "--profile",
         choices=[e.value for e in LinkProfile],
@@ -651,8 +730,8 @@ def main():
     )
     p.add_argument("--arms", default="configs/policy.yaml", help="(adaptive) arms YAML path")
     p.add_argument("--run-dir", default=None, help="기록 루트(artifacts/<ts>_<device_id> 기본)")
-    p.add_argument("--broker", default="localhost")
-    p.add_argument("--port", type=int, default=1883)
+    p.add_argument("--broker", default=broker_default)
+    p.add_argument("--port", type=int, default=port_default)
     p.add_argument("--client-id", default="edge-pub")
     p.add_argument("--keepalive", type=int, default=30)
     p.add_argument("--seed", type=int, default=None, help="random seed (reproducibility)")
@@ -671,12 +750,19 @@ def main():
     p.add_argument("--rtc-push-system", action="store_true", help="시스템 시간이 앞설 때 RTC에 기록")
 
     # MIC 옵션
-    p.add_argument("--mic-enable", action="store_true", default=False, help="마이크 스트림 활성화")
+    mic_group = p.add_mutually_exclusive_group()
+    mic_group.add_argument(
+        "--mic-enable", dest="mic_enable", action="store_true", help="마이크 스트림 활성화"
+    )
+    mic_group.add_argument(
+        "--mic-disable", dest="mic_enable", action="store_false", help="마이크 스트림 비활성화"
+    )
+    p.set_defaults(mic_enable=mic_enable_default)
     p.add_argument("--mic-backend", choices=["auto", "sounddevice", "arecord"], default="auto")
     p.add_argument("--mic-arecord-device", default=None)
     p.add_argument("--mic-sd-device", default=None)
-    p.add_argument("--mic-sr", type=int, default=16000)
-    p.add_argument("--mic-frame-ms", type=int, default=100)
+    p.add_argument("--mic-sr", type=int, default=mic_sr_default)
+    p.add_argument("--mic-frame-ms", type=int, default=mic_frame_ms_default)
     p.add_argument("--mic-alpha", type=float, default=0.2)
     p.add_argument("--mic-tau", type=float, default=3.0)
     p.add_argument("--mic-kbits", type=int, default=6)
@@ -684,9 +770,16 @@ def main():
     p.add_argument("--mic-min-emit-ms", type=int, default=0)
 
     # TEMP 옵션
-    p.add_argument("--temp-enable", action="store_true", default=False, help="온도 스트림 활성화")
+    temp_group = p.add_mutually_exclusive_group()
+    temp_group.add_argument(
+        "--temp-enable", dest="temp_enable", action="store_true", help="온도 스트림 활성화"
+    )
+    temp_group.add_argument(
+        "--temp-disable", dest="temp_enable", action="store_false", help="온도 스트림 비활성화"
+    )
+    p.set_defaults(temp_enable=temp_enable_default)
     p.add_argument("--temp-backend", choices=["auto", "w1", "sysfs", "mock"], default="auto")
-    p.add_argument("--temp-hz", type=float, default=1.0)
+    p.add_argument("--temp-hz", type=float, default=temp_hz_default)
     p.add_argument("--temp-alpha", type=float, default=0.5)
     p.add_argument("--temp-tau", type=float, default=0.2)
     p.add_argument("--temp-kbits", type=int, default=8)
@@ -696,8 +789,17 @@ def main():
     p.add_argument("--temp-sysfs-path", default=None)
 
     # UI 옵션
-    p.add_argument("--ui-enable", action="store_true", default=False, help="I2C LCD/OLED 상태 표시")
-    p.add_argument("--ui-kind", choices=["auto", "lcd1602", "ssd1306", "console"], default="auto")
+    ui_group = p.add_mutually_exclusive_group()
+    ui_group.add_argument(
+        "--ui-enable", dest="ui_enable", action="store_true", help="I2C LCD/OLED 상태 표시"
+    )
+    ui_group.add_argument(
+        "--ui-disable", dest="ui_enable", action="store_false", help="UI 비활성화"
+    )
+    p.set_defaults(ui_enable=ui_enable_default)
+    p.add_argument(
+        "--ui-kind", choices=["auto", "lcd1602", "ssd1306", "console"], default=ui_kind_default
+    )
     p.add_argument("--ui-bus", type=int, default=1, help="I2C bus 번호 (기본 1)")
     p.add_argument(
         "--ui-address", type=_parse_int_auto, default=None, help="LCD/OLED I2C 주소 override"
@@ -708,10 +810,17 @@ def main():
     # 버튼/링크 제어
     p.add_argument(
         "--buttons-enable",
+        dest="buttons_enable",
         action="store_true",
-        default=False,
         help="GPIO 버튼(모드/링크/마커) 사용",
     )
+    p.add_argument(
+        "--buttons-disable",
+        dest="buttons_enable",
+        action="store_false",
+        help="GPIO 버튼 비활성화",
+    )
+    p.set_defaults(buttons_enable=False)
     p.add_argument("--btn-mode-pin", type=int, default=17, help="정책 모드 버튼 BCM 핀")
     p.add_argument("--btn-profile-pin", type=int, default=27, help="링크 프로파일 버튼 BCM 핀")
     p.add_argument("--btn-marker-pin", type=int, default=22, help="마커 버튼 BCM 핀")
@@ -723,8 +832,31 @@ def main():
         action="store_true",
         help="버튼 프로파일 변경 시 tc 즉시 적용(root 필요)",
     )
+    p.add_argument(
+        "--tc-profiles-config",
+        default=None,
+        help="YAML path for overriding tc profiles (e.g., configs/link_profiles.yaml)",
+    )
 
-    args = p.parse_args()
+    args = p.parse_args(argv)
+
+    # device-config를 지정했는데, pre-parse에서 로드 실패한 경우를 대비해 본 파싱 후에도 로드.
+    # (예: `--device-config`가 후반 옵션에 의해 덮였을 때)
+    args.device_config = _opt_path(args.device_config)
+    if args.device_config and device_cfg is None:
+        device_cfg = _load_device_yaml(args.device_config)
+    if args.device_id is None:
+        if device_cfg is not None:
+            args.device_id = device_cfg.device_id
+        else:
+            print("[edge] ERROR: --device-id is required (or provide --device-config)")
+            sys.exit(2)
+
+    return args
+
+
+def main(argv: list[str] | None = None):
+    args = parse_args(argv)
 
     seed = args.seed
     if seed is None:
@@ -798,6 +930,7 @@ def main():
         iface=args.tc_iface,
         both=bool(args.tc_both),
         apply_on_button=bool(args.tc_apply_on_button),
+        profiles_config=args.tc_profiles_config,
     )
 
     if not mic_cfg.enable and not temp_cfg.enable:
@@ -843,6 +976,13 @@ def _load_policy_yaml(path: str) -> dict:
         return load_policy_config_dict(path)
     except Exception as e:
         print(f"[edge] ERROR: invalid arms config {path}: {e}")
+        sys.exit(2)
+
+def _load_device_yaml(path: str):
+    try:
+        return load_device_config(path)
+    except Exception as e:
+        print(f"[edge] ERROR: invalid device config {path}: {e}")
         sys.exit(2)
 
 

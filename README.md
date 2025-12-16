@@ -55,8 +55,8 @@
 
 ### 2) 재현 가능한 실험 설정(설정 파일 + 실행 커맨드)
 - **정책 팔/가중치/가드레일**: `configs/policy.yaml` (LinUCB arms + reward/safety)
-- **링크 프로파일(소스 오브 트루스)**: 현재는 `link/shaper/tc_profiles.py`에 정의(향후 YAML로 외부화 가능)
-- **디바이스/센서 설정**: 현재는 `edge.edge_daemon` CLI가 소스 오브 트루스(향후 `configs/device.yaml` 로딩 지원 가능)
+- **링크 프로파일**: 기본은 `link/shaper/tc_profiles.py`이며, 필요 시 `configs/link_profiles.yaml`을 `--profiles-config`로 로딩해 override 가능
+- **디바이스/센서 설정**: 기본은 `edge.edge_daemon` CLI이며, `configs/device.yaml`을 `--device-config`로 로딩해 기본값을 채울 수 있음
 
 ### 3) 실험 로그/지표/리포트(파일 산출물)
 실행하면 기본적으로 아래 결과물이 생성됩니다(경로는 예시).
@@ -209,8 +209,8 @@ python -m collector.analyze --input artifacts/run1/logs --out results/run1
 ## 설정 · Configuration
 실험 파라미터를 코드에서 분리해 “재현 가능한 실행”을 목표로 합니다.
 - `configs/policy.yaml` (**사용됨**): LinUCB arms / reward / safety
-- `configs/device.yaml` (**템플릿**): 센서·UI·MQTT 기본값(현재는 미적용; `edge.edge_daemon` CLI가 소스 오브 트루스)
-- `configs/link_profiles.yaml` (**템플릿**): 링크 제약 프로파일(현재는 미적용; `link/shaper/tc_profiles.py`가 소스 오브 트루스)
+- `configs/device.yaml` (**옵션**): 센서·UI·MQTT 기본값(엣지에서 `--device-config`로 로딩)
+- `configs/link_profiles.yaml` (**옵션**): 링크 제약 프로파일(`tc_profiles --profiles-config`, 또는 엣지 버튼 기반 tc 적용 시 `--tc-profiles-config`)
 
 **`configs/device.yaml`**
 ```yaml
@@ -252,15 +252,22 @@ python -m edge.edge_daemon \
 
 RTC는 정확한 이벤트 타임스탬프를 제공해 AoI·지연 측정의 신뢰도를 높여 줍니다.
 
-**`configs/link_profiles.yaml` (template)**
-> 런타임 로딩은 아직 연결되어 있지 않습니다. 실제 적용/실험은 `link/shaper/tc_profiles.py`의 프로파일을 사용합니다.
+**`configs/link_profiles.yaml`**
 ```yaml
 profiles:
-  slow_10kbps: { tbf: "tbf rate 10kbit burst 4kbit limit 4k",  netem: "netem delay 300ms loss 3%" }
-  delay_loss:  { tbf: "tbf rate 100kbit burst 16kbit limit 32k", netem: "netem delay 500ms loss 8% reorder 10%" }
-  cellular_var:{ tbf: "tbf rate 200kbit burst 32kbit limit 64k", netem: "netem delay 120ms loss 2%" }
-  lora_sf10:   { tbf: "tbf rate 5kbit burst 2kbit limit 4k",    netem: "netem delay 1200ms loss 10% 40%" }
-  lora_sf12:   { tbf: "tbf rate 2kbit burst 1kbit limit 2k",    netem: "netem delay 2000ms loss 15% 50%" }
+  slow_10kbps:
+    rate_kbit: 10
+    delay_ms: 300
+    jitter_ms: 50
+    loss_pct: 3.0
+  cellular_var:
+    rate_kbit: null
+    low_kbit: 50
+    high_kbit: 200
+    var_default_period_s: 30
+    delay_ms: 120
+    jitter_ms: 80
+    loss_pct: 2.0
 ```
 
 ---
@@ -494,8 +501,9 @@ python -m collector.analyze --input artifacts/run1/logs --out results/run1
 ## Configuration
 Current status:
 - `configs/policy.yaml`: **used at runtime** for adaptive(LinUCB) arms/reward/safety.
-- `configs/device.yaml`: **template only** (not loaded yet; source-of-truth is `edge.edge_daemon` CLI).
-- `configs/link_profiles.yaml`: **template only** (profiles are currently defined in `link/shaper/tc_profiles.py`).
+- `configs/device.yaml`: **optional** (edge loads defaults via `python -m edge.edge_daemon --device-config configs/device.yaml`).
+- `configs/link_profiles.yaml`: **optional** (tc shaper loads via `python -m link.shaper.tc_profiles --profiles-config configs/link_profiles.yaml ...`;
+  edge button-based tc apply uses `--tc-profiles-config`).
 
 ## Repository Layout
 ```text

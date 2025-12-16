@@ -168,6 +168,8 @@ sudo python -m link.shaper.tc_profiles status --iface eth0
 
 ```bash
 python -m experiments.run_scenarios \
+  --device-config configs/device.yaml \
+  --link-profiles-config configs/link_profiles.yaml \
   --device-id rpi5a \
   --iface eth0 \
   --run-root artifacts/experiments \
@@ -178,6 +180,10 @@ python -m experiments.run_scenarios \
 
 # 더 열악한 링크(LoRa-like)도 추가하려면:
 #   --profiles slow_10kbps,delay_loss,cellular_var,lora_sf10,lora_sf12
+
+# NOTE
+# - experiments runner는 기본적으로 headless 실행을 위해 edge_daemon에 `--ui-disable --buttons-disable`를 전달합니다.
+# - 디바이스 YAML이 UI를 켜고 있더라도 실험 자동화에서는 끄는 편이 안전합니다.
 
 # 종료 후 전체 결과를 한 번에 분석(평균/표준편차 + baseline 비교 + figures)
 python -m collector.analyze \
