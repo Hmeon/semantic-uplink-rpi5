@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Callable, Optional
 
@@ -14,6 +15,8 @@ except ImportError:
     Button = None
 
 __all__ = ["ButtonsConfig", "Buttons", "ButtonsInitError"]
+
+logger = logging.getLogger(__name__)
 
 
 class ButtonsInitError(RuntimeError):
@@ -34,7 +37,7 @@ class _DummyButtons:
         self.reason = reason
 
     def start(self) -> None:
-        print(f"[buttons] disabled: {self.reason}")
+        logger.info("buttons_disabled reason=%s", self.reason)
 
     def stop(self) -> None:
         return
@@ -50,12 +53,12 @@ class Buttons:
     ):
         if Button is None:
             raise ButtonsInitError("gpiozero library not installed")
-        
+
         self.cfg = cfg
         self._on_mode = on_mode
         self._on_profile = on_profile
         self._on_marker = on_marker
-        
+
         # Hold references to Button objects
         self._btn_mode: Optional[Button] = None
         self._btn_profile: Optional[Button] = None
@@ -68,7 +71,7 @@ class Buttons:
         try:
             # bounce_time in seconds for gpiozero
             bounce = self.cfg.debounce_ms / 1000.0
-            
+
             self._btn_mode = Button(self.cfg.mode_pin, pull_up=True, bounce_time=bounce)
             self._btn_mode.when_pressed = self._wrap(self._on_mode)
 
@@ -77,12 +80,12 @@ class Buttons:
 
             self._btn_marker = Button(self.cfg.marker_pin, pull_up=True, bounce_time=bounce)
             self._btn_marker.when_pressed = self._wrap(self._on_marker)
-            
-            print("[buttons] started (mode/profile/marker) via gpiozero")
-        
+
+            logger.info("buttons_started backend=gpiozero")
+
         except (BadPinFactory, PinFactoryFallback, OSError) as e:
             # This might happen if running on non-Pi hardware or without permissions
-            self.stop() # Cleanup any partially created buttons
+            self.stop()  # Cleanup any partially created buttons
             raise ButtonsInitError(f"Failed to initialize GPIO: {e}")
 
     def stop(self) -> None:
@@ -92,14 +95,14 @@ class Buttons:
         self._btn_mode = None
         self._btn_profile = None
         self._btn_marker = None
-        print("[buttons] stopped")
+        logger.info("buttons_stopped")
 
     def _wrap(self, fn: Callable[[], None]):
         def _cb(btn):
             try:
                 fn()
-            except Exception as e:
-                print(f"[buttons] handler error: {e}")
+            except Exception:
+                logger.exception("buttons_handler_error")
         return _cb
 
 
@@ -111,12 +114,12 @@ def build_buttons(
 ):
     if not cfg.enable:
         return _DummyButtons("disabled by config")
-    
+
     try:
         # Check if we can import gpiozero (handled at top level but good to double check safety)
         if Button is None:
-             return _DummyButtons("gpiozero not installed")
-        
+            return _DummyButtons("gpiozero not installed")
+
         return Buttons(cfg, on_mode, on_profile, on_marker)
     except ButtonsInitError as e:
         return _DummyButtons(str(e))

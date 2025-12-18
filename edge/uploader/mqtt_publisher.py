@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import signal
 import ssl
@@ -20,7 +21,10 @@ from typing import Dict, Optional
 
 import paho.mqtt.client as mqtt
 
+from common.logging_setup import add_logging_cli_args, setup_logging_from_args
 from edge.uploader.outbox import Outbox, OutboxItem
+
+logger = logging.getLogger(__name__)
 
 
 class MQTTPublisher:
@@ -113,18 +117,28 @@ class MQTTPublisher:
             # 재연결 직후 inflight 복구: 더는 PUBACK을 기대할 수 없으니 즉시 재시도 가능 상태로
             try:
                 restored = self.outbox.reset_inflight()
-                print(f"[pub] connected to mqtt://{self.broker}:{self.port} (restored {restored} msgs)")
-            except Exception as e:
-                print(f"[pub] reset_inflight error: {e}")
+                logger.info(
+                    "mqtt_connected broker=%s port=%s restored=%s",
+                    self.broker,
+                    int(self.port),
+                    int(restored),
+                )
+            except Exception:
+                logger.exception("mqtt_connected reset_inflight failed")
         else:
-            print(f"[pub] connect failed rc={rc}")
+            logger.error(
+                "mqtt_connect_failed broker=%s port=%s rc=%s",
+                self.broker,
+                int(self.port),
+                rc,
+            )
 
     def _on_disconnect(self, client: mqtt.Client, userdata, rc, properties=None):
         self._connected = False
         # 매핑 초기화(어차피 재연결 후 재시도)
         with self._map_lock:
             self._mid2oid.clear()
-        print(f"[pub] disconnected rc={rc}")
+        logger.warning("mqtt_disconnected rc=%s", rc)
 
     def _on_publish(self, client: mqtt.Client, userdata, mid: int):
         # PUBACK 수신 → outbox.ack
@@ -134,9 +148,9 @@ class MQTTPublisher:
             try:
                 self.outbox.ack(oid)
                 # 진단용 출력(필요 시 로그 레벨 조절)
-                # print(f"[pub] ack mid={mid} oid={oid}")
-            except Exception as e:
-                print(f"[pub] ack error for oid={oid}: {e}")
+                # logger.debug("mqtt_puback mid=%s oid=%s", mid, oid)
+            except Exception:
+                logger.exception("mqtt_puback_failed mid=%s oid=%s", mid, oid)
 
     # ------------- 라이프사이클 -------------
 
@@ -159,7 +173,7 @@ class MQTTPublisher:
         self._requeue_th = threading.Thread(target=self._requeue_loop, name="mqtt-requeue", daemon=True)
         self._requeue_th.start()
 
-        print("[pub] started. Press Ctrl+C to stop.")
+        logger.info("publisher_started broker=%s port=%s", self.broker, int(self.port))
 
     def stop(self):
         if self._stop.is_set():
@@ -177,7 +191,7 @@ class MQTTPublisher:
             self._worker_th.join(timeout=2.0)
         if self._requeue_th and self._requeue_th.is_alive():
             self._requeue_th.join(timeout=2.0)
-        print("[pub] stopped.")
+        logger.info("publisher_stopped")
 
     # ------------- 내부 워커 -------------
 
@@ -204,8 +218,8 @@ class MQTTPublisher:
             # Outbox에서 ready 메시지 인출
             try:
                 batch = self.outbox.claim_next(limit=min(self.claim_batch, budget))
-            except Exception as e:
-                print(f"[pub] claim_next error: {e}")
+            except Exception:
+                logger.exception("claim_next_failed")
                 self._stop.wait(timeout=0.5)
                 continue
 
@@ -226,13 +240,18 @@ class MQTTPublisher:
                 qos=it.qos,
                 retain=it.retain,
             )
-        except Exception as e:
+        except Exception:
             # 네트워크/클라이언트 예외 → 즉시 nack 후 짧은 대기
             try:
                 self.outbox.nack(it.id)
             except Exception:
                 pass
-            print(f"[pub] publish exception for id={it.id}: {e}")
+            logger.exception(
+                "publish_exception id=%s topic=%s payload_bytes=%s",
+                it.id,
+                it.topic,
+                len(it.payload),
+            )
             self._stop.wait(timeout=0.2)
             return
 
@@ -245,7 +264,7 @@ class MQTTPublisher:
                 self.outbox.nack(it.id)
             except Exception:
                 pass
-            print(f"[pub] publish rc={rc} mid={mid} → nack id={it.id}")
+            logger.warning("publish_failed rc=%s mid=%s id=%s topic=%s", rc, mid, it.id, it.topic)
             self._stop.wait(timeout=0.05)
             return
 
@@ -259,9 +278,9 @@ class MQTTPublisher:
             try:
                 n = self.outbox.requeue_stuck()
                 if n:
-                    print(f"[pub] requeued stuck: {n}")
-            except Exception as e:
-                print(f"[pub] requeue_stuck error: {e}")
+                    logger.warning("requeued_stuck n=%s", n)
+            except Exception:
+                logger.exception("requeue_stuck_failed")
             # 주기 슬립
             self._stop.wait(timeout=max(1, self.requeue_period_s))
 
@@ -270,7 +289,7 @@ class MQTTPublisher:
 
 def _install_signal_handlers(p: MQTTPublisher):
     def _h(signum, frame):
-        print(f"[pub] signal={signum} -> stopping...")
+        logger.info("signal=%s stopping", signum)
         p.stop()
         sys.exit(0)
     signal.signal(signal.SIGINT, _h)
@@ -279,6 +298,7 @@ def _install_signal_handlers(p: MQTTPublisher):
 
 def main():
     ap = argparse.ArgumentParser(description="Outbox-backed MQTT QoS1 publisher")
+    add_logging_cli_args(ap)
     ap.add_argument("--outbox", required=True, help="SQLite path (e.g., artifacts/<run>/outbox.sqlite)")
     ap.add_argument("--broker", default="localhost")
     ap.add_argument("--port", type=int, default=1883)
@@ -294,6 +314,7 @@ def main():
     ap.add_argument("--claim-batch", type=int, default=10)
     ap.add_argument("--requeue-period", type=int, default=5)
     args = ap.parse_args()
+    setup_logging_from_args(args)
 
     os.makedirs(os.path.dirname(args.outbox) or ".", exist_ok=True)
     ob = Outbox(args.outbox)

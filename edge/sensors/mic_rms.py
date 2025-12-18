@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import os
 import signal
@@ -21,6 +22,8 @@ from typing import Iterator, Optional
 import numpy as np
 
 __all__ = ["MicRMS", "Sample"]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -244,7 +247,11 @@ def _has_sounddevice() -> bool:
 
 def main():
     import argparse
+
+    from common.logging_setup import add_logging_cli_args, setup_logging_from_args
+
     parser = argparse.ArgumentParser(description="MicRMS 100ms RMS(dBFS) streamer (no raw audio)")
+    add_logging_cli_args(parser)
     parser.add_argument("--device-id", required=True)
     parser.add_argument("--backend", choices=["auto", "sounddevice", "arecord"], default="auto")
     parser.add_argument("--arecord-device", default=None, help="arecord -D 인자 (예: plughw:1,0)")
@@ -255,6 +262,7 @@ def main():
     parser.add_argument("--db-offset", type=float, default=0.0, help="마이크 경로 보정(dB)")
     parser.add_argument("--clip-threshold", type=float, default=0.999)
     args = parser.parse_args()
+    setup_logging_from_args(args)
 
     mic = MicRMS(
         device_id=args.device_id,
@@ -266,15 +274,21 @@ def main():
         arecord_device=args.arecord_device,
         sounddevice_device=args.sounddevice_device,
     )
-    print(f"[mic_rms] start: {mic!r}")
+    logger.info("mic_rms_start %r", mic)
     count = 0
     try:
         for s in mic.stream(duration_s=args.duration_s):
-            print(f"[mic_rms] ts={s.ts_ns} seq={s.seq} dbfs={s.dbfs:6.2f} dBFS clip={s.clip_ratio*100:5.2f}%")
+            logger.info(
+                "mic_rms ts_ns=%s seq=%s dbfs=%.2f clip_pct=%.2f",
+                int(s.ts_ns),
+                int(s.seq),
+                float(s.dbfs),
+                float(s.clip_ratio) * 100.0,
+            )
             count += 1
     finally:
         mic.close()
-        print(f"[mic_rms] done, frames={count}")
+        logger.info("mic_rms_done frames=%s", count)
 
 
 if __name__ == "__main__":

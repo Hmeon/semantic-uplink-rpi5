@@ -8,6 +8,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ from dataclasses import dataclass
 import numpy as np
 
 from common.schema import LinkProfile, PolicyDecisionMsg, SensorType
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "Arm",
@@ -109,7 +112,12 @@ class LinUCBPolicy:
     def __init__(self, cfg: LinUCBConfig):
         self.cfg = cfg
         if cfg.seed is not None:
-            print(f"[linucb] seed={int(cfg.seed)}")
+            logger.info(
+                "linucb_seed device_id=%s sensor=%s seed=%s",
+                cfg.device_id,
+                cfg.sensor.value,
+                int(cfg.seed),
+            )
         self.arms: list[Arm] = list(cfg.arms) if cfg.arms is not None else _default_arms(cfg.sensor)
         if not self.arms:
             raise ValueError("arms must not be empty")
@@ -169,9 +177,25 @@ class LinUCBPolicy:
 
         arm = self.arms[arm_idx]
         if arm_idx != self._last_logged_arm_idx:
-            print(
-                f"[linucb] select arm_idx={arm_idx} tau={arm.tau} kbits={arm.kbits} "
-                f"device_id={self.cfg.device_id} sensor={self.cfg.sensor.value}"
+            forced_reason = "NONE"
+            if safe_forced:
+                if aoi_limit and mae_limit:
+                    forced_reason = "BOTH"
+                elif aoi_limit:
+                    forced_reason = "AOI_LIMIT"
+                else:
+                    forced_reason = "MAE_LIMIT"
+            logger.info(
+                "linucb_arm_select device_id=%s sensor=%s profile=%s arm_id=%d tau=%.6g kbits=%d "
+                "safe_arm_forced=%s forced_reason=%s",
+                self.cfg.device_id,
+                self.cfg.sensor.value,
+                self.cfg.profile.value,
+                int(arm_idx),
+                float(arm.tau),
+                int(arm.kbits),
+                bool(safe_forced),
+                forced_reason,
             )
             self._last_logged_arm_idx = arm_idx
         x = self._context(state)

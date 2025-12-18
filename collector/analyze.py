@@ -35,6 +35,7 @@ from __future__ import annotations
 import argparse
 import fnmatch
 import json
+import logging
 import math
 import os
 from collections.abc import Iterable
@@ -44,10 +45,23 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from collector.plot_labels import (
+    LABEL_AOI_MEAN_MS,
+    LABEL_AOI_P95_MS,
+    LABEL_DUP_BYTES_RATIO_PCT,
+    LABEL_E2E_LATENCY_MS,
+    LABEL_LINK_PROFILE,
+    LABEL_OUTBOX_PENDING_COUNT,
+    LABEL_POLICY,
+    LABEL_RATE_BPS,
+)
 from common.config import load_policy_config_dict
 from common.discord_webhook import DiscordWebhookError, send_discord_message
+from common.logging_setup import add_logging_cli_args, setup_logging_from_args
 from common.metrics import percent_improvement
 from common.schema import EventMsg, LinkProfile, PolicyMode
+
+logger = logging.getLogger(__name__)
 
 # ----------------------------- I/O -----------------------------
 
@@ -305,8 +319,8 @@ def load_collector_meta(paths: list[str | os.PathLike]) -> pd.DataFrame:
     for f in files:
         try:
             meta = json.loads(f.read_text(encoding="utf-8"))
-        except Exception as e:
-            print(f"[analyze] WARN: failed to read collector meta: {f}. error={e}")
+        except Exception:
+            logger.warning("failed to read collector meta: %s", f, exc_info=True)
             continue
 
         run_id = _infer_run_id_from_path(f)
@@ -1208,6 +1222,10 @@ def _write_report_md(
         "- AoI/Rate는 기본적으로 **수집기 수신 시각(`t_recv_ns`)** 기반으로 계산합니다 "
         "(없으면 `ts` 기반)."
     )
+    lines.append(
+        "- (optional) LinUCB reward components (`reward_aoi`, `reward_mae`, `reward_rate`) "
+        "are logged only when edge diagnostics are enabled; otherwise plots are skipped."
+    )
     if "n_runs" in summary.columns:
         lines.append("- 표의 `mean±std`는 **run(리플리케이트) 단위 지표**의 평균/표준편차입니다.")
         lines.append(f"- 비교 기준(baseline): `{baseline_policy}`")
@@ -1518,18 +1536,32 @@ def _write_report_md(
                 policy="compare",
                 metric="pareto_rate_vs_aoi_mean",
             )
+            reward_components_fig = _fig_basename(
+                sensor=sensor_s,
+                profile=prof_s,
+                policy="compare",
+                metric="reward_components_bar",
+            )
             for rel in [
                 f"{figures_dir}/{rate_fig}.png",
                 f"{figures_dir}/{aoi_p95_fig}.png",
                 f"{figures_dir}/{mae_p95_fig}.png",
                 f"{figures_dir}/{pareto_fig}.png",
+                f"{figures_dir}/{reward_components_fig}.png",
             ]:
                 if (out_dir / rel).exists():
                     lines.append(f"![]({rel})")
             lines.append("")
 
         # paper-plots(추가): 논문/최종보고서용 플롯이 있으면 함께 임베드
-        paper_any = any(figs_path.glob("paper_*.png"))
+        paper_any = any(figs_path.glob("*_env_metrics_panel.png")) or any(
+            figs_path.glob("*_action_heatmap.png")
+        )
+        paper_any = paper_any or any(figs_path.glob("*_feature_weights__*.png"))
+        paper_any = paper_any or any(figs_path.glob("*_reward_ts__*.png"))
+        paper_any = paper_any or any(figs_path.glob("*_cumulative_regret__*.png"))
+        paper_any = paper_any or any(figs_path.glob("*_stability_abs_res_ts__*.png"))
+        paper_any = paper_any or any(figs_path.glob("*_timeline__*.png"))
         if paper_any:
             lines.append("---")
             lines.append("")
@@ -1538,9 +1570,21 @@ def _write_report_md(
 
             # sensor 단위 환경 비교(Reward/최종지표)
             for sensor_s in sorted({str(s) for s in summary["sensor"].unique()}):
+                env_metrics = _fig_basename(
+                    sensor=sensor_s,
+                    profile="all",
+                    policy="compare",
+                    metric="env_metrics_panel",
+                )
+                env_reward = _fig_basename(
+                    sensor=sensor_s,
+                    profile="all",
+                    policy="adaptive",
+                    metric="reward_by_profile_ts",
+                )
                 for rel in [
-                    f"{figures_dir}/paper_env_metrics__{sensor_s}.png",
-                    f"{figures_dir}/paper_env_reward_over_time__{sensor_s}.png",
+                    f"{figures_dir}/{env_metrics}.png",
+                    f"{figures_dir}/{env_reward}.png",
                 ]:
                     if (out_dir / rel).exists():
                         lines.append(f"![]({rel})")
@@ -1553,16 +1597,24 @@ def _write_report_md(
                 lines.append(f"### {prof_s} / {sensor_s}")
                 lines.append("")
 
-                rel = f"{figures_dir}/paper_action_heatmap__{prof_s}__{sensor_s}.png"
+                heatmap = _fig_basename(
+                    sensor=sensor_s,
+                    profile=prof_s,
+                    policy="adaptive",
+                    metric="action_heatmap",
+                )
+                rel = f"{figures_dir}/{heatmap}.png"
                 if (out_dir / rel).exists():
                     lines.append(f"![]({rel})")
 
+                sensor_slug = _slug(sensor_s)
+                prof_slug = _slug(prof_s)
                 for pattern in [
-                    f"paper_feature_weights__*__{prof_s}__{sensor_s}.png",
-                    f"paper_reward_over_time__*__{prof_s}__{sensor_s}.png",
-                    f"paper_cumulative_regret__*__{prof_s}__{sensor_s}.png",
-                    f"paper_stability_abs_res__*__{prof_s}__{sensor_s}.png",
-                    f"paper_timeline__*__{prof_s}__{sensor_s}.png",
+                    f"{sensor_slug}_{prof_slug}_adaptive_feature_weights__*.png",
+                    f"{sensor_slug}_{prof_slug}_adaptive_reward_ts__*.png",
+                    f"{sensor_slug}_{prof_slug}_adaptive_cumulative_regret__*.png",
+                    f"{sensor_slug}_{prof_slug}_adaptive_stability_abs_res_ts__*.png",
+                    f"{sensor_slug}_{prof_slug}_adaptive_timeline__*.png",
                 ]:
                     matches = sorted(figs_path.glob(pattern))
                     if matches:
@@ -1655,16 +1707,54 @@ def _apply_plot_style(matplotlib) -> None:
     )
 
 
+# plot manifest (for audits; populated by _save_figure_multi)
+_PLOT_MANIFEST: list[dict[str, object]] = []
+
+
 def _save_figure_multi(fig, out_dir: Path, *, base_name: str, cfg: PlotConfig) -> list[Path]:
     out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        fig.tight_layout()
+    except Exception:
+        pass
     created: list[Path] = []
     for fmt in cfg.formats:
         out_path = out_dir / f"{base_name}.{fmt}"
+        save_kwargs = {
+            "bbox_inches": "tight",
+            "pad_inches": 0.02,
+            "facecolor": "white",
+        }
         if fmt == "png":
-            fig.savefig(out_path, dpi=int(cfg.dpi))
+            fig.savefig(out_path, dpi=int(cfg.dpi), **save_kwargs)
         else:
-            fig.savefig(out_path)
+            fig.savefig(out_path, **save_kwargs)
         created.append(out_path)
+
+    try:
+        size_in = fig.get_size_inches()
+        axes = []
+        for ax in fig.get_axes():
+            axes.append(
+                {
+                    "title": str(ax.get_title() or ""),
+                    "xlabel": str(ax.get_xlabel() or ""),
+                    "ylabel": str(ax.get_ylabel() or ""),
+                    "ax_label": str(ax.get_label() or ""),
+                }
+            )
+        _PLOT_MANIFEST.append(
+            {
+                "base_name": base_name,
+                "formats": list(cfg.formats),
+                "dpi": int(cfg.dpi),
+                "size_inches": [float(size_in[0]), float(size_in[1])],
+                "files": [p.name for p in created],
+                "axes": axes,
+            }
+        )
+    except Exception:
+        pass
     return created
 
 
@@ -1740,7 +1830,7 @@ def _try_make_plots(
             color=[colors.get(x, "#6B7280") for x in xs],
         )
         ax.set_title(title)
-        ax.set_xlabel("Policy")
+        ax.set_xlabel(LABEL_POLICY)
         ax.set_ylabel(ylabel)
         ax.grid(axis="y", alpha=0.25)
         ax.set_axisbelow(True)
@@ -1810,7 +1900,7 @@ def _try_make_plots(
         _bar_compare(
             g,
             metric="rate_Bps",
-            ylabel="Rate [B/s]",
+            ylabel=LABEL_RATE_BPS,
             title=f"{title_base} · Rate",
             base_name=_fig_basename(
                 sensor=sensor_s, profile=prof_s, policy="compare", metric="rate_bar"
@@ -1819,7 +1909,7 @@ def _try_make_plots(
         _bar_compare(
             g,
             metric="aoi_mean_ms",
-            ylabel="AoI mean [ms]",
+            ylabel=LABEL_AOI_MEAN_MS,
             title=f"{title_base} · AoI mean",
             base_name=_fig_basename(
                 sensor=sensor_s, profile=prof_s, policy="compare", metric="aoi_mean_bar"
@@ -1828,7 +1918,7 @@ def _try_make_plots(
         _bar_compare(
             g,
             metric="aoi_p95_ms",
-            ylabel="AoI p95 [ms]",
+            ylabel=LABEL_AOI_P95_MS,
             title=f"{title_base} · AoI p95",
             base_name=_fig_basename(
                 sensor=sensor_s, profile=prof_s, policy="compare", metric="aoi_p95_bar"
@@ -1862,6 +1952,63 @@ def _try_make_plots(
             ),
         )
 
+        # Reward component breakdown (report-ready; only if components exist)
+        comp_cols = [
+            ("linucb_reward_aoi_mean", "reward_aoi"),
+            ("linucb_reward_mae_mean", "reward_mae"),
+            ("linucb_reward_rate_mean", "reward_rate"),
+        ]
+        if all(c in g.columns for c, _ in comp_cols):
+            mat = []
+            for pol in policy_order:
+                row = g[g["policy"].astype("string") == pol]
+                if row.empty:
+                    mat.append([float("nan")] * len(comp_cols))
+                else:
+                    r0 = row.iloc[0]
+                    mat.append(
+                        [
+                            float(pd.to_numeric(r0.get(col), errors="coerce"))
+                            for col, _ in comp_cols
+                        ]
+                    )
+            vals = np.asarray(mat, dtype=np.float64)
+            if np.isfinite(vals).any():
+                xs = np.arange(len(comp_cols))
+                width = 0.22
+                fig, ax = plt.subplots(figsize=(7.6, 3.8))
+                for j, pol in enumerate(policy_order):
+                    ax.bar(
+                        xs + (j - 1) * width,
+                        vals[j, :],
+                        width=width,
+                        label=pol,
+                        color=colors.get(pol, "#6B7280"),
+                    )
+                ax.axhline(0.0, color="#9CA3AF", linewidth=1.0)
+                ax.set_xticks(xs)
+                ax.set_xticklabels([lab for _, lab in comp_cols], rotation=0)
+                ax.set_ylabel("Reward component [reward units]")
+                ax.set_title(f"Reward components (mean) 쨌 {sensor_s}/{prof_s}")
+                ax.grid(axis="y", alpha=0.25)
+                ax.set_axisbelow(True)
+                ax.legend(loc="best", frameon=True)
+                fig.tight_layout()
+                created.extend(
+                    _save_figure_multi(
+                        fig,
+                        figs_dir,
+                        base_name=_fig_basename(
+                            sensor=sensor_s,
+                            profile=prof_s,
+                            policy="compare",
+                            metric="reward_components_bar",
+                        ),
+                        cfg=plot_cfg,
+                    )
+                )
+                plt.close(fig)
+
         _pareto_compare(
             g,
             x_col="rate_Bps",
@@ -1888,6 +2035,196 @@ def _try_make_plots(
                     metric="pareto_rate_vs_aoi_p95",
                 ),
             )
+
+    return created
+
+
+def _try_make_pipeline_plots(
+    out_dir: Path,
+    *,
+    events: pd.DataFrame,
+    decisions_enriched: pd.DataFrame,
+    by_run: pd.DataFrame,
+    plot_cfg: PlotConfig,
+) -> list[Path]:
+    """
+    Pipeline-level plots that should be produced whenever data exists:
+    - Outbox backlog (pending count) time-series
+    - Duplicate bytes ratio (bar, %)
+    - E2E latency distribution (boxplot)
+    """
+    matplotlib, plt = _maybe_import_matplotlib()
+    if matplotlib is None or plt is None:
+        return []
+    _apply_plot_style(matplotlib)
+
+    figs_dir = out_dir / plot_cfg.dir_name
+    figs_dir.mkdir(parents=True, exist_ok=True)
+
+    policy_order = ["periodic", "fixed_tau", "adaptive"]
+    colors = {"periodic": "#9CA3AF", "fixed_tau": "#2563EB", "adaptive": "#F59E0B"}
+    created: list[Path] = []
+
+    # ------------------- Outbox backlog time-series -------------------
+    need_outbox = {"run_id", "profile", "policy", "state_q_len", "ts"}
+    if not decisions_enriched.empty and need_outbox.issubset(decisions_enriched.columns):
+        d = decisions_enriched.copy()
+        tcol = "t_recv_ns" if "t_recv_ns" in d.columns and d["t_recv_ns"].notna().any() else "ts"
+        for (run_id, prof, pol), g in d.groupby(
+            ["run_id", "profile", "policy"], sort=False, observed=True
+        ):
+            gg = g.copy()
+            gg[tcol] = pd.to_numeric(gg[tcol], errors="coerce")
+            gg["state_q_len"] = pd.to_numeric(gg["state_q_len"], errors="coerce")
+            gg = gg.dropna(subset=[tcol, "state_q_len"]).sort_values(tcol, kind="mergesort")
+            if gg.empty:
+                continue
+            t0 = float(gg[tcol].iloc[0])
+            t_s = (gg[tcol].to_numpy(dtype=np.float64) - t0) / 1e9
+            q = gg["state_q_len"].to_numpy(dtype=np.float64)
+            if not np.isfinite(q).any():
+                continue
+
+            fig, ax = plt.subplots(figsize=(8.6, 3.6))
+            ax.plot(t_s, q, color="#111827", linewidth=1.8)
+            ax.fill_between(t_s, 0.0, q, where=q > 0, color="#F59E0B", alpha=0.15)
+            ax.set_title(
+                f"Outbox pending (decision-time samples) | profile={prof} | run={run_id}"
+            )
+            ax.set_xlabel("time since run start [s]")
+            ax.set_ylabel(LABEL_OUTBOX_PENDING_COUNT)
+            ax.grid(alpha=0.25)
+            ax.set_axisbelow(True)
+            created.extend(
+                _save_figure_multi(
+                    fig,
+                    figs_dir,
+                    base_name=_fig_basename(
+                        sensor="all",
+                        profile=str(prof),
+                        policy=str(pol),
+                        metric="outbox_pending_ts",
+                        run_id=str(run_id),
+                    ),
+                    cfg=plot_cfg,
+                )
+            )
+            plt.close(fig)
+
+    # ------------------- Duplicate bytes ratio -------------------
+    need_dup = {"run_id", "profile", "policy", "dup_bytes_ratio"}
+    if not by_run.empty and need_dup.issubset(by_run.columns):
+        dr = (
+            by_run[["run_id", "profile", "policy", "dup_bytes_ratio"]]
+            .drop_duplicates(subset=["run_id", "profile", "policy"], keep="last", ignore_index=True)
+            .copy()
+        )
+        for prof, g in dr.groupby("profile", sort=False, observed=True):
+            means: list[float] = []
+            stds: list[float] = []
+            xs: list[str] = []
+            for pol in policy_order:
+                xs.append(pol)
+                v = pd.to_numeric(
+                    g[g["policy"].astype("string") == pol]["dup_bytes_ratio"], errors="coerce"
+                ).dropna()
+                if not v.empty and np.isfinite(v.to_numpy(dtype=np.float64)).any():
+                    means.append(float(v.mean()) * 100.0)
+                    stds.append(float(v.std(ddof=1)) * 100.0 if len(v) >= 2 else 0.0)
+                else:
+                    means.append(float("nan"))
+                    stds.append(0.0)
+            if not np.isfinite(np.asarray(means, dtype=np.float64)).any():
+                continue
+
+            fig, ax = plt.subplots(figsize=(6.8, 3.6))
+            ax.bar(
+                xs,
+                means,
+                yerr=stds,
+                capsize=4,
+                color=[colors.get(x, "#6B7280") for x in xs],
+            )
+            ax.set_ylim(0, 100)
+            ax.set_ylabel(LABEL_DUP_BYTES_RATIO_PCT)
+            ax.set_title(f"Duplicate bytes ratio (QoS1 de-dup) | profile={prof}")
+            ax.grid(axis="y", alpha=0.25)
+            ax.set_axisbelow(True)
+            created.extend(
+                _save_figure_multi(
+                    fig,
+                    figs_dir,
+                    base_name=_fig_basename(
+                        sensor="all",
+                        profile=str(prof),
+                        policy="compare",
+                        metric="dup_bytes_ratio",
+                    ),
+                    cfg=plot_cfg,
+                )
+            )
+            plt.close(fig)
+
+    # ------------------- E2E latency (boxplot) -------------------
+    need_ev = {"profile", "policy", "sensor", "ts", "t_recv_ns"}
+    if not events.empty and need_ev.issubset(events.columns):
+        ev = events.copy()
+        ev = ev[ev["t_recv_ns"].notna()].copy()
+        if not ev.empty:
+            ev["rx_delay_ms"] = np.maximum(
+                (ev["t_recv_ns"].astype("float64") - ev["ts"].astype("float64")) / 1e6,
+                0.0,
+            )
+            for (prof, sensor), g in ev.groupby(["profile", "sensor"], sort=False, observed=True):
+                data: list[np.ndarray] = []
+                labels: list[str] = []
+                for pol in policy_order:
+                    gp = g[g["policy"].astype("string") == pol]
+                    y = (
+                        pd.to_numeric(gp["rx_delay_ms"], errors="coerce")
+                        .dropna()
+                        .to_numpy(dtype=np.float64)
+                    )
+                    if y.size == 0:
+                        continue
+                    data.append(y)
+                    labels.append(pol)
+                if not data:
+                    continue
+
+                fig, ax = plt.subplots(figsize=(7.4, 4.2))
+                bp = ax.boxplot(
+                    data,
+                    labels=labels,
+                    showfliers=False,
+                    patch_artist=True,
+                    medianprops={"color": "#111827", "linewidth": 1.8},
+                    boxprops={"edgecolor": "#374151"},
+                    whiskerprops={"color": "#374151"},
+                    capprops={"color": "#374151"},
+                )
+                for box, lab in zip(bp.get("boxes", []), labels):
+                    box.set_facecolor(colors.get(lab, "#E5E7EB"))
+                    box.set_alpha(0.35)
+                ax.set_xlabel(LABEL_POLICY)
+                ax.set_ylabel(LABEL_E2E_LATENCY_MS)
+                ax.set_title(f"E2E latency distribution | {sensor}/{prof}")
+                ax.grid(axis="y", alpha=0.25)
+                ax.set_axisbelow(True)
+                created.extend(
+                    _save_figure_multi(
+                        fig,
+                        figs_dir,
+                        base_name=_fig_basename(
+                            sensor=str(sensor),
+                            profile=str(prof),
+                            policy="compare",
+                            metric="rx_delay_box",
+                        ),
+                        cfg=plot_cfg,
+                    )
+                )
+                plt.close(fig)
 
     return created
 
@@ -2155,6 +2492,7 @@ def _try_make_paper_plots(
                 ax.grid(axis="y", alpha=0.25)
             axes[-1].set_xticks(x)
             axes[-1].set_xticklabels(profiles, rotation=0)
+            axes[-1].set_xlabel(LABEL_LINK_PROFILE)
             axes[0].set_title(f"Policy comparison by profile · sensor={sensor}")
             axes[0].legend(loc="best", frameon=True)
             fig.tight_layout()
@@ -2162,7 +2500,12 @@ def _try_make_paper_plots(
                 _save_figure_multi(
                     fig,
                     figs_dir,
-                    base_name=_slug(f"paper_env_metrics__{sensor}"),
+                    base_name=_fig_basename(
+                        sensor=str(sensor),
+                        profile="all",
+                        policy="compare",
+                        metric="env_metrics_panel",
+                    ),
                     cfg=plot_cfg,
                 )
             )
@@ -2226,7 +2569,12 @@ def _try_make_paper_plots(
                     _save_figure_multi(
                         fig,
                         figs_dir,
-                        base_name=_slug(f"paper_action_heatmap__{prof}__{sensor}"),
+                        base_name=_fig_basename(
+                            sensor=str(sensor),
+                            profile=str(prof),
+                            policy="adaptive",
+                            metric="action_heatmap",
+                        ),
                         cfg=plot_cfg,
                     )
                 )
@@ -2314,7 +2662,12 @@ def _try_make_paper_plots(
             _save_figure_multi(
                 fig,
                 figs_dir,
-                base_name=_slug(f"paper_env_reward_over_time__{sensor}"),
+                base_name=_fig_basename(
+                    sensor=str(sensor),
+                    profile="all",
+                    policy="adaptive",
+                    metric="reward_by_profile_ts",
+                ),
                 cfg=plot_cfg,
             )
         )
@@ -2352,7 +2705,13 @@ def _try_make_paper_plots(
             _save_figure_multi(
                 fig,
                 figs_dir,
-                base_name=_slug(f"paper_feature_weights__{rep_run}__{prof}__{sensor}"),
+                base_name=_fig_basename(
+                    sensor=str(sensor),
+                    profile=str(prof),
+                    policy="adaptive",
+                    metric="feature_weights",
+                    run_id=str(rep_run),
+                ),
                 cfg=plot_cfg,
             )
         )
@@ -2416,7 +2775,13 @@ def _try_make_paper_plots(
             _save_figure_multi(
                 fig,
                 figs_dir,
-                base_name=_slug(f"paper_reward_over_time__{rep_run}__{prof}__{sensor}"),
+                base_name=_fig_basename(
+                    sensor=str(sensor),
+                    profile=str(prof),
+                    policy="adaptive",
+                    metric="reward_ts",
+                    run_id=str(rep_run),
+                ),
                 cfg=plot_cfg,
             )
         )
@@ -2434,7 +2799,13 @@ def _try_make_paper_plots(
             _save_figure_multi(
                 fig,
                 figs_dir,
-                base_name=_slug(f"paper_cumulative_regret__{rep_run}__{prof}__{sensor}"),
+                base_name=_fig_basename(
+                    sensor=str(sensor),
+                    profile=str(prof),
+                    policy="adaptive",
+                    metric="cumulative_regret",
+                    run_id=str(rep_run),
+                ),
                 cfg=plot_cfg,
             )
         )
@@ -2471,7 +2842,13 @@ def _try_make_paper_plots(
                 _save_figure_multi(
                     fig,
                     figs_dir,
-                    base_name=_slug(f"paper_stability_abs_res__{rep_run}__{prof}__{sensor}"),
+                    base_name=_fig_basename(
+                        sensor=str(sensor),
+                        profile=str(prof),
+                        policy="adaptive",
+                        metric="stability_abs_res_ts",
+                        run_id=str(rep_run),
+                    ),
                     cfg=plot_cfg,
                 )
             )
@@ -2567,7 +2944,13 @@ def _try_make_paper_plots(
                 _save_figure_multi(
                     fig,
                     figs_dir,
-                    base_name=_slug(f"paper_timeline__{rep_run}__{prof}__{sensor}"),
+                    base_name=_fig_basename(
+                        sensor=str(sensor),
+                        profile=str(prof),
+                        policy="adaptive",
+                        metric="timeline",
+                        run_id=str(rep_run),
+                    ),
                     cfg=plot_cfg,
                 )
             )
@@ -3543,11 +3926,20 @@ def parse_args():
                     help="Discord 메시지에 사용할 표시 이름(옵션)")
     ap.add_argument("--discord-mention", action="append", default=[],
                     help="메시지에서 멘션할 Discord 사용자 ID (여러 번 지정 가능)")
+    ap.add_argument(
+        "--audit",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="quality audit 리포트(quality_audit.json/.md) 생성 (default: disabled)",
+    )
+    add_logging_cli_args(ap)
     return ap.parse_args()
 
 
 def main():
     args = parse_args()
+    setup_logging_from_args(args)
+    _PLOT_MANIFEST.clear()
     out_dir = Path(args.out)
     plot_cfg = PlotConfig(
         dir_name=str(args.plot_dir),
@@ -3559,8 +3951,8 @@ def main():
     df = dedup_and_sort(df)
     try:
         decisions = load_decisions(args.input)
-    except Exception as e:
-        print(f"[analyze] WARN: failed to load decisions logs: {e}")
+    except Exception:
+        logger.exception("failed to load decisions logs")
         decisions = pd.DataFrame()
 
     meta = load_collector_meta(args.input)
@@ -3624,6 +4016,15 @@ def main():
             plot_cfg=plot_cfg,
             pareto_p95=bool(args.pareto_p95),
         )
+        figures.extend(
+            _try_make_pipeline_plots(
+                out_dir,
+                events=df,
+                decisions_enriched=decisions_enriched,
+                by_run=by_run,
+                plot_cfg=plot_cfg,
+            )
+        )
         if bool(args.paper_plots):
             try:
                 paper_figures = _try_make_paper_plots(
@@ -3638,8 +4039,8 @@ def main():
                     top_actions=int(args.top_actions),
                     cellular_var_period_s=int(args.cellular_var_period_s),
                 )
-            except Exception as e:
-                print(f"[analyze] WARN: failed to generate paper plots: {e}")
+            except Exception:
+                logger.exception("failed to generate paper plots")
                 paper_figures = []
         if bool(args.diagnostic_plots):
             try:
@@ -3656,8 +4057,8 @@ def main():
                     entropy_smooth_window=int(args.entropy_smooth_window),
                     ucb_timeseries=bool(args.ucb_timeseries),
                 )
-            except Exception as e:
-                print(f"[analyze] WARN: failed to generate diagnostic plots: {e}")
+            except Exception:
+                logger.exception("failed to generate diagnostic plots")
                 diag_figures = []
 
     _write_report_md(
@@ -3668,24 +4069,54 @@ def main():
         figures_dir=str(plot_cfg.dir_name),
     )
 
+    if _PLOT_MANIFEST:
+        try:
+            manifest_path = out_dir / "plot_manifest.json"
+            manifest = {
+                "plot_cfg": {
+                    "dir_name": str(plot_cfg.dir_name),
+                    "formats": list(plot_cfg.formats),
+                    "dpi": int(plot_cfg.dpi),
+                },
+                "figures": _PLOT_MANIFEST,
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            logger.info("saved: %s", manifest_path)
+        except Exception:
+            logger.exception("failed to write plot_manifest.json")
+
+    if bool(args.audit):
+        try:
+            from collector.quality_audit import run_quality_audit, write_quality_audit_files
+
+            audit = run_quality_audit(out_dir, figs_dir_name=str(plot_cfg.dir_name))
+            qj, qm = write_quality_audit_files(audit, analysis_dir=out_dir)
+            logger.info("audit: %s", qj)
+            logger.info("audit: %s", qm)
+        except Exception:
+            logger.exception("failed to write quality audit reports")
+
     scenarios = summary[["profile", "policy", "sensor"]].drop_duplicates().shape[0]
-    print(f"[analyze] rows={len(df)} scenarios={scenarios}")
-    print(f"[analyze] saved: {csv_path}")
-    print(f"[analyze] saved: {by_run_path}")
-    print(f"[analyze] saved: {cmp_path}")
+    logger.info("rows=%s scenarios=%s", len(df), scenarios)
+    logger.info("saved: %s", csv_path)
+    logger.info("saved: %s", by_run_path)
+    logger.info("saved: %s", cmp_path)
     if arm_dist_path is not None:
-        print(f"[analyze] saved: {arm_dist_path}")
+        logger.info("saved: %s", arm_dist_path)
     if entropy_path is not None:
-        print(f"[analyze] saved: {entropy_path}")
+        logger.info("saved: %s", entropy_path)
     if args.save_parquet:
-        print(f"[analyze] saved: {pq_path}")
+        logger.info("saved: %s", pq_path)
     figs_root = out_dir / plot_cfg.dir_name
     if figures:
-        print(f"[analyze] figures: {len(figures)} files under {figs_root}")
+        logger.info("figures: %s files under %s", len(figures), figs_root)
     if paper_figures:
-        print(f"[analyze] paper figures: {len(paper_figures)} files under {figs_root}")
+        logger.info("paper figures: %s files under %s", len(paper_figures), figs_root)
     if diag_figures:
-        print(f"[analyze] diagnostic figures: {len(diag_figures)} files under {figs_root}")
+        logger.info("diagnostic figures: %s files under %s", len(diag_figures), figs_root)
 
     if args.discord_webhook:
         mentions = [m.strip() for m in args.discord_mention if m and m.strip()]
@@ -3702,9 +4133,9 @@ def main():
                 username=args.discord_username,
                 allowed_mentions=allowed_mentions,
             )
-            print("[analyze] sent Discord notification")
+            logger.info("sent Discord notification")
         except DiscordWebhookError as e:
-            print(f"[analyze] WARN: failed to send Discord notification: {e}")
+            logger.warning("failed to send Discord notification: %s", e)
 
 
 if __name__ == "__main__":

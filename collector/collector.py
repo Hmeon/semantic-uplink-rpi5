@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import signal
@@ -20,6 +21,9 @@ import paho.mqtt.client as mqtt
 import pandas as pd
 
 from common.jsonutil import loads as _json_loads
+from common.logging_setup import add_logging_cli_args, setup_logging_from_args
+
+logger = logging.getLogger(__name__)
 
 # MQTT PUBLISH 패킷 크기 계산(브로커 수신 기준; 헤더 포함)
 try:
@@ -138,19 +142,20 @@ class Collector:
 
     def _on_connect(self, client: mqtt.Client, userdata, flags, rc, properties=None):
         if rc != 0:
-            print(f"[collector] MQTT connect failed: rc={rc}")
+            logger.error("MQTT connect failed: rc=%s", rc)
             return
         client.subscribe("edge/+/+/event", qos=1)
         client.subscribe("policy/+/decision", qos=1)
         client.subscribe("marker/+", qos=1)
-        print(
-            f"[collector] connected to mqtt://{self.cfg.broker}:{self.cfg.port}, "
-            "subscribed topics."
+        logger.info(
+            "connected to mqtt://%s:%s; subscribed topics",
+            self.cfg.broker,
+            self.cfg.port,
         )
 
     def _on_disconnect(self, client: mqtt.Client, userdata, rc, properties=None):
         # Broker outage / network flap is a normal scenario; keep the process alive.
-        print(f"[collector] disconnected rc={rc}")
+        logger.warning("disconnected rc=%s", rc)
 
     def _on_message(self, client: mqtt.Client, userdata, msg: mqtt.MQTTMessage):
         t_recv_ns = time.time_ns()
@@ -170,9 +175,36 @@ class Collector:
                 retain=retain,
                 t_recv_ns=t_recv_ns,
             )
-        except Exception as e:
+        except Exception:
             # 수집기는 손실보다 지속성이 중요 — 개별 메시지 실패는 기록만 하고 계속 진행
-            print(f"[collector] ERROR processing topic={topic}: {e}")
+            device_id = None
+            sensor = None
+            try:
+                parts = str(topic).split("/")
+                if len(parts) >= 2:
+                    device_id = parts[1]
+                if len(parts) >= 3:
+                    sensor = parts[2]
+            except Exception:
+                device_id = None
+                sensor = None
+
+            seq = None
+            try:
+                d = _json_loads(payload)
+                if isinstance(d, dict) and "seq" in d:
+                    seq = d.get("seq")
+            except Exception:
+                seq = None
+
+            logger.exception(
+                "error processing message: topic=%s device_id=%s sensor=%s seq=%s payload_bytes=%s",
+                topic,
+                device_id,
+                sensor,
+                seq,
+                len(payload) if payload is not None else None,
+            )
 
     def ingest_message(
         self,
@@ -308,7 +340,15 @@ class Collector:
 
         # 경량 실시간 로그(빈도 제한 없음; 외부 rate-limit 필요시 조정)
         tag = "DUP" if is_dup else "OK"
-        print(f"[event:{tag}] {device_id}/{sensor} seq={seq} aoi_ms={aoi_ms:.1f} bytes+={pkt_size}")
+        logger.debug(
+            "event=%s device_id=%s sensor=%s seq=%s aoi_ms=%.1f bytes=%s",
+            tag,
+            device_id,
+            sensor,
+            seq,
+            float(aoi_ms),
+            pkt_size,
+        )
 
     # --------------- 정책결정 처리 --------------- 
 
@@ -376,7 +416,12 @@ class Collector:
         with self._lock:
             self._pending_markers.append(rec)
             self._markers_total += 1
-        print(f"[marker] {rec['device_id']} {rec['note']} @ {rec['ts']}")
+        logger.info(
+            "marker device_id=%s note=%s ts=%s",
+            rec.get("device_id"),
+            rec.get("note"),
+            rec.get("ts"),
+        )
 
     # --------------- 저장/플러시 --------------- 
 
@@ -526,10 +571,15 @@ class Collector:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
             os.replace(tmp, dst)
 
-            print(
-                f"[collector] flush: events+={events_written} decisions+={decisions_written} "
-                f"markers+={markers_written} total_events_unique={events_unique_total} "
-                f"bytes_total={bytes_total} dup_msgs={dup_msgs}"
+            logger.info(
+                "flush events+=%s decisions+=%s markers+=%s total_events_unique=%s "
+                "bytes_total=%s dup_msgs=%s",
+                events_written,
+                decisions_written,
+                markers_written,
+                events_unique_total,
+                bytes_total,
+                dup_msgs,
             )
 
     def start(self):
@@ -554,30 +604,27 @@ class Collector:
             while not self._stop_event.wait(self.cfg.flush_interval_s):
                 try:
                     self._flush()
-                except Exception as e:
-                    print(f"[collector] flush error: {e}")
+                except Exception:
+                    logger.exception("flush error")
 
         self._flusher_thread = threading.Thread(target=_flusher, daemon=True)
         self._flusher_thread.start()
 
         # 종료 시그널 처리
         def _handle_sig(signum, frame):
-            print(f"[collector] signal={signum} received; stopping...")
+            logger.info("signal=%s received; stopping", signum)
             self.stop()
 
         signal.signal(signal.SIGINT, _handle_sig)
         signal.signal(signal.SIGTERM, _handle_sig)
 
-        print("[collector] started. Press Ctrl+C to stop.")
+        logger.info("started")
         # 메인 스레드는 단순 대기
         try:
             while not self._stop_event.is_set():
                 if self.cfg.max_runtime_s is not None:
                     if (time.time() - t0) >= float(self.cfg.max_runtime_s):
-                        print(
-                            f"[collector] max_runtime_s={self.cfg.max_runtime_s} reached; "
-                            "stopping..."
-                        )
+                        logger.info("max_runtime_s=%s reached; stopping", self.cfg.max_runtime_s)
                         break
                 time.sleep(0.2)
         finally:
@@ -596,11 +643,11 @@ class Collector:
                 pass
         try:
             self._flush()
-        except Exception as e:
-            print(f"[collector] final flush error: {e}")
+        except Exception:
+            logger.exception("final flush error")
         if self._flusher_thread and self._flusher_thread.is_alive():
             self._flusher_thread.join(timeout=2.0)
-        print("[collector] stopped.")
+        logger.info("stopped")
 
 
 def main():
@@ -621,7 +668,9 @@ def main():
         default=None,
         help="Stop automatically after N seconds (useful for tests).",
     )
+    add_logging_cli_args(parser)
     args = parser.parse_args()
+    setup_logging_from_args(args)
 
     cfg = Config(
         run_dir=args.run_dir,

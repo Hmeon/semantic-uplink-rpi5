@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import signal
 import sys
@@ -22,6 +23,7 @@ import yaml
 
 from common.config import load_device_config, load_policy_config_dict
 from common.jsonutil import dumps as _json_dumps
+from common.logging_setup import add_logging_cli_args, setup_logging_from_args
 from common.schema import LinkProfile, PolicyMode, SensorType
 from edge.sensors.mic_rms import MicRMS
 from edge.sensors.temp import TempSensor
@@ -34,6 +36,8 @@ from edge.ui.status import StatusTracker
 from edge.policy.runtime import SensorPolicyRuntime, StepResult, load_linucb_config
 from edge.ui.buttons import ButtonsConfig, build_buttons
 from link.shaper import tc_profiles
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -127,6 +131,8 @@ class EdgeDaemon:
         self.device_id = device_id
         self.profile = profile
         self.outbox_path = outbox_path
+        self.run_dir = os.path.dirname(self.outbox_path) or "."
+        self.run_id = os.path.basename(os.path.normpath(self.run_dir))
         self.mode = mode
         self.seed = seed
         self._arms_cfg = arms_cfg or {}
@@ -197,9 +203,10 @@ class EdgeDaemon:
         self._maybe_start_ui()
         self._maybe_start_buttons()
 
-        print(
-            f"[edge] started (mode={self.mode.value}, profile={self.profile.value}). "
-            "Press Ctrl+C to stop."
+        logger.info(
+            "edge_started mode=%s profile=%s (Ctrl+C to stop)",
+            self.mode.value,
+            self.profile.value,
         )
         try:
             while not self._stop.is_set():
@@ -243,7 +250,7 @@ class EdgeDaemon:
         finally:
             self.outbox.close()
         self._stop_rtc()
-        print("[edge] stopped.")
+        logger.info("edge_stopped")
 
     # ---------- 내부: 센서 루프 ----------
 
@@ -260,7 +267,7 @@ class EdgeDaemon:
             )
             status = self._rtc_guardian.guard_once()
             if status.rtc_time is None:
-                print(f"[edge] RTC unavailable: {status.last_error}")
+                logger.warning("rtc_unavailable error=%s", status.last_error)
                 self._rtc_guardian = None
                 if self._rtc_device is not None:
                     try:
@@ -270,11 +277,15 @@ class EdgeDaemon:
                     self._rtc_device = None
                 return
             drift = status.drift_seconds or 0.0
-            print(f"[edge] RTC sync: rtc={status.rtc_time.isoformat()} drift={drift:.3f}s")
+            logger.info(
+                "rtc_sync rtc=%s drift_s=%.3f",
+                status.rtc_time.isoformat(),
+                float(drift),
+            )
             if self.rtc_cfg.resync_interval_s > 0:
                 self._rtc_guardian.start()
-        except Exception as e:
-            print(f"[edge] RTC init failed: {e}")
+        except Exception:
+            logger.exception("rtc_init_failed")
             self._rtc_guardian = None
             if self._rtc_device is not None:
                 try:
@@ -308,9 +319,9 @@ class EdgeDaemon:
                 refresh_s=self.ui_cfg.refresh_s,
             )
             self._display = build_display(disp_cfg)
-        except Exception as e:
+        except Exception:
             self._display = None
-            print(f"[ui] init failed: {e}")
+            logger.exception("ui_init_failed kind=%s bus=%s address=%s", self.ui_cfg.kind, self.ui_cfg.bus, self.ui_cfg.address)
             return
         if self._display is None:
             return
@@ -324,15 +335,15 @@ class EdgeDaemon:
         while not self._stop.is_set():
             try:
                 pending = self.outbox.pending()
-            except Exception as e:
+            except Exception:
                 pending = 0
-                print(f"[ui] outbox pending error: {e}")
+                logger.exception("ui_outbox_pending_failed")
             mqtt_ok = self.publisher.is_connected()
             snap = self._status.snapshot(mqtt_connected=mqtt_ok, outbox_pending=pending)
             try:
                 self._display.show_snapshot(snap)
-            except Exception as e:
-                print(f"[ui] render error: {e}")
+            except Exception:
+                logger.exception("ui_render_failed")
             time.sleep(interval)
         try:
             self._display.close()
@@ -356,8 +367,8 @@ class EdgeDaemon:
         )
         try:
             self._buttons.start()
-        except Exception as e:
-            print(f"[buttons] init failed: {e}")
+        except Exception:
+            logger.exception("buttons_init_failed")
 
     def _cycle_mode(self):
         with self._lock:
@@ -365,11 +376,11 @@ class EdgeDaemon:
             cur_idx = modes.index(self.mode) if self.mode in modes else 0
             next_mode = modes[(cur_idx + 1) % len(modes)]
             if next_mode == PolicyMode.ADAPTIVE and not self._arms_cfg:
-                print("[buttons] adaptive mode unavailable (no arms config).")
+                logger.warning("buttons_mode_switch_rejected reason=no_arms_config")
                 return
             self.mode = next_mode
             self._status.update_policy(mode=self.mode)
-            print(f"[buttons] mode -> {self.mode.value}")
+            logger.info("buttons_mode mode=%s", self.mode.value)
             self._refresh_policies()
 
     def _cycle_profile(self):
@@ -382,7 +393,7 @@ class EdgeDaemon:
             cur_idx = profiles.index(self.profile) if self.profile in profiles else 0
             self.profile = profiles[(cur_idx + 1) % len(profiles)]
             self._status.update_policy(profile=self.profile)
-            print(f"[buttons] profile -> {self.profile.value}")
+            logger.info("buttons_profile profile=%s", self.profile.value)
             self._apply_link_profile()
             self._refresh_policies()
 
@@ -401,9 +412,9 @@ class EdgeDaemon:
             self.outbox.enqueue(
                 f"marker/{self.device_id}", payload, qos=1, retain=False, created_ns=ts
             )
-            print("[buttons] marker emitted")
-        except Exception as e:
-            print(f"[buttons] marker enqueue failed: {e}")
+            logger.info("marker_emitted device_id=%s ts_ns=%s", self.device_id, ts)
+        except Exception:
+            logger.exception("marker_enqueue_failed device_id=%s", self.device_id)
 
     def _apply_link_profile(self):
         if not (self.link_cfg.apply_on_button or self.link_cfg.apply_on_start):
@@ -416,8 +427,10 @@ class EdgeDaemon:
                         self._tc_profiles_override = tc_profiles.load_profiles_config(
                             self.link_cfg.profiles_config
                         )
-                    except Exception as e:
-                        print(f"[tc] profiles-config load failed: {self.link_cfg.profiles_config}: {e}")
+                    except Exception:
+                        logger.exception(
+                            "tc_profiles_config_load_failed path=%s", self.link_cfg.profiles_config
+                        )
                         self._tc_profiles_override = None
                 profiles_override = self._tc_profiles_override
             tc_profiles.apply_profile(
@@ -426,9 +439,19 @@ class EdgeDaemon:
                 both=self.link_cfg.both,
                 profiles=profiles_override,
             )
-            print(f"[tc] applied profile {self.profile.value} on {self.link_cfg.iface}")
-        except Exception as e:
-            print(f"[tc] apply failed: {e}")
+            logger.info(
+                "tc_profile_applied iface=%s profile=%s both=%s",
+                self.link_cfg.iface,
+                self.profile.value,
+                bool(self.link_cfg.both),
+            )
+        except Exception:
+            logger.exception(
+                "tc_apply_failed iface=%s profile=%s both=%s",
+                self.link_cfg.iface,
+                self.profile.value,
+                bool(self.link_cfg.both),
+            )
 
     def _refresh_policies(self):
         # 현재 모드/프로파일을 반영해 정책 실행기를 재생성
@@ -477,11 +500,15 @@ class EdgeDaemon:
                 nominal_period_s=cfg.frame_ms / 1000.0,
             )
         except Exception as e:
-            print(f"[edge] mic init failed: {e}")
+            logger.exception("mic_init_failed")
             return
-        print(
-            f"[edge] mic loop started: {self._mic_obj!r} mode={self.mode.value} "
-            f"α={cfg.alpha} τ={cfg.tau} k={cfg.kbits}"
+        logger.info(
+            "mic_loop_started device=%s mode=%s alpha=%s tau=%s kbits=%s",
+            self._mic_obj,
+            self.mode.value,
+            cfg.alpha,
+            cfg.tau,
+            cfg.kbits,
         )
         try:
             for s in self._mic_obj.stream(duration_s=None):
@@ -493,14 +520,14 @@ class EdgeDaemon:
                 self._handle_step_result(res, label="mic", sensor=SensorType.MIC_RMS)
         except SystemExit:
             pass
-        except Exception as e:
-            print(f"[edge] mic loop error: {e}")
+        except Exception:
+            logger.exception("mic_loop_error")
         finally:
             try:
                 self._mic_obj.close()
             except Exception:
                 pass
-            print("[edge] mic loop stopped")
+            logger.info("mic_loop_stopped")
 
     def _temp_loop(self):
         cfg = self.temp_cfg
@@ -523,11 +550,15 @@ class EdgeDaemon:
                 nominal_period_s=(1.0 / cfg.sample_hz) if cfg.sample_hz > 0 else 1.0,
             )
         except Exception as e:
-            print(f"[edge] temp init failed: {e}")
+            logger.exception("temp_init_failed")
             return
-        print(
-            f"[edge] temp loop started: {self._temp_obj!r} mode={self.mode.value} "
-            f"α={cfg.alpha} τ={cfg.tau} k={cfg.kbits}"
+        logger.info(
+            "temp_loop_started device=%s mode=%s alpha=%s tau=%s kbits=%s",
+            self._temp_obj,
+            self.mode.value,
+            cfg.alpha,
+            cfg.tau,
+            cfg.kbits,
         )
         try:
             for s in self._temp_obj.stream(duration_s=None):
@@ -539,14 +570,14 @@ class EdgeDaemon:
                 self._handle_step_result(res, label="temp", sensor=SensorType.TEMP)
         except SystemExit:
             pass
-        except Exception as e:
-            print(f"[edge] temp loop error: {e}")
+        except Exception:
+            logger.exception("temp_loop_error")
         finally:
             try:
                 self._temp_obj.close()
             except Exception:
                 pass
-            print("[edge] temp loop stopped")
+            logger.info("temp_loop_stopped")
 
     def _handle_step_result(self, res: StepResult, *, label: str, sensor: SensorType) -> None:
         # 상태/UI 업데이트
@@ -567,9 +598,11 @@ class EdgeDaemon:
                     retain=False,
                     created_ns=res.event.ts,
                 )
-            except Exception as e:
-                print(f"[edge] outbox enqueue error({label} event): {e}")
+            except Exception:
+                logger.exception("outbox_enqueue_failed type=event label=%s sensor=%s", label, sensor.value)
         if res.decision is not None:
+            if res.event is not None:
+                self._maybe_log_policy_diag(sensor=sensor, seq=int(res.event.seq), decision=res.decision)
             try:
                 payload = res.decision.to_json_bytes()
                 self._status.record_payload(len(payload), res.decision.ts)
@@ -580,8 +613,41 @@ class EdgeDaemon:
                     retain=False,
                     created_ns=res.decision.ts,
                 )
-            except Exception as e:
-                print(f"[edge] outbox enqueue error({label} decision): {e}")
+            except Exception:
+                logger.exception(
+                    "outbox_enqueue_failed type=decision label=%s sensor=%s", label, sensor.value
+                )
+
+    def _maybe_log_policy_diag(self, *, sensor: SensorType, seq: int, decision) -> None:
+        if decision is None:
+            return
+        if getattr(decision, "arm_id", None) is None:
+            return
+        if not logger.isEnabledFor(logging.DEBUG):
+            return
+
+        logger.debug(
+            "policy_diag run_id=%s device_id=%s sensor=%s seq=%s arm_id=%s tau=%s kbits=%s "
+            "safe_arm_forced=%s forced_reason=%s exploitation=%s exploration=%s score=%s ucb_alpha=%s "
+            "reward_aoi=%s reward_mae=%s reward_rate=%s rate_limit_skips=%s",
+            self.run_id,
+            self.device_id,
+            sensor.value,
+            int(seq),
+            getattr(decision, "arm_id", None),
+            getattr(decision, "tau", None),
+            getattr(decision, "kbits", None),
+            getattr(decision, "safe_arm_forced", None),
+            getattr(decision, "forced_reason", None),
+            getattr(decision, "ucb_exploitation", None),
+            getattr(decision, "ucb_exploration", None),
+            getattr(decision, "ucb_score", None),
+            getattr(decision, "ucb_alpha", None),
+            getattr(decision, "reward_aoi", None),
+            getattr(decision, "reward_mae", None),
+            getattr(decision, "reward_rate", None),
+            getattr(decision, "rate_limit_skips", None),
+        )
 
     def _build_policy_runtime(
         self,
@@ -647,7 +713,7 @@ class EdgeDaemon:
 
     def _install_signals(self):
         def _h(signum, frame):
-            print(f"[edge] signal={signum} -> stopping...")
+            logger.info("edge_signal=%s stopping", signum)
             self.stop()
             sys.exit(0)
         signal.signal(signal.SIGINT, _h)
@@ -726,6 +792,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
     p = argparse.ArgumentParser(description="Edge daemon: sensors → EWMA(τ) → Outbox → MQTT QoS1")
     # 공통
+    add_logging_cli_args(p)
     p.add_argument(
         "--device-config",
         default=device_config_path,
@@ -869,14 +936,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         if device_cfg is not None:
             args.device_id = device_cfg.device_id
         else:
-            print("[edge] ERROR: --device-id is required (or provide --device-config)")
-            sys.exit(2)
+            p.error("--device-id is required (or provide --device-config)")
 
     return args
 
 
 def main(argv: list[str] | None = None):
     args = parse_args(argv)
+    setup_logging_from_args(args)
 
     seed = args.seed
     if seed is None:
@@ -894,7 +961,7 @@ def main(argv: list[str] | None = None):
     profile = LinkProfile(args.profile)
     arms_cfg: dict | None = None
     if policy_mode == PolicyMode.ADAPTIVE:
-        print(f"[edge] adaptive seed={seed}")
+        logger.info("adaptive_seed seed=%s", seed)
         arms_cfg = _load_policy_yaml(args.arms)
 
     # 기본 run-dir/outbox
@@ -955,8 +1022,10 @@ def main(argv: list[str] | None = None):
     )
 
     if not mic_cfg.enable and not temp_cfg.enable:
-        print("[edge] ERROR: at least one sensor must be enabled (--mic-enable / --temp-enable)")
-        sys.exit(2)
+        logger.error(
+            "at least one sensor must be enabled (--mic-enable / --temp-enable)"
+        )
+        raise SystemExit(2)
 
     rtc_cfg = RTCCfg(
         enable=bool(args.rtc_enable),
@@ -995,16 +1064,16 @@ def main(argv: list[str] | None = None):
 def _load_policy_yaml(path: str) -> dict:
     try:
         return load_policy_config_dict(path)
-    except Exception as e:
-        print(f"[edge] ERROR: invalid arms config {path}: {e}")
-        sys.exit(2)
+    except Exception:
+        logger.exception("invalid_arms_config path=%s", path)
+        raise SystemExit(2) from None
 
 def _load_device_yaml(path: str):
     try:
         return load_device_config(path)
-    except Exception as e:
-        print(f"[edge] ERROR: invalid device config {path}: {e}")
-        sys.exit(2)
+    except Exception:
+        logger.exception("invalid_device_config path=%s", path)
+        raise SystemExit(2) from None
 
 
 def _hb_none(x: float | None) -> float | None:

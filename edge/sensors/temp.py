@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import glob
+import logging
 import math
 import os
 import signal
@@ -18,6 +19,8 @@ from collections.abc import Iterator
 from dataclasses import dataclass
 
 __all__ = ["TempSensor", "Sample"]
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -269,9 +272,12 @@ class TempSensor:
 # ---------------- CLI(현장 점검용) ----------------
 def main():
     import argparse
+
+    from common.logging_setup import add_logging_cli_args, setup_logging_from_args
     p = argparse.ArgumentParser(
         description="1Hz Temperature sensor stream (DS18B20/sysfs/mock)"
     )
+    add_logging_cli_args(p)
     p.add_argument("--device-id", required=True)
     p.add_argument("--backend", choices=["auto", "w1", "sysfs", "mock"], default="auto")
     p.add_argument("--sample-hz", type=float, default=1.0)
@@ -283,6 +289,7 @@ def main():
     p.add_argument("--w1-path", default=None, help="예: /sys/bus/w1/devices/28-xxxx/w1_slave")
     p.add_argument("--sysfs-path", default=None, help="예: /sys/class/thermal/thermal_zone0/temp")
     args = p.parse_args()
+    setup_logging_from_args(args)
 
     sensor = TempSensor(
         device_id=args.device_id,
@@ -295,24 +302,24 @@ def main():
         w1_path=args.w1_path,
         sysfs_path=args.sysfs_path,
     )
-    print(f"[temp] start: {sensor!r}")
+    logger.info("temp_start %r", sensor)
     count = 0
     try:
         for s in sensor.stream(duration_s=args.duration_s):
             v = f"{s.celsius:6.3f}" if s.celsius == s.celsius else "  NaN "  # NaN 출력 처리
-            print(
-                "[temp] "
-                f"ts={s.ts_ns} "
-                f"seq={s.seq:6d} "
-                f"T={v} °C "
-                f"valid={s.valid} "
-                f"src={s.source} "
-                f"path={s.raw_path}"
+            logger.info(
+                "temp ts_ns=%s seq=%s celsius=%s valid=%s src=%s path=%s",
+                int(s.ts_ns),
+                int(s.seq),
+                v.strip(),
+                bool(s.valid),
+                s.source,
+                s.raw_path,
             )
             count += 1
     finally:
         sensor.close()
-        print(f"[temp] done, samples={count}")
+        logger.info("temp_done samples=%s", count)
 
 
 if __name__ == "__main__":

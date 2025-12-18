@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import shlex
 import signal
@@ -19,6 +20,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from common.config import load_link_profiles_config
+from common.logging_setup import add_logging_cli_args, setup_logging_from_args
+
+logger = logging.getLogger(__name__)
 
 
 # ---------- 프로파일 정의 (동결안과 동일) ----------
@@ -150,8 +154,8 @@ def _require_root():
     )
 
 def _run(cmd: str, check: bool = True) -> subprocess.CompletedProcess:
-    # 모든 명령은 쉘 로그에 보이도록 출력
-    print(f"[tc] $ {cmd}")
+    if logger.isEnabledFor(logging.DEBUG):
+        logger.debug("tc_cmd %s", cmd)
     return subprocess.run(shlex.split(cmd), capture_output=True, text=True, check=check)
 
 def _ignore(cmd: str) -> None:
@@ -159,7 +163,7 @@ def _ignore(cmd: str) -> None:
         _run(cmd, check=True)
     except subprocess.CalledProcessError as e:
         # 존재하지 않음 등은 무시하고 진행
-        sys.stderr.write(f"[tc] ignore: {cmd} -> {e.returncode}\n")
+        logger.warning("tc_ignore cmd=%s rc=%s", cmd, e.returncode)
 
 def _build_netem_args(p: TcProfile) -> str:
     # delay±jitter, loss, reorder를 조합
@@ -234,13 +238,16 @@ class _RateToggle:
             while not self._stop.wait(self.period_s):
                 try:
                     self._flip()
-                except Exception as e:
-                    sys.stderr.write(f"[tc] toggle error: {e}\n")
+                except Exception:
+                    logger.exception("tc_rate_toggle_error iface=%s", self.iface)
         self._th = threading.Thread(target=_loop, daemon=True)
         self._th.start()
-        print(
-            "[tc] rate toggle started: "
-            f"{self.low_kbit}↔{self.high_kbit} kbit every {self.period_s}s"
+        logger.info(
+            "tc_rate_toggle_started iface=%s low_kbit=%s high_kbit=%s period_s=%s",
+            self.iface,
+            int(self.low_kbit),
+            int(self.high_kbit),
+            int(self.period_s),
         )
 
     def _flip(self):
@@ -257,13 +264,13 @@ class _RateToggle:
                 f"tc class replace dev {self.ifb} parent 1: classid 1:1 "
                 f"htb rate {rate}kbit ceil {rate}kbit"
             )
-        print(f"[tc] toggled rate -> {rate} kbit")
+        logger.info("tc_rate_toggled iface=%s rate_kbit=%s", self.iface, int(rate))
 
     def stop(self, timeout: float = 2.0):
         self._stop.set()
         if self._th and self._th.is_alive():
             self._th.join(timeout=timeout)
-        print("[tc] rate toggle stopped.")
+        logger.info("tc_rate_toggle_stopped iface=%s", self.iface)
 
 
 # ---------- 외부 API ----------
@@ -368,7 +375,7 @@ def status(iface: str, both: bool = False) -> str:
 
 def _install_signal_handlers(iface: str, both: bool):
     def _handler(signum, frame):
-        print(f"[tc] signal={signum} -> clearing profile and exit")
+        logger.info("tc_signal=%s clearing_profile iface=%s both=%s", signum, iface, both)
         try:
             clear(iface, both=both)
         finally:
@@ -380,6 +387,7 @@ def _install_signal_handlers(iface: str, both: bool):
 
 def main():
     parser = argparse.ArgumentParser(description="tc profile applier (HTB+netem)")
+    add_logging_cli_args(parser)
     parser.add_argument(
         "--profiles-config",
         default=None,
@@ -407,16 +415,15 @@ def main():
     p_status.add_argument("--both", action="store_true")
 
     args = parser.parse_args()
+    setup_logging_from_args(args)
     _install_signal_handlers(iface=getattr(args, "iface", ""), both=getattr(args, "both", False))
 
     profiles_override = None
     if args.profiles_config:
         try:
             profiles_override = load_profiles_config(args.profiles_config)
-        except Exception as e:
-            sys.stderr.write(
-                f"[tc] WARN: failed to load profiles_config={args.profiles_config}: {e}\n"
-            )
+        except Exception:
+            logger.exception("failed to load profiles_config=%s", args.profiles_config)
             profiles_override = None
 
     try:
@@ -428,7 +435,12 @@ def main():
                 var_period_s=args.var_period,
                 profiles=profiles_override,
             )
-            print("[tc] profile applied. (Ctrl+C to clear)")
+            logger.info(
+                "tc_profile_applied iface=%s profile=%s both=%s",
+                args.iface,
+                args.profile,
+                bool(args.both),
+            )
             # apply 모드로 실행된 경우, 셀룰러 토글이 있다면 유지 대기
             if args.profile == "cellular_var":
                 # 토글 스레드가 동작하는 동안 프로세스 유지
@@ -436,14 +448,14 @@ def main():
                     time.sleep(1)
         elif args.cmd == "clear":
             clear(args.iface, both=args.both)
-            print("[tc] cleared.")
+            logger.info("tc_cleared iface=%s both=%s", args.iface, bool(args.both))
         elif args.cmd == "status":
-            print(status(args.iface, both=args.both))
+            logger.info("\n%s", status(args.iface, both=args.both))
     except PermissionError as e:
-        sys.stderr.write(str(e) + "\n")
+        logger.error("%s", e)
         sys.exit(1)
-    except Exception as e:
-        sys.stderr.write(f"[tc] error: {e}\n")
+    except Exception:
+        logger.exception("tc_profiles error")
         sys.exit(2)
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import signal
 import socket
@@ -9,6 +10,10 @@ import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
+
+from common.logging_setup import add_logging_cli_args, setup_logging_from_args
+
+logger = logging.getLogger(__name__)
 
 
 def _opt_path(val: str | None) -> str | None:
@@ -218,9 +223,11 @@ class PiStack:
         self._start_child("collector", _build_collector_cmd(self.cfg), logs_dir / "collector.log")
         self._start_child("edge", _build_edge_cmd(self.cfg), logs_dir / "edge.log")
 
-        print(
-            f"[stack] running: run_dir={self.cfg.run_dir} "
-            f"broker={self.cfg.broker_host}:{self.cfg.broker_port}"
+        logger.info(
+            "stack_running run_dir=%s broker=%s:%s",
+            self.cfg.run_dir,
+            self.cfg.broker_host,
+            int(self.cfg.broker_port),
         )
 
         try:
@@ -232,7 +239,7 @@ class PiStack:
                 ]
                 if dead:
                     for name, rc in dead:
-                        print(f"[stack] child exited: {name} rc={rc}")
+                        logger.error("child_exited name=%s rc=%s", name, rc)
                     return 1
                 time.sleep(0.25)
         finally:
@@ -247,7 +254,7 @@ class PiStack:
 
     def _install_signals(self) -> None:
         def _h(signum, frame):
-            print(f"[stack] signal={signum} -> stopping...")
+            logger.info("stack_signal=%s stopping", signum)
             self.stop()
 
         try:
@@ -303,6 +310,7 @@ class PiStack:
 
 def parse_args(argv: list[str] | None = None) -> StackConfig:
     ap = argparse.ArgumentParser(description="Single-Pi stack: broker(mosquitto)+collector+edge")
+    add_logging_cli_args(ap)
     ap.add_argument("--run-dir", default="artifacts/live", help="shared run dir for edge+collector")
     ap.add_argument("--device-config", default="configs/device.yaml", help="edge device YAML path")
     ap.add_argument(
@@ -338,6 +346,7 @@ def parse_args(argv: list[str] | None = None) -> StackConfig:
     ap.add_argument("--tc-profiles-config", default="configs/link_profiles.yaml")
 
     args = ap.parse_args(argv)
+    setup_logging_from_args(args)
 
     run_dir = _opt_path(args.run_dir) or f"artifacts/{_timestamp_id()}_live"
     device_config = _opt_path(args.device_config) or "configs/device.yaml"

@@ -1,11 +1,14 @@
 """I2C LCD/OLED 상태 표시."""
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass
 from typing import Sequence
 
 from edge.ui.status import UISnapshot
+
+logger = logging.getLogger(__name__)
 
 try:  # pragma: no cover - 하드웨어 의존
     from smbus2 import SMBus  # type: ignore
@@ -53,7 +56,7 @@ class ConsoleDisplay(BaseDisplay):
     def show_lines(self, lines: Sequence[str]) -> None:
         block = " | ".join(line.rstrip() for line in lines)
         if block != self._last:
-            print(f"[ui] {block}")
+            logger.info("ui %s", block)
             self._last = block
 
 
