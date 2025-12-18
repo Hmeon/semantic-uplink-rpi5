@@ -45,12 +45,19 @@ class SafetyConfig(BaseModel):
     mae_max: float = 2.0
 
 
+class PolicyDiagnosticsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+
+
 class PolicyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     arms: list[ArmConfig]
     reward: RewardConfig = Field(default_factory=RewardConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
+    diagnostics: PolicyDiagnosticsConfig = Field(default_factory=PolicyDiagnosticsConfig)
 
     @field_validator("arms")
     @classmethod

@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import argparse
 import fnmatch
+import json
 import math
 import os
 from collections.abc import Iterable
@@ -266,11 +267,86 @@ def load_decisions(paths: list[str | os.PathLike]) -> pd.DataFrame:
         "kbits": "int64",
         "reward": "float64",
         "topic": "string",
+        # optional diagnostics
+        "arm_id": "Int64",
+        "safe_arm_forced": "boolean",
+        "forced_reason": "string",
+        "ucb_exploitation": "float64",
+        "ucb_exploration": "float64",
+        "ucb_score": "float64",
+        "ucb_alpha": "float64",
+        "reward_aoi": "float64",
+        "reward_mae": "float64",
+        "reward_rate": "float64",
+        "rate_limit_skips": "Int64",
     }
     for k, t in cast_cols.items():
         if k in out.columns:
             out[k] = out[k].astype(t)
     out["run_id"] = out.get("run_id", out["__source_file"]).astype("string")
+    return out
+
+
+def load_collector_meta(paths: list[str | os.PathLike]) -> pd.DataFrame:
+    """
+    Load Collector meta (logs/collector_meta.json) and expose dedup-related diagnostics.
+
+    Expected keys (collector/collector.py):
+    - bytes_total_including_dups
+    - dup_bytes_dropped
+    - dup_messages_dropped
+    """
+    files = _discover_named_files(paths, names=("collector_meta.json",))
+    if not files:
+        return pd.DataFrame()
+
+    rows: list[dict[str, object]] = []
+    for f in files:
+        try:
+            meta = json.loads(f.read_text(encoding="utf-8"))
+        except Exception as e:
+            print(f"[analyze] WARN: failed to read collector meta: {f}. error={e}")
+            continue
+
+        run_id = _infer_run_id_from_path(f)
+        bytes_total = meta.get("bytes_total_including_dups", None)
+        dup_bytes = meta.get("dup_bytes_dropped", None)
+        dup_msgs = meta.get("dup_messages_dropped", None)
+
+        bytes_total_f = float(bytes_total) if bytes_total is not None else float("nan")
+        dup_bytes_f = float(dup_bytes) if dup_bytes is not None else float("nan")
+        dup_bytes_ratio = float("nan")
+        if (
+            math.isfinite(bytes_total_f)
+            and bytes_total_f > 0
+            and math.isfinite(dup_bytes_f)
+            and dup_bytes_f >= 0
+        ):
+            dup_bytes_ratio = float(dup_bytes_f / bytes_total_f)
+
+        rows.append(
+            {
+                "run_id": str(run_id),
+                "bytes_total_including_dups": bytes_total_f,
+                "dup_bytes_dropped": dup_bytes_f,
+                "dup_bytes_ratio": float(dup_bytes_ratio),
+                "dup_messages_dropped": float(dup_msgs) if dup_msgs is not None else float("nan"),
+            }
+        )
+
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    for c, t in {
+        "run_id": "string",
+        "bytes_total_including_dups": "float64",
+        "dup_bytes_dropped": "float64",
+        "dup_bytes_ratio": "float64",
+        "dup_messages_dropped": "float64",
+    }.items():
+        if c in out.columns:
+            out[c] = out[c].astype(t)
+    out = out.drop_duplicates(subset=["run_id"], keep="last", ignore_index=True)
     return out
 
 
@@ -366,6 +442,224 @@ def enrich_decisions_with_events(decisions: pd.DataFrame, events: pd.DataFrame) 
     drop_cols = [c for c in ("tau_key", "kbits_key", "res_key", "t_recv_ns_ev") if c in out.columns]
     out.drop(columns=drop_cols, inplace=True)
     return out
+
+
+def _entropy_log2_from_counts(counts: np.ndarray) -> float:
+    total = float(np.sum(counts))
+    if total <= 0:
+        return float("nan")
+    p = np.asarray(counts, dtype=np.float64) / total
+    p = p[p > 0]
+    if p.size == 0:
+        return float("nan")
+    return float(-(p * np.log2(p)).sum())
+
+
+def summarize_decisions_diagnostics_by_run(
+    decisions: pd.DataFrame,
+    *,
+    window_s: int = 60,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """
+    LinUCB/파이프라인 진단 지표를 decisions 로그에서 집계한다.
+
+    Returns:
+      - diag_by_run: (run_id, profile, policy, sensor) 단위 요약
+      - arm_distribution: arm_id 분포(long-form; 논문/보고서용)
+      - entropy_windows: 고정 시간창 entropy(long-form)
+    """
+    if decisions.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    d = decisions.copy()
+    for col in ["run_id", "profile", "policy", "sensor"]:
+        if col not in d.columns:
+            d[col] = "unknown"
+        d[col] = d[col].astype("string")
+
+    time_col = "ts"
+    if "t_recv_ns" in d.columns and d["t_recv_ns"].notna().any():
+        time_col = "t_recv_ns"
+        d["_t_ns"] = d["t_recv_ns"].fillna(d["ts"]).astype("int64")
+    else:
+        d["_t_ns"] = d["ts"].astype("int64")
+
+    window_ns = int(max(1, int(window_s)) * 1_000_000_000)
+    entropy_col = f"linucb_action_entropy_mean_{int(window_s)}s"
+    keys = ["run_id", "profile", "policy", "sensor"]
+
+    diag_rows: list[dict[str, object]] = []
+    arm_rows: list[dict[str, object]] = []
+    entropy_rows: list[dict[str, object]] = []
+
+    for (run_id, prof, pol, sensor), g in d.groupby(keys, sort=False, observed=True):
+        g = g.sort_values("_t_ns", kind="mergesort").reset_index(drop=True)
+        row: dict[str, object] = {
+            "run_id": str(run_id),
+            "profile": str(prof),
+            "policy": str(pol),
+            "sensor": str(sensor),
+            "linucb_n_decisions": int(len(g)),
+        }
+
+        # --- outbox backlog diagnostics (pending) ---
+        outbox_max = float("nan")
+        outbox_auc_s = float("nan")
+        outbox_recovery_s = float("nan")
+        if "state_q_len" in g.columns and "ts" in g.columns and len(g) > 0:
+            t = g["ts"].astype("int64").to_numpy()
+            q = g["state_q_len"].astype("float64").to_numpy()
+            order = np.argsort(t, kind="mergesort")
+            t = t[order]
+            q = q[order]
+            if q.size > 0 and np.isfinite(q).any():
+                outbox_max = float(np.nanmax(q))
+            if q.size >= 2:
+                dt_s = np.diff(t.astype("int64")) / 1e9
+                avg_q = (q[:-1] + q[1:]) / 2.0
+                outbox_auc_s = float(np.nansum(avg_q * dt_s))
+            if q.size > 0 and np.isfinite(outbox_max):
+                i_max = int(np.nanargmax(q))
+                after_zero = np.where(q[i_max:] == 0)[0]
+                if after_zero.size > 0:
+                    j = i_max + int(after_zero[0])
+                    outbox_recovery_s = float((t[j] - t[i_max]) / 1e9)
+        row["outbox_pending_max"] = float(outbox_max)
+        row["outbox_pending_auc_s"] = float(outbox_auc_s)
+        row["outbox_pending_recovery_s"] = float(outbox_recovery_s)
+
+        # --- arm-level diagnostics (arm_id required) ---
+        row["linucb_switch_rate"] = float("nan")
+        row[entropy_col] = float("nan")
+        if "arm_id" in g.columns and g["arm_id"].notna().any():
+            ga = g.dropna(subset=["arm_id"]).copy()
+            ga["arm_id"] = ga["arm_id"].astype("int64")
+            if not ga.empty:
+                counts = ga["arm_id"].value_counts().sort_index()
+                total = int(counts.sum())
+                for arm_id, cnt in counts.items():
+                    arm_rows.append(
+                        {
+                            "run_id": str(run_id),
+                            "profile": str(prof),
+                            "policy": str(pol),
+                            "sensor": str(sensor),
+                            "arm_id": int(arm_id),
+                            "count": int(cnt),
+                            "frac": float(cnt / total) if total > 0 else float("nan"),
+                            "n_decisions": int(total),
+                        }
+                    )
+
+                av = ga["arm_id"].to_numpy()
+                if av.size >= 2:
+                    row["linucb_switch_rate"] = float(np.mean(av[1:] != av[:-1]))
+
+                t0 = int(ga["_t_ns"].iloc[0])
+                ga["_window_idx"] = ((ga["_t_ns"] - t0) // window_ns).astype("int64")
+                win_entropies = []
+                for w, gw in ga.groupby("_window_idx", sort=False, observed=True):
+                    c = gw["arm_id"].value_counts().to_numpy(dtype=np.float64)
+                    h = _entropy_log2_from_counts(c)
+                    entropy_rows.append(
+                        {
+                            "run_id": str(run_id),
+                            "profile": str(prof),
+                            "policy": str(pol),
+                            "sensor": str(sensor),
+                            "time_base": str(time_col),
+                            "window_s": int(window_s),
+                            "window_idx": int(w),
+                            "n_decisions": int(len(gw)),
+                            "entropy_log2": float(h),
+                        }
+                    )
+                    if math.isfinite(h):
+                        win_entropies.append(float(h))
+                if win_entropies:
+                    row[entropy_col] = float(np.mean(win_entropies))
+
+        # --- safe arm intervention diagnostics ---
+        row["linucb_safe_forced_rate"] = float("nan")
+        if "safe_arm_forced" in g.columns and g["safe_arm_forced"].notna().any():
+            s = g["safe_arm_forced"].astype("boolean")
+            row["linucb_safe_forced_rate"] = float(s.mean(skipna=True))
+
+        for name, code in [
+            ("linucb_forced_reason_none_rate", "NONE"),
+            ("linucb_forced_reason_aoi_limit_rate", "AOI_LIMIT"),
+            ("linucb_forced_reason_mae_limit_rate", "MAE_LIMIT"),
+            ("linucb_forced_reason_both_rate", "BOTH"),
+        ]:
+            row[name] = float("nan")
+        if "forced_reason" in g.columns and g["forced_reason"].notna().any():
+            fr = g["forced_reason"].astype("string").fillna("")
+            if len(fr) > 0:
+                row["linucb_forced_reason_none_rate"] = float((fr == "NONE").mean())
+                row["linucb_forced_reason_aoi_limit_rate"] = float((fr == "AOI_LIMIT").mean())
+                row["linucb_forced_reason_mae_limit_rate"] = float((fr == "MAE_LIMIT").mean())
+                row["linucb_forced_reason_both_rate"] = float((fr == "BOTH").mean())
+
+        # --- UCB decomposition diagnostics ---
+        for src, dst in [
+            ("ucb_exploitation", "linucb_ucb_exploitation_mean"),
+            ("ucb_exploration", "linucb_ucb_exploration_mean"),
+            ("ucb_score", "linucb_ucb_score_mean"),
+        ]:
+            row[dst] = float("nan")
+            if src in g.columns and g[src].notna().any():
+                row[dst] = float(pd.to_numeric(g[src], errors="coerce").mean())
+
+        row["linucb_ucb_uncertainty_mean"] = float("nan")
+        if (
+            "ucb_exploration" in g.columns
+            and "ucb_alpha" in g.columns
+            and g["ucb_exploration"].notna().any()
+            and g["ucb_alpha"].notna().any()
+        ):
+            exploration = pd.to_numeric(g["ucb_exploration"], errors="coerce")
+            alpha = pd.to_numeric(g["ucb_alpha"], errors="coerce")
+            u = (exploration / alpha).replace([np.inf, -np.inf], np.nan)
+            if u.notna().any():
+                row["linucb_ucb_uncertainty_mean"] = float(u.mean())
+
+        # --- reward diagnostics ---
+        row["linucb_reward_mean"] = float("nan")
+        if "reward" in g.columns and g["reward"].notna().any():
+            row["linucb_reward_mean"] = float(pd.to_numeric(g["reward"], errors="coerce").mean())
+
+        for src, dst in [
+            ("reward_aoi", "linucb_reward_aoi_mean"),
+            ("reward_mae", "linucb_reward_mae_mean"),
+            ("reward_rate", "linucb_reward_rate_mean"),
+        ]:
+            row[dst] = float("nan")
+            if src in g.columns and g[src].notna().any():
+                row[dst] = float(pd.to_numeric(g[src], errors="coerce").mean())
+
+        # --- rate-limit skip diagnostics ---
+        row["linucb_rate_limit_skips_total"] = float("nan")
+        row["linucb_rate_limit_skips_per_decision"] = float("nan")
+        if "rate_limit_skips" in g.columns and g["rate_limit_skips"].notna().any():
+            skips = pd.to_numeric(g["rate_limit_skips"], errors="coerce").fillna(0.0)
+            total_skips = float(skips.sum())
+            row["linucb_rate_limit_skips_total"] = float(total_skips)
+            if len(g) > 0:
+                row["linucb_rate_limit_skips_per_decision"] = float(total_skips / len(g))
+
+        diag_rows.append(row)
+
+    diag = pd.DataFrame(diag_rows)
+    arm_dist = pd.DataFrame(arm_rows)
+    entropy = pd.DataFrame(entropy_rows)
+    for c in ["_t_ns"]:
+        if c in diag.columns:
+            diag.drop(columns=[c], inplace=True)
+        if c in arm_dist.columns:
+            arm_dist.drop(columns=[c], inplace=True)
+        if c in entropy.columns:
+            entropy.drop(columns=[c], inplace=True)
+    return diag, arm_dist, entropy
 
 
 def _normalize_events_schema(df: pd.DataFrame) -> pd.DataFrame:
@@ -601,7 +895,12 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
         # 시간축: 수집기 수신 시각이 있으면 그 기준으로 AoI/Rate를 계산(논문/보고서 관점에 더 적합)
         use_recv = "t_recv_ns" in g.columns and g["t_recv_ns"].notna().any()
         rx_delay_mean_ms = float("nan")
+        rx_delay_p50_ms = float("nan")
         rx_delay_p95_ms = float("nan")
+        event_reason_threshold_count = float("nan")
+        event_reason_heartbeat_count = float("nan")
+        event_reason_threshold_frac = float("nan")
+        event_reason_heartbeat_frac = float("nan")
         if use_recv:
             g = g.sort_values("t_recv_ns", kind="mergesort")
             recv = g["t_recv_ns"].astype("int64").to_numpy()
@@ -619,6 +918,7 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
                 rx_delay_ms = np.maximum((recv - gen).astype("float64") / 1e6, 0.0)
                 if rx_delay_ms.size > 0:
                     rx_delay_mean_ms = float(np.mean(rx_delay_ms))
+                    rx_delay_p50_ms = float(np.quantile(rx_delay_ms, 0.50))
                     rx_delay_p95_ms = float(np.quantile(rx_delay_ms, 0.95))
         else:
             ts = np.sort(g["ts"].astype("int64").to_numpy())
@@ -644,6 +944,14 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
             time_base = "recv"
         else:
             time_base = "ts"
+
+        if "event_reason" in g.columns:
+            er = g["event_reason"].astype("string")
+            event_reason_threshold_count = float((er == "THRESHOLD").sum())
+            event_reason_heartbeat_count = float((er == "HEARTBEAT").sum())
+            if len(g) > 0:
+                event_reason_threshold_frac = float(event_reason_threshold_count / len(g))
+                event_reason_heartbeat_frac = float(event_reason_heartbeat_count / len(g))
 
         # 이벤트 기반 MAE 통계(잔차 res)
         mae_mean = float(g["res"].abs().mean())
@@ -686,7 +994,12 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
             "kbits_mean": float(g["kbits"].mean()),
             "time_base": time_base,
             "rx_delay_mean_ms": float(rx_delay_mean_ms),
+            "rx_delay_p50_ms": float(rx_delay_p50_ms),
             "rx_delay_p95_ms": float(rx_delay_p95_ms),
+            "event_reason_threshold_count": float(event_reason_threshold_count),
+            "event_reason_heartbeat_count": float(event_reason_heartbeat_count),
+            "event_reason_threshold_frac": float(event_reason_threshold_frac),
+            "event_reason_heartbeat_frac": float(event_reason_heartbeat_frac),
         })
 
     out = pd.DataFrame(rows)
@@ -734,7 +1047,37 @@ def summarize(summary_by_run: pd.DataFrame) -> pd.DataFrame:
         "mae_event_p95",
         "kbits_mean",
     ]
-    for c in ["event_rate_hz", "send_ratio", "rx_delay_mean_ms", "rx_delay_p95_ms"]:
+    for c in [
+        "event_rate_hz",
+        "send_ratio",
+        "rx_delay_mean_ms",
+        "rx_delay_p50_ms",
+        "rx_delay_p95_ms",
+        "event_reason_threshold_frac",
+        "event_reason_heartbeat_frac",
+        "dup_bytes_ratio",
+        "linucb_n_decisions",
+        "linucb_action_entropy_mean_60s",
+        "linucb_switch_rate",
+        "linucb_safe_forced_rate",
+        "linucb_forced_reason_none_rate",
+        "linucb_forced_reason_aoi_limit_rate",
+        "linucb_forced_reason_mae_limit_rate",
+        "linucb_forced_reason_both_rate",
+        "linucb_ucb_exploitation_mean",
+        "linucb_ucb_exploration_mean",
+        "linucb_ucb_score_mean",
+        "linucb_ucb_uncertainty_mean",
+        "linucb_reward_mean",
+        "linucb_reward_aoi_mean",
+        "linucb_reward_mae_mean",
+        "linucb_reward_rate_mean",
+        "linucb_rate_limit_skips_total",
+        "linucb_rate_limit_skips_per_decision",
+        "outbox_pending_max",
+        "outbox_pending_auc_s",
+        "outbox_pending_recovery_s",
+    ]:
         if c in summary_by_run.columns:
             metric_cols.append(c)
 
@@ -944,6 +1287,124 @@ def _write_report_md(
             ]
 
         lines.append("| " + " | ".join(cells) + " |")
+
+    # --- LinUCB diagnostics (optional) ---
+    diag_cols = [
+        "linucb_n_decisions",
+        "linucb_action_entropy_mean_60s",
+        "linucb_switch_rate",
+        "linucb_safe_forced_rate",
+        "linucb_forced_reason_aoi_limit_rate",
+        "linucb_forced_reason_mae_limit_rate",
+        "linucb_forced_reason_both_rate",
+        "linucb_ucb_uncertainty_mean",
+        "linucb_rate_limit_skips_per_decision",
+        "outbox_pending_max",
+        "outbox_pending_auc_s",
+        "outbox_pending_recovery_s",
+        "dup_bytes_ratio",
+        "rx_delay_p50_ms",
+    ]
+    if any(c in tbl.columns for c in diag_cols):
+        diag = tbl[tbl["policy"].astype("string") == "adaptive"].copy()
+        if not diag.empty:
+            lines.append("")
+            lines.append("## LinUCB/파이프라인 진단 (adaptive)")
+            lines.append("")
+            lines.append(
+                "| profile | sensor | n_dec | H(60s) | switch | safe_forced | "
+                "AOI_limit | MAE_limit | BOTH | u_mean | skip/dec | "
+                "q_max | q_auc[s] | q_recover[s] | dup_bytes | rx_p50[ms] |"
+            )
+            lines.append(
+                "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+            )
+            for _, r in diag.iterrows():
+                n_dec = (
+                    _fmt_mean_std("linucb_n_decisions", ".0f")
+                    if "linucb_n_decisions" in r
+                    else "NaN"
+                )
+                h_60s = (
+                    _fmt_mean_std("linucb_action_entropy_mean_60s", ".3f")
+                    if "linucb_action_entropy_mean_60s" in r
+                    else "NaN"
+                )
+                switch = (
+                    _fmt_mean_std("linucb_switch_rate", ".3f")
+                    if "linucb_switch_rate" in r
+                    else "NaN"
+                )
+                safe_forced = (
+                    _fmt_mean_std("linucb_safe_forced_rate", ".3f")
+                    if "linucb_safe_forced_rate" in r
+                    else "NaN"
+                )
+                aoi_limit = (
+                    _fmt_mean_std("linucb_forced_reason_aoi_limit_rate", ".3f")
+                    if "linucb_forced_reason_aoi_limit_rate" in r
+                    else "NaN"
+                )
+                mae_limit = (
+                    _fmt_mean_std("linucb_forced_reason_mae_limit_rate", ".3f")
+                    if "linucb_forced_reason_mae_limit_rate" in r
+                    else "NaN"
+                )
+                both = (
+                    _fmt_mean_std("linucb_forced_reason_both_rate", ".3f")
+                    if "linucb_forced_reason_both_rate" in r
+                    else "NaN"
+                )
+                u_mean = (
+                    _fmt_mean_std("linucb_ucb_uncertainty_mean", ".3f")
+                    if "linucb_ucb_uncertainty_mean" in r
+                    else "NaN"
+                )
+                skip_dec = (
+                    _fmt_mean_std("linucb_rate_limit_skips_per_decision", ".3f")
+                    if "linucb_rate_limit_skips_per_decision" in r
+                    else "NaN"
+                )
+                q_max = (
+                    _fmt_mean_std("outbox_pending_max", ".1f")
+                    if "outbox_pending_max" in r
+                    else "NaN"
+                )
+                q_auc = (
+                    _fmt_mean_std("outbox_pending_auc_s", ".1f")
+                    if "outbox_pending_auc_s" in r
+                    else "NaN"
+                )
+                q_rec = (
+                    _fmt_mean_std("outbox_pending_recovery_s", ".1f")
+                    if "outbox_pending_recovery_s" in r
+                    else "NaN"
+                )
+                dup = (
+                    _fmt_mean_std("dup_bytes_ratio", ".3f") if "dup_bytes_ratio" in r else "NaN"
+                )
+                rx_p50 = (
+                    _fmt_mean_std("rx_delay_p50_ms", ".1f") if "rx_delay_p50_ms" in r else "NaN"
+                )
+                cells = [
+                    str(r["profile"]),
+                    str(r["sensor"]),
+                    n_dec,
+                    h_60s,
+                    switch,
+                    safe_forced,
+                    aoi_limit,
+                    mae_limit,
+                    both,
+                    u_mean,
+                    skip_dec,
+                    q_max,
+                    q_auc,
+                    q_rec,
+                    dup,
+                    rx_p50,
+                ]
+                lines.append("| " + " | ".join(cells) + " |")
     p.write_text("\n".join(lines), encoding="utf-8")
 
     # --- Baseline 비교(추가) ---
@@ -2002,12 +2463,48 @@ def main():
 
     df = load_events(args.input)
     df = dedup_and_sort(df)
+    try:
+        decisions = load_decisions(args.input)
+    except Exception as e:
+        print(f"[analyze] WARN: failed to load decisions logs: {e}")
+        decisions = pd.DataFrame()
+
+    meta = load_collector_meta(args.input)
     by_run = summarize_by_run(df)
+    if not meta.empty:
+        by_run = by_run.merge(meta, how="left", on=["run_id"])
+
+    arm_dist = pd.DataFrame()
+    entropy_win = pd.DataFrame()
+    arm_dist_path: Path | None = None
+    entropy_path: Path | None = None
+    if not decisions.empty:
+        dec_enriched = enrich_decisions_with_events(decisions, df)
+        diag_dec, arm_dist, entropy_win = summarize_decisions_diagnostics_by_run(
+            dec_enriched,
+            window_s=60,
+        )
+        if not diag_dec.empty:
+            by_run = by_run.merge(
+                diag_dec,
+                how="left",
+                on=["run_id", "profile", "policy", "sensor"],
+            )
     summary = summarize(by_run)
     baseline_policy = str(args.baseline_policy)
     comparisons = compare_policies(summary, baseline_policy=baseline_policy)
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    if not arm_dist.empty:
+        arm_dist_path = out_dir / "linucb_arm_distribution.csv"
+        arm_dist.sort_values(
+            ["run_id", "profile", "policy", "sensor", "arm_id"], kind="mergesort"
+        ).to_csv(arm_dist_path, index=False)
+    if not entropy_win.empty:
+        entropy_path = out_dir / "linucb_entropy_60s.csv"
+        entropy_win.sort_values(
+            ["run_id", "profile", "policy", "sensor", "window_idx"], kind="mergesort"
+        ).to_csv(entropy_path, index=False)
     # 저장
     csv_path = out_dir / "metrics_summary.csv"
     summary.to_csv(csv_path, index=False)
@@ -2025,11 +2522,6 @@ def main():
     figures = [] if args.no_plots else _try_make_plots(out_dir, summary)
     paper_figures: list[Path] = []
     if bool(args.paper_plots):
-        try:
-            decisions = load_decisions(args.input)
-        except Exception as e:
-            print(f"[analyze] WARN: failed to load decisions logs: {e}")
-            decisions = pd.DataFrame()
         try:
             paper_figures = _try_make_paper_plots(
                 out_dir,
@@ -2053,6 +2545,10 @@ def main():
     print(f"[analyze] saved: {csv_path}")
     print(f"[analyze] saved: {by_run_path}")
     print(f"[analyze] saved: {cmp_path}")
+    if arm_dist_path is not None:
+        print(f"[analyze] saved: {arm_dist_path}")
+    if entropy_path is not None:
+        print(f"[analyze] saved: {entropy_path}")
     if args.save_parquet:
         print(f"[analyze] saved: {pq_path}")
     if figures:

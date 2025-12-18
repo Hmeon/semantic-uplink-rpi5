@@ -147,6 +147,7 @@ class SensorPolicyRuntime:
                 profile=event.profile,
                 policy=event.policy,
                 aoi_ms=int(aoi_ms),
+                event_reason=event.event_reason,
             )
             rate_bps = self._rate_from_event(event, aoi_ms)
             self._last_sent_val = event.val
@@ -161,6 +162,20 @@ class SensorPolicyRuntime:
             )
             # 링크 사용량을 줄이기 위해 이벤트 발생 시에만 결정 메시지 송신
             if event is not None and decision is not None:
+                diag_enabled = bool(self._linucb.cfg.diagnostics_enabled)
+                reward_aoi = None
+                reward_mae = None
+                reward_rate = None
+                rate_limit_skips = None
+                if diag_enabled:
+                    cfg = self._linucb.cfg
+                    aoi_n = float(aoi_ms) / max(1e-9, cfg.aoi_scale_ms)
+                    mae_n = float(mae_est) / max(1e-9, cfg.mae_scale)
+                    rate_n = float(rate_bps) / max(1e-9, cfg.rate_scale_bps)
+                    reward_aoi = float(-(cfg.w_aoi * aoi_n))
+                    reward_mae = float(-(cfg.w_mae * mae_n))
+                    reward_rate = float(-(cfg.w_rate * rate_n))
+                    rate_limit_skips = int(self._predictor.consume_rate_limit_skips())
                 decision = PolicyDecisionMsg(
                     ts=int(ts_ns),
                     device_id=self.device_id,
@@ -172,6 +187,17 @@ class SensorPolicyRuntime:
                     tau=float(tau),
                     kbits=int(kbits),
                     reward=float(reward),
+                    arm_id=decision.arm_id,
+                    safe_arm_forced=decision.safe_arm_forced,
+                    forced_reason=decision.forced_reason,
+                    ucb_exploitation=decision.ucb_exploitation,
+                    ucb_exploration=decision.ucb_exploration,
+                    ucb_score=decision.ucb_score,
+                    ucb_alpha=decision.ucb_alpha,
+                    reward_aoi=reward_aoi,
+                    reward_mae=reward_mae,
+                    reward_rate=reward_rate,
+                    rate_limit_skips=rate_limit_skips,
                 )
 
         return StepResult(
@@ -221,6 +247,7 @@ def load_linucb_config(
     arms = [Arm(tau=float(a["tau"]), kbits=int(a["kbits"])) for a in arms_raw]
     reward = cfg_dict.get("reward", {}) or {}
     safety = cfg_dict.get("safety", {}) or {}
+    diagnostics = cfg_dict.get("diagnostics", {}) or {}
     return LinUCBConfig(
         device_id=device_id,
         sensor=sensor,
@@ -235,4 +262,5 @@ def load_linucb_config(
         mae_scale=float(mae_scale) if mae_scale is not None else 1.0,
         res_scale=float(res_scale) if res_scale is not None else 1.0,
         resvar_scale=float(resvar_scale) if resvar_scale is not None else 1.0,
+        diagnostics_enabled=bool(diagnostics.get("enabled", False)),
     )

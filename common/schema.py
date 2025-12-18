@@ -112,6 +112,7 @@ class EventMsg:
     profile: LinkProfile
     policy: PolicyMode
     aoi_ms: int | None = None  # 선택 필드(로그용)
+    event_reason: str | None = None
 
     # ---- 검증/정규화 ----
     def __post_init__(self):
@@ -143,6 +144,11 @@ class EventMsg:
             raise ValueError("kbits must be in [1, 16]")
 
         aoi_ms = None if self.aoi_ms is None else _ensure_nonneg_int("aoi_ms", self.aoi_ms)
+        event_reason = (
+            None
+            if self.event_reason is None
+            else _ensure_nonempty_str("event_reason", self.event_reason)
+        )
 
         object.__setattr__(self, "ts", ts)
         object.__setattr__(self, "seq", seq)
@@ -156,6 +162,7 @@ class EventMsg:
         object.__setattr__(self, "tau", tau)
         object.__setattr__(self, "kbits", kbits)
         object.__setattr__(self, "aoi_ms", aoi_ms)
+        object.__setattr__(self, "event_reason", event_reason)
 
     # ---- 직렬화/역직렬화 ----
     def to_dict(self) -> dict[str, Any]:
@@ -174,6 +181,8 @@ class EventMsg:
         }
         if self.aoi_ms is not None:
             d["aoi_ms"] = int(self.aoi_ms)
+        if self.event_reason is not None:
+            d["event_reason"] = str(self.event_reason)
         return d
 
     def to_json_bytes(self) -> bytes:
@@ -212,6 +221,11 @@ class EventMsg:
             profile=d["profile"],
             policy=d["policy"],
             aoi_ms=None if "aoi_ms" not in d or d["aoi_ms"] is None else int(d["aoi_ms"]),
+            event_reason=(
+                None
+                if "event_reason" not in d or d["event_reason"] is None
+                else str(d["event_reason"])
+            ),
         )
 
     @classmethod
@@ -258,6 +272,18 @@ class PolicyDecisionMsg:
     tau: float
     kbits: int
     reward: float
+    # --- optional diagnostics (enable via policy config) ---
+    arm_id: int | None = None
+    safe_arm_forced: bool | None = None
+    forced_reason: str | None = None
+    ucb_exploitation: float | None = None
+    ucb_exploration: float | None = None
+    ucb_score: float | None = None
+    ucb_alpha: float | None = None  # allows deriving uncertainty: u = exploration / alpha
+    reward_aoi: float | None = None
+    reward_mae: float | None = None
+    reward_rate: float | None = None
+    rate_limit_skips: int | None = None
 
     def __post_init__(self):
         ts = int(self.ts)
@@ -286,6 +312,51 @@ class PolicyDecisionMsg:
 
         reward = _ensure_finite("reward", self.reward)
 
+        arm_id = None if self.arm_id is None else _ensure_nonneg_int("arm_id", self.arm_id)
+
+        safe_arm_forced: bool | None
+        if self.safe_arm_forced is None:
+            safe_arm_forced = None
+        elif isinstance(self.safe_arm_forced, bool):
+            safe_arm_forced = self.safe_arm_forced
+        elif self.safe_arm_forced in (0, 1):
+            safe_arm_forced = bool(self.safe_arm_forced)
+        else:
+            raise TypeError("safe_arm_forced must be bool-like (bool/0/1)")
+
+        forced_reason = None
+        if self.forced_reason is not None:
+            forced_reason = _ensure_nonempty_str("forced_reason", self.forced_reason)
+
+        ucb_exploitation = (
+            None
+            if self.ucb_exploitation is None
+            else _ensure_finite("ucb_exploitation", self.ucb_exploitation)
+        )
+        ucb_exploration = None
+        if self.ucb_exploration is not None:
+            ucb_exploration = _ensure_finite("ucb_exploration", self.ucb_exploration)
+        ucb_score = None if self.ucb_score is None else _ensure_finite("ucb_score", self.ucb_score)
+        ucb_alpha = None if self.ucb_alpha is None else _ensure_finite("ucb_alpha", self.ucb_alpha)
+        if ucb_alpha is not None and ucb_alpha <= 0.0:
+            raise ValueError("ucb_alpha must be > 0")
+
+        reward_aoi = None
+        if self.reward_aoi is not None:
+            reward_aoi = _ensure_finite("reward_aoi", self.reward_aoi)
+        reward_mae = None
+        if self.reward_mae is not None:
+            reward_mae = _ensure_finite("reward_mae", self.reward_mae)
+        reward_rate = None
+        if self.reward_rate is not None:
+            reward_rate = _ensure_finite("reward_rate", self.reward_rate)
+
+        rate_limit_skips = (
+            None
+            if self.rate_limit_skips is None
+            else _ensure_nonneg_int("rate_limit_skips", self.rate_limit_skips)
+        )
+
         object.__setattr__(self, "ts", ts)
         object.__setattr__(self, "device_id", device_id)
         object.__setattr__(self, "state_aoi", state_aoi)
@@ -296,10 +367,21 @@ class PolicyDecisionMsg:
         object.__setattr__(self, "tau", tau)
         object.__setattr__(self, "kbits", kbits)
         object.__setattr__(self, "reward", reward)
+        object.__setattr__(self, "arm_id", arm_id)
+        object.__setattr__(self, "safe_arm_forced", safe_arm_forced)
+        object.__setattr__(self, "forced_reason", forced_reason)
+        object.__setattr__(self, "ucb_exploitation", ucb_exploitation)
+        object.__setattr__(self, "ucb_exploration", ucb_exploration)
+        object.__setattr__(self, "ucb_score", ucb_score)
+        object.__setattr__(self, "ucb_alpha", ucb_alpha)
+        object.__setattr__(self, "reward_aoi", reward_aoi)
+        object.__setattr__(self, "reward_mae", reward_mae)
+        object.__setattr__(self, "reward_rate", reward_rate)
+        object.__setattr__(self, "rate_limit_skips", rate_limit_skips)
 
     # 직렬화/역직렬화
     def to_dict(self) -> dict[str, Any]:
-        return {
+        d: dict[str, Any] = {
             "ts": self.ts,
             "device_id": self.device_id,
             "state_aoi": float(self.state_aoi),
@@ -311,6 +393,29 @@ class PolicyDecisionMsg:
             "kbits": int(self.kbits),
             "reward": float(self.reward),
         }
+        if self.arm_id is not None:
+            d["arm_id"] = int(self.arm_id)
+        if self.safe_arm_forced is not None:
+            d["safe_arm_forced"] = bool(self.safe_arm_forced)
+        if self.forced_reason is not None:
+            d["forced_reason"] = str(self.forced_reason)
+        if self.ucb_exploitation is not None:
+            d["ucb_exploitation"] = float(self.ucb_exploitation)
+        if self.ucb_exploration is not None:
+            d["ucb_exploration"] = float(self.ucb_exploration)
+        if self.ucb_score is not None:
+            d["ucb_score"] = float(self.ucb_score)
+        if self.ucb_alpha is not None:
+            d["ucb_alpha"] = float(self.ucb_alpha)
+        if self.reward_aoi is not None:
+            d["reward_aoi"] = float(self.reward_aoi)
+        if self.reward_mae is not None:
+            d["reward_mae"] = float(self.reward_mae)
+        if self.reward_rate is not None:
+            d["reward_rate"] = float(self.reward_rate)
+        if self.rate_limit_skips is not None:
+            d["rate_limit_skips"] = int(self.rate_limit_skips)
+        return d
 
     def to_json_bytes(self) -> bytes:
         return _json_dumps(self.to_dict())
@@ -333,6 +438,53 @@ class PolicyDecisionMsg:
             tau=float(d["tau"]),
             kbits=int(d["kbits"]),
             reward=float(d["reward"]),
+            arm_id=None if "arm_id" not in d or d["arm_id"] is None else int(d["arm_id"]),
+            safe_arm_forced=(
+                None
+                if "safe_arm_forced" not in d or d["safe_arm_forced"] is None
+                else d["safe_arm_forced"]
+            ),
+            forced_reason=(
+                None
+                if "forced_reason" not in d or d["forced_reason"] is None
+                else str(d["forced_reason"])
+            ),
+            ucb_exploitation=(
+                None
+                if "ucb_exploitation" not in d or d["ucb_exploitation"] is None
+                else float(d["ucb_exploitation"])
+            ),
+            ucb_exploration=(
+                None
+                if "ucb_exploration" not in d or d["ucb_exploration"] is None
+                else float(d["ucb_exploration"])
+            ),
+            ucb_score=(
+                None if "ucb_score" not in d or d["ucb_score"] is None else float(d["ucb_score"])
+            ),
+            ucb_alpha=(
+                None if "ucb_alpha" not in d or d["ucb_alpha"] is None else float(d["ucb_alpha"])
+            ),
+            reward_aoi=(
+                None
+                if "reward_aoi" not in d or d["reward_aoi"] is None
+                else float(d["reward_aoi"])
+            ),
+            reward_mae=(
+                None
+                if "reward_mae" not in d or d["reward_mae"] is None
+                else float(d["reward_mae"])
+            ),
+            reward_rate=(
+                None
+                if "reward_rate" not in d or d["reward_rate"] is None
+                else float(d["reward_rate"])
+            ),
+            rate_limit_skips=(
+                None
+                if "rate_limit_skips" not in d or d["rate_limit_skips"] is None
+                else int(d["rate_limit_skips"])
+            ),
         )
 
     @classmethod

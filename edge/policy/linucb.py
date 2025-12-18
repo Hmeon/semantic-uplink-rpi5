@@ -67,6 +67,9 @@ class LinUCBConfig:
     # 세이프 팔 (None이면 자동: tau 최소, kbits 최대)
     safe_arm: Arm | None = None
 
+    # Telemetry (default: off). When enabled, policy emits lightweight diagnostics scalars.
+    diagnostics_enabled: bool = False
+
 
 @dataclass(slots=True, frozen=True)
 class PolicyState:
@@ -153,8 +156,12 @@ class LinUCBPolicy:
         현재 상태에 대한 (τ,k) 결정을 수행하고 PolicyDecisionMsg를 반환한다.
         - reward 필드는 0.0으로 기록(실제 보상은 observe_outcome에서 적용)
         """
+        aoi_limit = bool(state.aoi_ms >= self.cfg.aoi_max_ms)
+        mae_limit = bool(abs(state.res) >= self.cfg.mae_max)
+        safe_forced = bool(aoi_limit or mae_limit)
+
         # 안전가드
-        if (state.aoi_ms >= self.cfg.aoi_max_ms) or (abs(state.res) >= self.cfg.mae_max):
+        if safe_forced:
             arm_idx = self._safe_idx
         else:
             # 워밍업: 시도 횟수 미달 팔부터 순서대로 사용
@@ -168,6 +175,43 @@ class LinUCBPolicy:
             )
             self._last_logged_arm_idx = arm_idx
         x = self._context(state)
+
+        diag: dict[str, object] = {}
+        if bool(self.cfg.diagnostics_enabled):
+            forced_reason = "NONE"
+            if safe_forced:
+                if aoi_limit and mae_limit:
+                    forced_reason = "BOTH"
+                elif aoi_limit:
+                    forced_reason = "AOI_LIMIT"
+                else:
+                    forced_reason = "MAE_LIMIT"
+
+            a_mat = self._A[arm_idx]
+            b_vec = self._b[arm_idx]
+            try:
+                theta = np.linalg.solve(a_mat, b_vec)
+            except np.linalg.LinAlgError:
+                theta = np.zeros_like(b_vec)
+            exploitation = float(np.dot(theta, x))
+            try:
+                a_x = np.linalg.solve(a_mat, x)
+                uncertainty = float(np.sqrt(max(0.0, float(np.dot(x, a_x)))))
+            except np.linalg.LinAlgError:
+                uncertainty = 0.0
+            exploration = float(self.cfg.alpha_ucb * uncertainty)
+            score = float(exploitation + exploration)
+
+            diag = {
+                "arm_id": int(arm_idx),
+                "safe_arm_forced": bool(safe_forced),
+                "forced_reason": str(forced_reason),
+                "ucb_exploitation": float(exploitation),
+                "ucb_exploration": float(exploration),
+                "ucb_score": float(score),
+                # Store alpha to allow deriving uncertainty in analysis: u = exploration / alpha
+                "ucb_alpha": float(self.cfg.alpha_ucb),
+            }
 
         # 학습용 버퍼에 기록(직전 결정)
         self._last_x = x
@@ -186,6 +230,7 @@ class LinUCBPolicy:
             tau=float(arm.tau),
             kbits=int(arm.kbits),
             reward=0.0,
+            **diag,
         )
         return (arm.tau, arm.kbits), msg
 

@@ -48,6 +48,7 @@ class EWMAConfig:
     vmin: float | None = None
     vmax: float | None = None
     bootstrap_emit: bool = True
+    diagnostics_enabled: bool = False
 
 
 class EWMAPredictor:
@@ -70,6 +71,7 @@ class EWMAPredictor:
         self._last_pred: float | None = None
         self._last_emit_ns: int | None = None
         self._boot_emitted: bool = False
+        self._rate_limit_skips: int = 0
 
     # ---------------- 공용 API ----------------
 
@@ -139,9 +141,17 @@ class EWMAPredictor:
         if should_emit and min_emit_ms > 0 and self._last_emit_ns is not None:
             if now_ns - self._last_emit_ns < int(min_emit_ms * 1e6):
                 should_emit = False  # rate-limit
+                if bool(self.cfg.diagnostics_enabled):
+                    self._rate_limit_skips += 1
 
         evt: EventMsg | None = None
         if should_emit:
+            event_reason: str | None = None
+            if bool(self.cfg.diagnostics_enabled):
+                if emit_due_to_resid:
+                    event_reason = "THRESHOLD"
+                elif emit_due_to_hb:
+                    event_reason = "HEARTBEAT"
             qv = self._quantizer(kbits).quantize(x_raw).q  # 대표값(실수)
             evt = EventMsg(
                 ts=int(ts_ns),
@@ -156,6 +166,7 @@ class EWMAPredictor:
                 profile=self.cfg.profile,
                 policy=policy,
                 aoi_ms=None,                      # 수집기 기준 계산. 엣지에서는 기록 생략.
+                event_reason=event_reason,
             )
             self._last_emit_ns = now_ns
             if emit_due_to_boot:
@@ -164,6 +175,17 @@ class EWMAPredictor:
         # 상태 업데이트(EWMA)
         self._update_ewma(x_raw)
         return evt
+
+    def consume_rate_limit_skips(self) -> int:
+        """
+        Return and reset the number of rate-limited "would-have-emitted" events since last consume.
+        Logged only on policy decision to keep overhead negligible.
+        """
+        if not bool(self.cfg.diagnostics_enabled):
+            return 0
+        n = int(self._rate_limit_skips)
+        self._rate_limit_skips = 0
+        return n
 
     def run(
         self, sample_iter: Iterator[Any], duration_s: float | None = None

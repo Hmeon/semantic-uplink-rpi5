@@ -148,6 +148,10 @@ class Collector:
             "subscribed topics."
         )
 
+    def _on_disconnect(self, client: mqtt.Client, userdata, rc, properties=None):
+        # Broker outage / network flap is a normal scenario; keep the process alive.
+        print(f"[collector] disconnected rc={rc}")
+
     def _on_message(self, client: mqtt.Client, userdata, msg: mqtt.MQTTMessage):
         t_recv_ns = time.time_ns()
         self._last_ns = t_recv_ns
@@ -251,6 +255,9 @@ class Collector:
         kbits = int(data["kbits"])
         profile = str(data["profile"])
         policy = str(data["policy"])
+        event_reason = None
+        if "event_reason" in data and data["event_reason"] is not None:
+            event_reason = str(data["event_reason"])
 
         # 수신 즉시 AoI(ms) 계산(저장은 하지 않음; 로그/모니터링용)
         aoi_ms = (t_recv_ns - ts_ns - int(self.cfg.clock_offset_ns)) / 1e6
@@ -278,6 +285,7 @@ class Collector:
                     "sensor": sensor,
                     "profile": profile,
                     "policy": policy,
+                    "event_reason": event_reason,
                     "seq": seq,
                     "ts_ns": ts_ns,
                     "t_recv_ns": int(t_recv_ns),
@@ -331,6 +339,21 @@ class Collector:
             "reward": float(data["reward"]),
             "topic": topic,
         }
+        for k in [
+            "arm_id",
+            "safe_arm_forced",
+            "forced_reason",
+            "ucb_exploitation",
+            "ucb_exploration",
+            "ucb_score",
+            "ucb_alpha",
+            "reward_aoi",
+            "reward_mae",
+            "reward_rate",
+            "rate_limit_skips",
+        ]:
+            if k in data and data[k] is not None:
+                rec[k] = data[k]
         with self._lock:
             self._pending_decisions.append(rec)
             self._decisions_total += 1
@@ -413,6 +436,7 @@ class Collector:
                         "sensor": "string",
                         "profile": "string",
                         "policy": "string",
+                        "event_reason": "string",
                         "seq": "uint64",
                         "ts_ns": "int64",
                         "t_recv_ns": "int64",
@@ -434,6 +458,35 @@ class Collector:
 
                 if pending_decisions and decisions_part is not None:
                     df_d = pd.DataFrame.from_records(list(pending_decisions))
+                    dtype_map = {
+                        "ts": "int64",
+                        "t_recv_ns": "int64",
+                        "device_id": "string",
+                        "state_aoi": "float64",
+                        "state_res": "float64",
+                        "state_res_var": "float64",
+                        "state_loss": "float64",
+                        "state_q_len": "int64",
+                        "tau": "float32",
+                        "kbits": "int16",
+                        "reward": "float64",
+                        "topic": "string",
+                        # optional diagnostics
+                        "arm_id": "Int64",
+                        "safe_arm_forced": "boolean",
+                        "forced_reason": "string",
+                        "ucb_exploitation": "float64",
+                        "ucb_exploration": "float64",
+                        "ucb_score": "float64",
+                        "ucb_alpha": "float64",
+                        "reward_aoi": "float64",
+                        "reward_mae": "float64",
+                        "reward_rate": "float64",
+                        "rate_limit_skips": "Int64",
+                    }
+                    for c, dt in dtype_map.items():
+                        if c in df_d.columns:
+                            df_d[c] = df_d[c].astype(dt)
                     _write_parquet(df_d, f"decisions_{decisions_part:06d}.parquet")
                     decisions_written = len(df_d)
                     decisions_ok = True
@@ -486,8 +539,14 @@ class Collector:
         )
         self._client.on_connect = self._on_connect
         self._client.on_message = self._on_message
+        self._client.on_disconnect = self._on_disconnect
+        try:
+            self._client.reconnect_delay_set(min_delay=1, max_delay=60)
+        except Exception:
+            pass
         # subscriber side는 username/password 필요시 환경변수 등으로 확장
-        self._client.connect(self.cfg.broker, self.cfg.port, keepalive=60)
+        # connect_async keeps the collector alive even when the broker is down on startup.
+        self._client.connect_async(self.cfg.broker, self.cfg.port, keepalive=60)
         self._client.loop_start()
 
         # 주기적 플러시(원자적 저장)

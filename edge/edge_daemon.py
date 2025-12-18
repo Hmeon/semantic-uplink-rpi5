@@ -457,24 +457,28 @@ class EdgeDaemon:
 
     def _mic_loop(self):
         cfg = self.mic_cfg
-        # 센서 준비
-        self._mic_obj = MicRMS(
-            device_id=self.device_id,
-            sample_rate=cfg.sample_rate,
-            frame_ms=cfg.frame_ms,
-            backend=cfg.backend,
-            arecord_device=cfg.arecord_device,
-            sounddevice_device=cfg.sounddevice_device,
-        )
-        self._mic_policy = self._build_policy_runtime(
-            sensor=SensorType.MIC_RMS,
-            alpha=cfg.alpha,
-            tau=cfg.tau,
-            kbits=cfg.kbits,
-            heartbeat_s=cfg.heartbeat_s,
-            min_emit_ms=cfg.min_emit_ms,
-            nominal_period_s=cfg.frame_ms / 1000.0,
-        )
+        try:
+            # 센서 준비
+            self._mic_obj = MicRMS(
+                device_id=self.device_id,
+                sample_rate=cfg.sample_rate,
+                frame_ms=cfg.frame_ms,
+                backend=cfg.backend,
+                arecord_device=cfg.arecord_device,
+                sounddevice_device=cfg.sounddevice_device,
+            )
+            self._mic_policy = self._build_policy_runtime(
+                sensor=SensorType.MIC_RMS,
+                alpha=cfg.alpha,
+                tau=cfg.tau,
+                kbits=cfg.kbits,
+                heartbeat_s=cfg.heartbeat_s,
+                min_emit_ms=cfg.min_emit_ms,
+                nominal_period_s=cfg.frame_ms / 1000.0,
+            )
+        except Exception as e:
+            print(f"[edge] mic init failed: {e}")
+            return
         print(
             f"[edge] mic loop started: {self._mic_obj!r} mode={self.mode.value} "
             f"α={cfg.alpha} τ={cfg.tau} k={cfg.kbits}"
@@ -500,23 +504,27 @@ class EdgeDaemon:
 
     def _temp_loop(self):
         cfg = self.temp_cfg
-        # 센서 준비
-        self._temp_obj = TempSensor(
-            device_id=self.device_id,
-            backend=cfg.backend,
-            sample_hz=cfg.sample_hz,
-            w1_path=cfg.w1_path,
-            sysfs_path=cfg.sysfs_path,
-        )
-        self._temp_policy = self._build_policy_runtime(
-            sensor=SensorType.TEMP,
-            alpha=cfg.alpha,
-            tau=cfg.tau,
-            kbits=cfg.kbits,
-            heartbeat_s=cfg.heartbeat_s,
-            min_emit_ms=cfg.min_emit_ms,
-            nominal_period_s=(1.0 / cfg.sample_hz) if cfg.sample_hz > 0 else 1.0,
-        )
+        try:
+            # 센서 준비
+            self._temp_obj = TempSensor(
+                device_id=self.device_id,
+                backend=cfg.backend,
+                sample_hz=cfg.sample_hz,
+                w1_path=cfg.w1_path,
+                sysfs_path=cfg.sysfs_path,
+            )
+            self._temp_policy = self._build_policy_runtime(
+                sensor=SensorType.TEMP,
+                alpha=cfg.alpha,
+                tau=cfg.tau,
+                kbits=cfg.kbits,
+                heartbeat_s=cfg.heartbeat_s,
+                min_emit_ms=cfg.min_emit_ms,
+                nominal_period_s=(1.0 / cfg.sample_hz) if cfg.sample_hz > 0 else 1.0,
+            )
+        except Exception as e:
+            print(f"[edge] temp init failed: {e}")
+            return
         print(
             f"[edge] temp loop started: {self._temp_obj!r} mode={self.mode.value} "
             f"α={cfg.alpha} τ={cfg.tau} k={cfg.kbits}"
@@ -586,6 +594,9 @@ class EdgeDaemon:
         min_emit_ms: int,
         nominal_period_s: float | None,
     ) -> SensorPolicyRuntime:
+        diag_enabled = False
+        if self.mode == PolicyMode.ADAPTIVE:
+            diag_enabled = bool((self._arms_cfg.get("diagnostics") or {}).get("enabled", False))
         ewma_cfg = EWMAConfig(
             device_id=self.device_id,
             sensor=sensor,
@@ -596,6 +607,7 @@ class EdgeDaemon:
             heartbeat_s=heartbeat_s,
             min_emit_interval_ms=min_emit_ms,
             bootstrap_emit=True,
+            diagnostics_enabled=diag_enabled,
         )
         linucb_cfg = None
         if self.mode == PolicyMode.ADAPTIVE:
