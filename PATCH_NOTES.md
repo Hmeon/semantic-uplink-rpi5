@@ -4,6 +4,34 @@
 
 ---
 
+## 2025-12-19 — 지표/시각화 고품질 보증 + 로그 체계 확립
+
+### ✅ Quality audit (보고서/논문용 QC 증빙)
+- `python -m collector.analyze ... --audit` 실행 시 아래 산출물이 생성됩니다.
+  - `quality_audit.json` / `quality_audit.md` (PASS/FAIL/SKIP + 근거)
+  - `plot_manifest.json` (그림 메타: label 등 — audit가 라벨 누락을 검사)
+- Audit 체크 항목: 기대 그림(데이터 기반)↔실제 생성, 네이밍 규칙, PNG DPI≥300, 최소 파일 크기,
+  NaN/inf 비율, 라벨 누락, `print()` 잔존, 예외 traceback 로깅(규칙 기반)
+
+### ✅ Plot 규격화(기본 high-quality)
+- 기본 저장 디렉터리: `figs/` (옵션 `--plot-dir`)
+- 기본 포맷/품질: `--plot-formats png,pdf`, `--plot-dpi 300`, `bbox_inches="tight"` + `tight_layout()`
+- 네이밍/라벨 규칙 문서: `docs/metrics/FIGURE_NAMING.md`, `docs/metrics/LABEL_STYLE.md`
+
+### ✅ Logging 표준화(운영/재현/디버깅)
+- 공통 초기화: `common/logging_setup.py` (timestamp 포함, console+file rotation)
+  - CLI: `--log-level`, `--log-file`, `--log-max-bytes`, `--log-backup-count`, `--no-log-console`
+- 디버깅(성능 가드): `configs/policy.yaml`에서 `diagnostics.enabled: true` + 실행 `--log-level DEBUG`
+  - 한 줄 `policy_diag key=value ...` 형태로 핵심 필드 출력
+
+### ⚠️ 현재 남은 커버리지(정상 SKIP 조건)
+- LinUCB diagnostics(보상 구성요소 포함)은 `diagnostics.enabled: false`(기본)일 때 수집/그림이 **SKIP**됩니다.
+  - reward components 그림: `*_reward_components_bar.*` 는 `reward_aoi/reward_mae/reward_rate`가 없으면 SKIP
+- `dup_bytes_ratio`는 `artifacts/<run_id>/logs/collector_meta.json`이 없으면 NaN/SKIP입니다.
+- Outbox backlog(`outbox_pending_*`)는 decisions 로그에 `state_q_len`이 없으면 NaN/SKIP입니다.
+
+---
+
 ## 2025-12-17 — RPi 5 호환성 패치 (Hardware Compatibility)
 
 ### ✅ RPi 5 호환성 해결
@@ -72,9 +100,11 @@
 - 문서도 평가 산출물 기준으로 보강했습니다.
   - `README.md`, `CODEX.md`: 분석 산출물(3종 CSV + report + figures)과 반복 실험 워크플로우를 반영
 - plotting 의존성 추가
-  - `requirements.txt`, `pyproject.toml`에 `matplotlib`을 추가하여 figures 생성이 기본 환경에서 동작하도록 했습니다.
-- 논문용 추가 플롯(`paper_*.png`)
-  - reward over time, predicted regret, LinUCB θ(weight) 수렴, action heatmap, stability(|res|), 타임라인(annotated) 등을 `collector/analyze.py`가 자동 생성합니다.
+   - `requirements.txt`, `pyproject.toml`에 `matplotlib`을 추가하여 figures 생성이 기본 환경에서 동작하도록 했습니다.
+- 논문용 추가 플롯(추가 패널)
+  - 예: `*_env_metrics_panel.*`, `*_action_heatmap.*`, `*_feature_weights__*.*`, `*_reward_ts__*.*`,
+    `*_cumulative_regret__*.*`, `*_stability_abs_res_ts__*.*`, `*_timeline__*.*`
+  - 위 플롯은 `collector/analyze.py`의 `--paper-plots`로 on/off 가능합니다(기본 ON).
 
 ---
 

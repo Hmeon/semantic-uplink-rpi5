@@ -99,11 +99,16 @@ Edge는 기본적으로 `artifacts/<ts>_<device_id>/` 형태의 run-dir를 만�
   - 보조 컬럼: `event_rate_hz`, `send_ratio`(SEQ gap 기반), `rx_delay_*`(t_recv_ns가 있을 때)
 - `results/<run_id>/metrics_by_run.csv` (run 단위 지표; 리플리케이트 확인용)
 - `results/<run_id>/metrics_vs_periodic.csv` (baseline 대비 변화량/개선율)
-- `results/<run_id>/report.md` (표 + baseline 비교 + (옵션) figures 임베드)
-- (옵션) `results/<run_id>/figures/*.png` (막대/파레토 이미지; `matplotlib` 설치 시 생성)
-- (paper-plots, 기본 ON) `results/<run_id>/figures/paper_*.png` (reward/regret/θ/히트맵/타임라인 등 논문용 추가 플롯)
+- `results/<run_id>/report.md` (표 + baseline 비교 + (옵션) `figs/` 임베드)
+- (plots, 기본 ON) `results/<run_id>/figs/` (보고서/논문용 그림; 기본 `png,pdf`, DPI=300)
+  - 네이밍 규칙: `docs/metrics/FIGURE_NAMING.md`
+  - 라벨 규칙: `docs/metrics/LABEL_STYLE.md`
+- (paper-plots, 기본 ON) 추가 패널(예): `*_env_metrics_panel.*`, `*_action_heatmap.*`, `*_feature_weights__*.*`
   - 비활성화: `python -m collector.analyze ... --no-paper-plots`
   - 튜닝: `--reward-window`, `--action-bins`, `--top-actions`, `--cellular-var-period-s`, `--policy-config`
+- (audit, 기본 OFF) `--audit` 실행 시: `quality_audit.json/.md` (QC 리포트)
+  - 참고: plots가 생성되면 `plot_manifest.json`도 함께 저장됩니다(라벨 audit용).
+  - 단독 실행: `python -m collector.quality_audit --analysis-dir results/<run_id>`
 - (옵션) `--save-parquet` → `metrics_summary.parquet`
 
 ---

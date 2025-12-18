@@ -11,7 +11,7 @@ so that:
 
 `{sensor}_{profile}_{policy}_{metric}[__{run_id}].{ext}`
 
-- `sensor`: sensor name (e.g., `temp`, `cellular_var`)
+- `sensor`: sensor name (e.g., `temp`, `mic`); cross-sensor aggregations may use `all`
 - `profile`: link profile name; multi-profile aggregations MUST use `all`
 - `policy`: policy name; multi-policy comparisons MUST use `compare`
 - `metric`: plot identifier (snake_case)
@@ -33,4 +33,3 @@ To avoid filesystem and Markdown issues, any `/`, `\`, spaces, `:`, `|` must be 
 
 `python -m collector.quality_audit --analysis-dir <DIR>` enforces this rule and marks violations
 as **FAIL**.
-
