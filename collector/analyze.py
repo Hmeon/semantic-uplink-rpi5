@@ -455,6 +455,31 @@ def enrich_decisions_with_events(decisions: pd.DataFrame, events: pd.DataFrame) 
     # 기본값
     out["sensor"] = out.get("sensor", "unknown").fillna("unknown").astype("string")
     out["profile"] = out.get("profile", "unknown").fillna("unknown").astype("string")
+
+    # Fallback: if events contain a single sensor/profile per run_id, fill unknown decisions.
+    run_sensor = (
+        e.groupby("run_id")["sensor"].agg(lambda s: s.dropna().unique())
+        if "run_id" in e.columns and "sensor" in e.columns
+        else None
+    )
+    if run_sensor is not None:
+        sensor_map = {rid: vals[0] for rid, vals in run_sensor.items() if len(vals) == 1}
+        if sensor_map:
+            mask = out["sensor"] == "unknown"
+            out.loc[mask, "sensor"] = out.loc[mask, "run_id"].map(sensor_map).fillna("unknown")
+
+    run_profile = (
+        e.groupby("run_id")["profile"].agg(lambda s: s.dropna().unique())
+        if "run_id" in e.columns and "profile" in e.columns
+        else None
+    )
+    if run_profile is not None:
+        profile_map = {rid: vals[0] for rid, vals in run_profile.items() if len(vals) == 1}
+        if profile_map:
+            mask = out["profile"] == "unknown"
+            out.loc[mask, "profile"] = (
+                out.loc[mask, "run_id"].map(profile_map).fillna("unknown")
+            )
     # 정책 모드: decision은 adaptive에서만 생성되는 것이 일반적이므로 unknown이면 adaptive로 보정
     out["policy"] = out.get("policy", "adaptive").fillna("adaptive").astype("string")
 
@@ -2043,7 +2068,7 @@ def _try_make_plots(
                 ax.set_xticklabels([lab for _, lab in comp_cols], rotation=0)
                 ax.set_xlabel(LABEL_COMPONENT)
                 ax.set_ylabel("Reward component [reward units]")
-                ax.set_title(f"Reward components (mean) 쨌 {sensor_s}/{prof_s}")
+                ax.set_title(f"Reward components (mean) - {sensor_s}/{prof_s}")
                 ax.grid(axis="y", alpha=0.25)
                 ax.set_axisbelow(True)
                 ax.legend(loc="best", frameon=True)
