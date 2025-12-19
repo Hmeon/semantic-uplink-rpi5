@@ -2275,7 +2275,7 @@ def _try_make_pipeline_plots(
                 fig, ax = plt.subplots(figsize=(7.4, 4.2))
                 bp = ax.boxplot(
                     data,
-                    labels=labels,
+                    tick_labels=labels,
                     showfliers=False,
                     patch_artist=True,
                     medianprops={"color": "#111827", "linewidth": 1.8},
@@ -3756,7 +3756,7 @@ def _try_make_diagnostic_plots(
                 fig, ax = plt.subplots(figsize=(7.4, 4.2))
                 bp = ax.boxplot(
                     data,
-                    labels=labels,
+                    tick_labels=labels,
                     showfliers=False,
                     patch_artist=True,
                     medianprops={"color": "#111827", "linewidth": 1.8},
