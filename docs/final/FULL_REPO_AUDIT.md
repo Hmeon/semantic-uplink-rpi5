@@ -1,6 +1,6 @@
 # Full repository audit
 
-- Generated: 2025-12-19T17:49:00Z
+- Generated: 2025-12-19T18:06:20Z
 - Scope: all files in repo excluding .git and .venv* directories
 
 ## Findings by category
@@ -13,11 +13,13 @@
 ### Minor
 - Matplotlib boxplot deprecation warnings addressed by switching to `tick_labels` (no output change).
 - Editable install failed due to package discovery; fixed by explicit package list in `pyproject.toml`.
+- RPi5 install guidance aligned to `pip install -e .[analysis,hw]` and hw extras now include gpiozero/rpi-lgpio.
 
 ## Issues (Symptom -> Root cause -> Fix -> Verification)
 - Editable install failed in clean venv -> setuptools auto-discovery found multiple top-level dirs -> added explicit `tool.setuptools.packages.find` -> `pip install -e .[dev,analysis]` succeeded.
 - Matplotlib deprecation warning on boxplot labels -> old `labels` kwarg -> updated to `tick_labels` -> reran `collector.analyze` with no warnings.
 - RPi5 profiling missing -> no hardware run in this audit -> document runbook + require on-device run -> `scripts/bench_policy_rpi5.py` output recorded from host.
+- RPi5 install docs outdated -> requirements vs extras mismatch -> updated README/CODEX/AGENTS and hw extras -> verify by inspecting docs and `pyproject.toml`.
 
 ## Per-file status table
 | path | category | status | notes |

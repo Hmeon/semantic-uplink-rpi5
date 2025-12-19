@@ -13,7 +13,7 @@
 ## Build, Test, and Development Commands
 ```bash
 python -m venv .venv && source .venv/bin/activate
-pip install -e .[dev]                # editable install with test/lint tools
+pip install -e .[dev,analysis,hw]     # editable install (dev + plots + hardware extras)
 ruff check .                         # lint (line length 100; see pyproject.toml)
 pytest -q                            # unit + integration tests (pytest-asyncio enabled)
 

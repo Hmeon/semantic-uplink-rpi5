@@ -179,7 +179,9 @@ sudo apt install -y mosquitto mosquitto-clients iproute2 python3-venv python3-de
  
  # 파이썬 가상환경
  python3 -m venv .venv && source .venv/bin/activate
- pip install -r requirements.txt
+ pip install -e .[analysis,hw]
+ # dev/test: pip install -e .[dev,analysis,hw]
+ # fallback: pip install -r requirements.txt
  
  # 브로커 실행(옵션)
  # - (A) systemd로 상시 실행
@@ -435,7 +437,7 @@ Codex(또는 다른 에이전트형 도구)로 이 저장소를 열었을 때 �
 
 ## 기여 · Contributing
 ```bash
-pip install -e .[dev]
+pip install -e .[dev,analysis,hw]
 ruff check .
 pytest -q --cov=common --cov=collector --cov=edge --cov=link --cov-report=term-missing --cov-fail-under=20
 ```
@@ -495,7 +497,9 @@ Learning diagnostics (adaptive only; `--paper-plots` under `figs/`):
 sudo apt update && sudo apt full-upgrade -y
 sudo apt install -y mosquitto mosquitto-clients iproute2 python3-venv python3-dev build-essential libportaudio2
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .[analysis,hw]
+# dev/test: pip install -e .[dev,analysis,hw]
+# fallback: pip install -r requirements.txt
 sudo systemctl enable mosquitto && sudo systemctl start mosquitto
 ```
 
@@ -585,7 +589,7 @@ Current status:
 
 ## Contributing
 ```bash
-pip install -e .[dev]
+pip install -e .[dev,analysis,hw]
 ruff check .
 pytest -q --cov=common --cov=collector --cov=edge --cov=link --cov-report=term-missing --cov-fail-under=20
 ```

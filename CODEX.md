@@ -132,7 +132,9 @@ Edge는 기본적으로 `artifacts/<ts>_<device_id>/` 형태의 run-dir를 만�
 sudo apt update && sudo apt full-upgrade -y
 sudo apt install -y mosquitto mosquitto-clients iproute2 python3-venv python3-dev build-essential libportaudio2
 python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e .[analysis,hw]
+# dev/test: pip install -e .[dev,analysis,hw]
+# fallback: pip install -r requirements.txt
 sudo systemctl enable mosquitto && sudo systemctl start mosquitto
 ```
 
