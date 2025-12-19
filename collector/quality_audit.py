@@ -4,6 +4,7 @@ import argparse
 import ast
 import json
 import logging
+import math
 import re
 import struct
 from collections import Counter
@@ -482,6 +483,12 @@ def _audit_policy_diag_debug_log(path: Path) -> dict[str, Any]:
         "reward_mae",
         "reward_rate",
         "rate_limit_skips",
+        "t_predict_ms",
+        "t_decide_ms",
+        "t_observe_ms",
+        "t_step_ms",
+        "cpu_step_ms",
+        "maxrss_kb",
     ]
 
     if not path.exists():
@@ -518,9 +525,12 @@ def run_quality_audit(
     analysis_dir: Path,
     *,
     figs_dir_name: str = "figs",
-    min_png_bytes: int = 12_000,
+    min_png_bytes: int = 20_000,
     min_pdf_bytes: int = 2_000,
+    min_png_width: int = 1200,
+    min_png_height: int = 800,
     require_png_dpi: int = 300,
+    require_vector: bool = True,
     code_roots: tuple[str, ...] = ("edge", "collector", "common", "link", "stack"),
 ) -> dict[str, Any]:
     analysis_dir = Path(analysis_dir)
@@ -532,11 +542,61 @@ def run_quality_audit(
 
     summary = pd.read_csv(summary_path) if summary_path.exists() else pd.DataFrame()
     by_run = pd.read_csv(by_run_path) if by_run_path.exists() else pd.DataFrame()
+    arm_dist_path = analysis_dir / "linucb_arm_distribution.csv"
+    entropy_path = analysis_dir / "linucb_entropy_60s.csv"
+    arm_dist = pd.read_csv(arm_dist_path) if arm_dist_path.exists() else pd.DataFrame()
+    entropy = pd.read_csv(entropy_path) if entropy_path.exists() else pd.DataFrame()
+
+    meta_path = analysis_dir / "analysis_meta.json"
+    meta: dict[str, Any] = {}
+    flags: dict[str, Any] = {}
+    plot_cfg_meta: dict[str, Any] = {}
+    if meta_path.exists():
+        try:
+            meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            flags = meta.get("flags", {}) or {}
+            plot_cfg_meta = meta.get("plot_cfg", {}) or {}
+        except Exception:
+            meta = {}
+            flags = {}
+            plot_cfg_meta = {}
+
+    plots_enabled = bool(flags.get("plots", True))
+    diagnostic_plots_enabled = bool(flags.get("diagnostic_plots", False))
+    ucb_timeseries_enabled = bool(flags.get("ucb_timeseries", False))
+    pareto_p95_enabled = bool(flags.get("pareto_p95", False))
 
     figure_files: list[Path] = []
     if figs_dir is not None:
         figure_files = [p for p in figs_dir.iterdir() if p.is_file()]
-    plot_formats = _infer_plot_formats(figs_dir) if figs_dir is not None else ("png",)
+    meta_formats = [
+        str(x).lower()
+        for x in (plot_cfg_meta.get("formats", []) if isinstance(plot_cfg_meta, dict) else [])
+        if x
+    ]
+    plot_formats = (
+        tuple(meta_formats) if meta_formats else _infer_plot_formats(figs_dir)
+    ) if figs_dir is not None else ("png",)
+    format_audit = {"status": "PASS", "reason": "ok", "details": {"formats": plot_formats}}
+    if not plots_enabled or figs_dir is None:
+        format_audit = {
+            "status": "SKIP",
+            "reason": "plots disabled or figs dir missing",
+            "details": {"formats": plot_formats},
+        }
+    if format_audit.get("status") == "PASS":
+        if "png" not in plot_formats:
+            format_audit = {
+                "status": "FAIL",
+                "reason": "PNG format missing",
+                "details": {"formats": plot_formats},
+            }
+        if bool(require_vector) and not any(fmt in {"pdf", "svg"} for fmt in plot_formats):
+            format_audit = {
+                "status": "FAIL",
+                "reason": "vector format missing (pdf/svg)",
+                "details": {"formats": plot_formats},
+            }
 
     # Allowed naming values (data-driven)
     sensors: set[str] = {"all"}
@@ -559,7 +619,9 @@ def run_quality_audit(
     # ---------------- Expected figure list (data-driven) ----------------
     expected: list[ExpectedFigure] = []
 
-    if not summary.empty and {"profile", "sensor", "policy"}.issubset(summary.columns):
+    if plots_enabled and not summary.empty and {"profile", "sensor", "policy"}.issubset(
+        summary.columns
+    ):
         for (prof, sensor), g in summary.groupby(["profile", "sensor"], sort=False, dropna=False):
             prof_s = str(prof)
             sensor_s = str(sensor)
@@ -674,6 +736,36 @@ def run_quality_audit(
                         details={"driver_cols": ["rate_Bps", "aoi_mean_ms"]},
                     )
                 )
+            if bool(pareto_p95_enabled):
+                base = fig_basename(
+                    sensor=sensor_s,
+                    profile=prof_s,
+                    policy="compare",
+                    metric="pareto_rate_vs_aoi_p95",
+                )
+                if {"rate_Bps", "aoi_p95_ms"}.issubset(g.columns) and (
+                    _isfinite_series(g["rate_Bps"]).any()
+                    and _isfinite_series(g["aoi_p95_ms"]).any()
+                ):
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="PASS",
+                            reason="expected (data present)",
+                            details={"driver_cols": ["rate_Bps", "aoi_p95_ms"]},
+                        )
+                    )
+                else:
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="SKIP",
+                            reason="missing/invalid Rate or AoI p95",
+                            details={"driver_cols": ["rate_Bps", "aoi_p95_ms"]},
+                        )
+                    )
 
             # Pipeline: latency distribution (boxplot)
             base = fig_basename(
@@ -707,7 +799,9 @@ def run_quality_audit(
                 )
 
     # Pipeline: outbox backlog time-series is per-run
-    if not by_run.empty and {"run_id", "profile", "policy"}.issubset(by_run.columns):
+    if plots_enabled and not by_run.empty and {"run_id", "profile", "policy"}.issubset(
+        by_run.columns
+    ):
         need_outbox = {"outbox_pending_max", "outbox_pending_auc_s", "outbox_pending_recovery_s"}
         if need_outbox.issubset(by_run.columns):
             for (run_id, prof, pol), g in by_run.groupby(
@@ -747,6 +841,351 @@ def run_quality_audit(
                     )
                 )
 
+    # Pipeline: duplicate bytes ratio (bar, compare)
+    if plots_enabled and not by_run.empty and {"profile", "policy", "dup_bytes_ratio"}.issubset(
+        by_run.columns
+    ):
+        for prof, g in by_run.groupby("profile", sort=False, dropna=False):
+            base = fig_basename(
+                sensor="all",
+                profile=str(prof),
+                policy="compare",
+                metric="dup_bytes_ratio",
+            )
+            vals = pd.to_numeric(g["dup_bytes_ratio"], errors="coerce")
+            if vals.notna().any() and np.isfinite(vals.to_numpy(dtype=np.float64)).any():
+                expected.append(
+                    ExpectedFigure(
+                        base_name=base,
+                        formats=plot_formats,
+                        status="PASS",
+                        reason="expected (dup_bytes_ratio present)",
+                        details={"driver_col": "dup_bytes_ratio"},
+                    )
+                )
+            else:
+                expected.append(
+                    ExpectedFigure(
+                        base_name=base,
+                        formats=plot_formats,
+                        status="SKIP",
+                        reason="dup_bytes_ratio missing/invalid",
+                        details={"driver_col": "dup_bytes_ratio"},
+                    )
+                )
+
+    # Diagnostic plots (adaptive only)
+    if bool(diagnostic_plots_enabled):
+        # Arm distribution (per run)
+        need_arm = {"run_id", "profile", "sensor", "arm_id", "frac"}
+        if not arm_dist.empty and need_arm.issubset(arm_dist.columns):
+            ad = arm_dist.copy()
+            if "policy" in ad.columns:
+                ad = ad[ad["policy"].astype("string") == "adaptive"]
+            for (run_id, prof, sensor), g in ad.groupby(
+                ["run_id", "profile", "sensor"], sort=False, dropna=False
+            ):
+                base = fig_basename(
+                    sensor=str(sensor),
+                    profile=str(prof),
+                    policy="adaptive",
+                    metric="arm_dist",
+                    run_id=str(run_id),
+                )
+                if _isfinite_series(g["frac"]).any():
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="PASS",
+                            reason="expected (arm distribution present)",
+                            details={"driver_col": "frac"},
+                        )
+                    )
+                else:
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="SKIP",
+                            reason="arm distribution missing/invalid",
+                            details={"driver_col": "frac"},
+                        )
+                    )
+
+        # Entropy time-series (per run + window)
+        need_entropy = {"run_id", "profile", "sensor", "window_idx", "entropy_log2"}
+        if not entropy.empty and need_entropy.issubset(entropy.columns):
+            ew = entropy.copy()
+            if "policy" in ew.columns:
+                ew = ew[ew["policy"].astype("string") == "adaptive"]
+            for (run_id, prof, sensor), g in ew.groupby(
+                ["run_id", "profile", "sensor"], sort=False, dropna=False
+            ):
+                win_s = 60
+                if "window_s" in g.columns and g["window_s"].notna().any():
+                    try:
+                        win_s_raw = pd.to_numeric(g["window_s"], errors="coerce").dropna()
+                        win_s = int(float(win_s_raw.iloc[0]))
+                    except Exception:
+                        win_s = 60
+                base = fig_basename(
+                    sensor=str(sensor),
+                    profile=str(prof),
+                    policy="adaptive",
+                    metric=f"entropy_{win_s}s",
+                    run_id=str(run_id),
+                )
+                if _isfinite_series(g["entropy_log2"]).any():
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="PASS",
+                            reason="expected (entropy present)",
+                            details={"driver_col": "entropy_log2"},
+                        )
+                    )
+                else:
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="SKIP",
+                            reason="entropy missing/invalid",
+                            details={"driver_col": "entropy_log2"},
+                        )
+                    )
+
+        # Safe-arm forced reasons (stacked bar, per sensor)
+        need_safe = {
+            "policy",
+            "sensor",
+            "linucb_safe_forced_rate",
+            "linucb_forced_reason_aoi_limit_rate",
+            "linucb_forced_reason_mae_limit_rate",
+            "linucb_forced_reason_both_rate",
+        }
+        if not summary.empty and need_safe.issubset(summary.columns):
+            ss = summary.copy()
+            ss = ss[ss["policy"].astype("string") == "adaptive"]
+            for sensor, g in ss.groupby("sensor", sort=False, dropna=False):
+                base = fig_basename(
+                    sensor=str(sensor),
+                    profile="all",
+                    policy="adaptive",
+                    metric="safe_forced_reasons",
+                )
+                if _isfinite_series(g["linucb_safe_forced_rate"]).any():
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="PASS",
+                            reason="expected (safe forced present)",
+                            details={"driver_col": "linucb_safe_forced_rate"},
+                        )
+                    )
+                else:
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="SKIP",
+                            reason="safe forced missing/invalid",
+                            details={"driver_col": "linucb_safe_forced_rate"},
+                        )
+                    )
+
+        # Switch rate (per sensor)
+        need_switch = {"policy", "sensor", "linucb_switch_rate"}
+        if not summary.empty and need_switch.issubset(summary.columns):
+            ss = summary.copy()
+            ss = ss[ss["policy"].astype("string") == "adaptive"]
+            for sensor, g in ss.groupby("sensor", sort=False, dropna=False):
+                base = fig_basename(
+                    sensor=str(sensor), profile="all", policy="adaptive", metric="switch_rate"
+                )
+                if _isfinite_series(g["linucb_switch_rate"]).any():
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="PASS",
+                            reason="expected (switch rate present)",
+                            details={"driver_col": "linucb_switch_rate"},
+                        )
+                    )
+                else:
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="SKIP",
+                            reason="switch rate missing/invalid",
+                            details={"driver_col": "linucb_switch_rate"},
+                        )
+                    )
+
+        # Rate-limit skips (per sensor; only when >0)
+        skips_col = "linucb_rate_limit_skips_per_decision"
+        if not summary.empty and {"policy", "sensor", skips_col}.issubset(summary.columns):
+            ss = summary.copy()
+            ss = ss[ss["policy"].astype("string") == "adaptive"]
+            for sensor, g in ss.groupby("sensor", sort=False, dropna=False):
+                base = fig_basename(
+                    sensor=str(sensor),
+                    profile="all",
+                    policy="adaptive",
+                    metric="rate_limit_skips_per_decision",
+                )
+                vals = pd.to_numeric(g[skips_col], errors="coerce").fillna(0.0)
+                if float(vals.max()) > 0.0:
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="PASS",
+                            reason="expected (rate-limit skips present)",
+                            details={"driver_col": skips_col},
+                        )
+                    )
+                else:
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="SKIP",
+                            reason="rate-limit skips all zero",
+                            details={"driver_col": skips_col},
+                        )
+                    )
+
+        # UCB decomposition (per profile/sensor)
+        need_ucb = {
+            "policy",
+            "sensor",
+            "profile",
+            "linucb_ucb_exploitation_mean",
+            "linucb_ucb_exploration_mean",
+            "linucb_ucb_score_mean",
+            "linucb_ucb_uncertainty_mean",
+        }
+        if not summary.empty and need_ucb.issubset(summary.columns):
+            ss = summary.copy()
+            ss = ss[ss["policy"].astype("string") == "adaptive"]
+            for (prof, sensor), g in ss.groupby(["profile", "sensor"], sort=False, dropna=False):
+                base = fig_basename(
+                    sensor=str(sensor),
+                    profile=str(prof),
+                    policy="adaptive",
+                    metric="ucb_decomposition",
+                )
+                any_finite = any(
+                    _isfinite_series(g[c]).any()
+                    for c in (
+                        "linucb_ucb_exploitation_mean",
+                        "linucb_ucb_exploration_mean",
+                        "linucb_ucb_score_mean",
+                        "linucb_ucb_uncertainty_mean",
+                    )
+                )
+                if any_finite:
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="PASS",
+                            reason="expected (UCB terms present)",
+                            details={"driver_cols": sorted(list(need_ucb))},
+                        )
+                    )
+                else:
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="SKIP",
+                            reason="UCB terms missing/invalid",
+                            details={"driver_cols": sorted(list(need_ucb))},
+                        )
+                    )
+
+        # Event reasons (per sensor)
+        need_reasons = {
+            "policy",
+            "sensor",
+            "profile",
+            "event_reason_threshold_count",
+            "event_reason_heartbeat_count",
+            "linucb_rate_limit_skips_total",
+        }
+        if not by_run.empty and need_reasons.issubset(by_run.columns):
+            br = by_run.copy()
+            br = br[br["policy"].astype("string") == "adaptive"]
+            for sensor, g in br.groupby("sensor", sort=False, dropna=False):
+                base = fig_basename(
+                    sensor=str(sensor),
+                    profile="all",
+                    policy="adaptive",
+                    metric="event_reasons",
+                )
+                thr = pd.to_numeric(g["event_reason_threshold_count"], errors="coerce")
+                hb = pd.to_numeric(g["event_reason_heartbeat_count"], errors="coerce")
+                sk = pd.to_numeric(g["linucb_rate_limit_skips_total"], errors="coerce")
+                total = (thr + hb + sk).replace([np.inf, -np.inf], np.nan)
+                if total.notna().any() and float(total.max(skipna=True)) > 0.0:
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="PASS",
+                            reason="expected (event reasons present)",
+                            details={"driver_cols": sorted(list(need_reasons))},
+                        )
+                    )
+                else:
+                    expected.append(
+                        ExpectedFigure(
+                            base_name=base,
+                            formats=plot_formats,
+                            status="SKIP",
+                            reason="event reasons missing/invalid",
+                            details={"driver_cols": sorted(list(need_reasons))},
+                        )
+                    )
+
+        # UCB time-series (per run) if enabled
+        if bool(ucb_timeseries_enabled) and not by_run.empty and {
+            "run_id",
+            "profile",
+            "sensor",
+            "policy",
+            "linucb_n_decisions",
+        }.issubset(by_run.columns):
+            br = by_run.copy()
+            br = br[br["policy"].astype("string") == "adaptive"]
+            for _, r in br.iterrows():
+                n_dec = float(pd.to_numeric(r.get("linucb_n_decisions"), errors="coerce"))
+                if not math.isfinite(n_dec) or n_dec <= 0:
+                    continue
+                base = fig_basename(
+                    sensor=str(r.get("sensor")),
+                    profile=str(r.get("profile")),
+                    policy="adaptive",
+                    metric="ucb_terms_ts",
+                    run_id=str(r.get("run_id")),
+                )
+                expected.append(
+                    ExpectedFigure(
+                        base_name=base,
+                        formats=plot_formats,
+                        status="PASS",
+                        reason="expected (ucb_timeseries enabled)",
+                        details={"driver_col": "linucb_n_decisions"},
+                    )
+                )
+
     # ---------------- Evaluate expected vs actual ----------------
     expected_checks: list[dict[str, Any]] = []
     missing_files: list[str] = []
@@ -781,6 +1220,7 @@ def run_quality_audit(
     naming_violations: list[str] = []
     png_quality_fails: list[str] = []
     tiny_files: list[str] = []
+    small_png_dims: list[str] = []
 
     for p in figure_files:
         ext = p.suffix.lower().lstrip(".")
@@ -852,6 +1292,29 @@ def run_quality_audit(
                     status="FAIL",
                     reason="failed to parse PNG metadata",
                     details={"error": str(e)},
+                )
+            )
+            continue
+
+        width_px = info.get("width_px")
+        height_px = info.get("height_px")
+        if (
+            isinstance(width_px, int)
+            and isinstance(height_px, int)
+            and (width_px < min_png_width or height_px < min_png_height)
+        ):
+            small_png_dims.append(p.name)
+            file_checks.append(
+                FileCheck(
+                    path=str(p).replace("\\", "/"),
+                    status="FAIL",
+                    reason="PNG dimensions too small",
+                    details={
+                        "width_px": width_px,
+                        "height_px": height_px,
+                        "min_width": min_png_width,
+                        "min_height": min_png_height,
+                    },
                 )
             )
             continue
@@ -1024,6 +1487,13 @@ def run_quality_audit(
         "analysis_dir": str(analysis_dir).replace("\\", "/"),
         "figs_dir": str(figs_dir).replace("\\", "/") if figs_dir else None,
         "plot_formats_inferred": plot_formats,
+        "plot_flags": {
+            "plots_enabled": bool(plots_enabled),
+            "diagnostic_plots_enabled": bool(diagnostic_plots_enabled),
+            "ucb_timeseries_enabled": bool(ucb_timeseries_enabled),
+            "pareto_p95_enabled": bool(pareto_p95_enabled),
+        },
+        "format_audit": format_audit,
         "visualization": {
             "expected_figures": expected_checks,
             "expected_status_counts": dict(expected_counts),
@@ -1035,6 +1505,7 @@ def run_quality_audit(
             "naming_violations": sorted(set(naming_violations)),
             "png_quality_fails": sorted(set(png_quality_fails)),
             "tiny_files": sorted(set(tiny_files)),
+            "small_png_dims": sorted(set(small_png_dims)),
         },
         "tables": {
             "paths": {
@@ -1083,7 +1554,10 @@ def write_quality_audit_files(report: dict[str, Any], *, analysis_dir: Path) -> 
     naming = vis.get("naming_violations", []) or []
     png_fails = vis.get("png_quality_fails", []) or []
     tiny = vis.get("tiny_files", []) or []
+    small_dims = vis.get("small_png_dims", []) or []
 
+    format_audit = report.get("format_audit", {}) or {}
+    plot_flags = report.get("plot_flags", {}) or {}
     log = report.get("logging", {}) or {}
     print_calls = log.get("print_calls", []) or []
     exc_audit = log.get("exception_traceback_audit", {}) or {}
@@ -1099,6 +1573,14 @@ def write_quality_audit_files(report: dict[str, Any], *, analysis_dir: Path) -> 
     lines.append(f"- Figs dir: `{report.get('figs_dir')}`")
     formats_str = ",".join(report.get("plot_formats_inferred") or [])
     lines.append(f"- Inferred plot formats: `{formats_str}`")
+    if plot_flags:
+        lines.append(
+            "- Plot flags: "
+            f"plots={plot_flags.get('plots_enabled')} "
+            f"diagnostic={plot_flags.get('diagnostic_plots_enabled')} "
+            f"ucb_timeseries={plot_flags.get('ucb_timeseries_enabled')} "
+            f"pareto_p95={plot_flags.get('pareto_p95_enabled')}"
+        )
     lines.append("")
 
     lines.append("## Summary")
@@ -1118,6 +1600,11 @@ def write_quality_audit_files(report: dict[str, Any], *, analysis_dir: Path) -> 
         lines.append(
             f"- Visualization (labels): PASS {label_counts.get('PASS', 0)} / "
             f"FAIL {label_counts.get('FAIL', 0)} / SKIP {label_counts.get('SKIP', 0)}"
+        )
+    if format_audit:
+        lines.append(
+            f"- Formats: {format_audit.get('status')} "
+            f"({format_audit.get('reason')})"
         )
     lines.append(
         f"- Logging: PASS {log.get('status_counts', {}).get('PASS', 0)} / "
@@ -1160,6 +1647,12 @@ def write_quality_audit_files(report: dict[str, Any], *, analysis_dir: Path) -> 
     if tiny:
         lines.append("## Tiny figure files (FAIL)")
         for n in tiny:
+            lines.append(f"- `{n}`")
+        lines.append("")
+
+    if small_dims:
+        lines.append("## Small PNG dimensions (FAIL)")
+        for n in small_dims:
             lines.append(f"- `{n}`")
         lines.append("")
 
@@ -1233,7 +1726,7 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument(
         "--min-png-bytes",
         type=int,
-        default=12_000,
+        default=20_000,
         help="minimum PNG file size",
     )
     ap.add_argument(
@@ -1248,6 +1741,24 @@ def _parse_args() -> argparse.Namespace:
         default=300,
         help="minimum effective DPI for PNGs",
     )
+    ap.add_argument(
+        "--min-png-width",
+        type=int,
+        default=1200,
+        help="minimum PNG width in pixels",
+    )
+    ap.add_argument(
+        "--min-png-height",
+        type=int,
+        default=800,
+        help="minimum PNG height in pixels",
+    )
+    ap.add_argument(
+        "--require-vector",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="require at least one vector format (pdf/svg) in outputs",
+    )
     add_logging_cli_args(ap)
     return ap.parse_args()
 
@@ -1261,7 +1772,10 @@ def main() -> None:
         figs_dir_name=str(args.figs_dir_name),
         min_png_bytes=int(args.min_png_bytes),
         min_pdf_bytes=int(args.min_pdf_bytes),
+        min_png_width=int(args.min_png_width),
+        min_png_height=int(args.min_png_height),
         require_png_dpi=int(args.require_png_dpi),
+        require_vector=bool(args.require_vector),
     )
     json_path, md_path = write_quality_audit_files(report, analysis_dir=analysis_dir)
     logger.info("wrote %s", json_path)

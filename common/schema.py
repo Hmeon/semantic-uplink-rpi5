@@ -284,6 +284,12 @@ class PolicyDecisionMsg:
     reward_mae: float | None = None
     reward_rate: float | None = None
     rate_limit_skips: int | None = None
+    t_predict_ms: float | None = None
+    t_decide_ms: float | None = None
+    t_observe_ms: float | None = None
+    t_step_ms: float | None = None
+    cpu_step_ms: float | None = None
+    maxrss_kb: float | None = None
 
     def __post_init__(self):
         ts = int(self.ts)
@@ -356,6 +362,40 @@ class PolicyDecisionMsg:
             if self.rate_limit_skips is None
             else _ensure_nonneg_int("rate_limit_skips", self.rate_limit_skips)
         )
+        t_predict_ms = (
+            None
+            if self.t_predict_ms is None
+            else _ensure_finite("t_predict_ms", self.t_predict_ms)
+        )
+        t_decide_ms = (
+            None if self.t_decide_ms is None else _ensure_finite("t_decide_ms", self.t_decide_ms)
+        )
+        t_observe_ms = (
+            None
+            if self.t_observe_ms is None
+            else _ensure_finite("t_observe_ms", self.t_observe_ms)
+        )
+        t_step_ms = (
+            None if self.t_step_ms is None else _ensure_finite("t_step_ms", self.t_step_ms)
+        )
+        cpu_step_ms = (
+            None
+            if self.cpu_step_ms is None
+            else _ensure_finite("cpu_step_ms", self.cpu_step_ms)
+        )
+        maxrss_kb = (
+            None if self.maxrss_kb is None else _ensure_finite("maxrss_kb", self.maxrss_kb)
+        )
+        for name, val in (
+            ("t_predict_ms", t_predict_ms),
+            ("t_decide_ms", t_decide_ms),
+            ("t_observe_ms", t_observe_ms),
+            ("t_step_ms", t_step_ms),
+            ("cpu_step_ms", cpu_step_ms),
+            ("maxrss_kb", maxrss_kb),
+        ):
+            if val is not None and val < 0:
+                raise ValueError(f"{name} must be >= 0")
 
         object.__setattr__(self, "ts", ts)
         object.__setattr__(self, "device_id", device_id)
@@ -378,6 +418,12 @@ class PolicyDecisionMsg:
         object.__setattr__(self, "reward_mae", reward_mae)
         object.__setattr__(self, "reward_rate", reward_rate)
         object.__setattr__(self, "rate_limit_skips", rate_limit_skips)
+        object.__setattr__(self, "t_predict_ms", t_predict_ms)
+        object.__setattr__(self, "t_decide_ms", t_decide_ms)
+        object.__setattr__(self, "t_observe_ms", t_observe_ms)
+        object.__setattr__(self, "t_step_ms", t_step_ms)
+        object.__setattr__(self, "cpu_step_ms", cpu_step_ms)
+        object.__setattr__(self, "maxrss_kb", maxrss_kb)
 
     # 직렬화/역직렬화
     def to_dict(self) -> dict[str, Any]:
@@ -415,6 +461,18 @@ class PolicyDecisionMsg:
             d["reward_rate"] = float(self.reward_rate)
         if self.rate_limit_skips is not None:
             d["rate_limit_skips"] = int(self.rate_limit_skips)
+        if self.t_predict_ms is not None:
+            d["t_predict_ms"] = float(self.t_predict_ms)
+        if self.t_decide_ms is not None:
+            d["t_decide_ms"] = float(self.t_decide_ms)
+        if self.t_observe_ms is not None:
+            d["t_observe_ms"] = float(self.t_observe_ms)
+        if self.t_step_ms is not None:
+            d["t_step_ms"] = float(self.t_step_ms)
+        if self.cpu_step_ms is not None:
+            d["cpu_step_ms"] = float(self.cpu_step_ms)
+        if self.maxrss_kb is not None:
+            d["maxrss_kb"] = float(self.maxrss_kb)
         return d
 
     def to_json_bytes(self) -> bytes:
@@ -484,6 +542,34 @@ class PolicyDecisionMsg:
                 None
                 if "rate_limit_skips" not in d or d["rate_limit_skips"] is None
                 else int(d["rate_limit_skips"])
+            ),
+            t_predict_ms=(
+                None
+                if "t_predict_ms" not in d or d["t_predict_ms"] is None
+                else float(d["t_predict_ms"])
+            ),
+            t_decide_ms=(
+                None
+                if "t_decide_ms" not in d or d["t_decide_ms"] is None
+                else float(d["t_decide_ms"])
+            ),
+            t_observe_ms=(
+                None
+                if "t_observe_ms" not in d or d["t_observe_ms"] is None
+                else float(d["t_observe_ms"])
+            ),
+            t_step_ms=(
+                None if "t_step_ms" not in d or d["t_step_ms"] is None else float(d["t_step_ms"])
+            ),
+            cpu_step_ms=(
+                None
+                if "cpu_step_ms" not in d or d["cpu_step_ms"] is None
+                else float(d["cpu_step_ms"])
+            ),
+            maxrss_kb=(
+                None
+                if "maxrss_kb" not in d or d["maxrss_kb"] is None
+                else float(d["maxrss_kb"])
             ),
         )
 

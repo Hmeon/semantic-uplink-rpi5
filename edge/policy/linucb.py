@@ -63,6 +63,7 @@ class LinUCBConfig:
     # 안전가드 임계
     aoi_max_ms: float = 5_000.0      # 5s
     mae_max: float = 2.0             # mic dB / temp °C
+    safety_force_emit_on_aoi: bool = False
 
     # 워밍업(팔별 최소 시도 횟수 보장)
     warmup_per_arm: int = 1
@@ -164,8 +165,45 @@ class LinUCBPolicy:
         현재 상태에 대한 (τ,k) 결정을 수행하고 PolicyDecisionMsg를 반환한다.
         - reward 필드는 0.0으로 기록(실제 보상은 observe_outcome에서 적용)
         """
-        aoi_limit = bool(state.aoi_ms >= self.cfg.aoi_max_ms)
-        mae_limit = bool(abs(state.res) >= self.cfg.mae_max)
+        invalid_state = False
+        aoi_ms = float(state.aoi_ms)
+        res = float(state.res)
+        res_var = float(state.res_var)
+        loss = float(state.loss)
+        q_len = int(state.q_len)
+        if not math.isfinite(aoi_ms):
+            aoi_ms = 0.0
+            invalid_state = True
+        if not math.isfinite(res):
+            res = 0.0
+            invalid_state = True
+        if not math.isfinite(res_var) or res_var < 0.0:
+            res_var = 0.0
+            invalid_state = True
+        if not math.isfinite(loss):
+            loss = 0.0
+            invalid_state = True
+        if q_len < 0:
+            q_len = 0
+            invalid_state = True
+        if invalid_state:
+            logger.warning(
+                "linucb_state_sanitized device_id=%s sensor=%s",
+                self.cfg.device_id,
+                self.cfg.sensor.value,
+            )
+
+        safe_state = PolicyState(
+            ts_ns=int(state.ts_ns),
+            aoi_ms=float(aoi_ms),
+            res=float(res),
+            res_var=float(res_var),
+            loss=float(loss),
+            q_len=int(q_len),
+        )
+
+        aoi_limit = bool(aoi_ms >= self.cfg.aoi_max_ms)
+        mae_limit = bool(abs(res) >= self.cfg.mae_max)
         safe_forced = bool(aoi_limit or mae_limit)
 
         # 안전가드
@@ -173,7 +211,7 @@ class LinUCBPolicy:
             arm_idx = self._safe_idx
         else:
             # 워밍업: 시도 횟수 미달 팔부터 순서대로 사용
-            arm_idx = self._select_arm_ucb(state)
+            arm_idx = self._select_arm_ucb(safe_state)
 
         arm = self.arms[arm_idx]
         if arm_idx != self._last_logged_arm_idx:
@@ -198,7 +236,7 @@ class LinUCBPolicy:
                 forced_reason,
             )
             self._last_logged_arm_idx = arm_idx
-        x = self._context(state)
+        x = self._context(safe_state)
 
         diag: dict[str, object] = {}
         if bool(self.cfg.diagnostics_enabled):
@@ -238,19 +276,23 @@ class LinUCBPolicy:
             }
 
         # 학습용 버퍼에 기록(직전 결정)
-        self._last_x = x
-        self._last_arm_idx = arm_idx
+        if invalid_state:
+            self._last_x = None
+            self._last_arm_idx = None
+        else:
+            self._last_x = x
+            self._last_arm_idx = arm_idx
         self._counts[arm_idx] += 1
 
         # 정책 결정 로그(보상은 의도적으로 0.0; 수집기가 실제 r을 계산/분석)
         msg = PolicyDecisionMsg(
-            ts=int(state.ts_ns),
+            ts=int(safe_state.ts_ns),
             device_id=self.cfg.device_id,
-            state_aoi=float(state.aoi_ms),
-            state_res=float(state.res),
-            state_res_var=float(state.res_var),
-            state_loss=float(state.loss),
-            state_q_len=int(state.q_len),
+            state_aoi=float(aoi_ms),
+            state_res=float(res),
+            state_res_var=float(res_var),
+            state_loss=float(loss),
+            state_q_len=int(q_len),
             tau=float(arm.tau),
             kbits=int(arm.kbits),
             reward=0.0,
@@ -265,6 +307,24 @@ class LinUCBPolicy:
         """
         if self._last_x is None or self._last_arm_idx is None:
             # 아직 결정이 없거나 중복 호출
+            return 0.0
+        if not np.isfinite(self._last_x).all():
+            logger.warning(
+                "linucb_skip_update invalid_context device_id=%s sensor=%s",
+                self.cfg.device_id,
+                self.cfg.sensor.value,
+            )
+            self._last_x = None
+            self._last_arm_idx = None
+            return 0.0
+        if not (math.isfinite(aoi_ms) and math.isfinite(mae) and math.isfinite(rate_bps)):
+            logger.warning(
+                "linucb_skip_update nonfinite_reward_inputs device_id=%s sensor=%s",
+                self.cfg.device_id,
+                self.cfg.sensor.value,
+            )
+            self._last_x = None
+            self._last_arm_idx = None
             return 0.0
 
         # 보상 계산(정규화 후 음의 가중합)

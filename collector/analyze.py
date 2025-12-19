@@ -40,6 +40,7 @@ import math
 import os
 from collections.abc import Iterable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -48,12 +49,15 @@ import pandas as pd
 from collector.plot_labels import (
     LABEL_AOI_MEAN_MS,
     LABEL_AOI_P95_MS,
+    LABEL_ARM,
+    LABEL_COMPONENT,
     LABEL_DUP_BYTES_RATIO_PCT,
     LABEL_E2E_LATENCY_MS,
     LABEL_LINK_PROFILE,
     LABEL_OUTBOX_PENDING_COUNT,
     LABEL_POLICY,
     LABEL_RATE_BPS,
+    LABEL_UCB_TERM,
 )
 from common.config import load_policy_config_dict
 from common.discord_webhook import DiscordWebhookError, send_discord_message
@@ -294,6 +298,12 @@ def load_decisions(paths: list[str | os.PathLike]) -> pd.DataFrame:
         "reward_mae": "float64",
         "reward_rate": "float64",
         "rate_limit_skips": "Int64",
+        "t_predict_ms": "float64",
+        "t_decide_ms": "float64",
+        "t_observe_ms": "float64",
+        "t_step_ms": "float64",
+        "cpu_step_ms": "float64",
+        "maxrss_kb": "float64",
     }
     for k, t in cast_cols.items():
         if k in out.columns:
@@ -962,7 +972,8 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
 
         if "event_reason" in g.columns:
             er = g["event_reason"].astype("string")
-            event_reason_threshold_count = float((er == "THRESHOLD").sum())
+            thr_mask = er.isin(["THRESHOLD", "THRESHOLD_OVERRIDE", "SAFETY_AOI"])
+            event_reason_threshold_count = float(thr_mask.sum())
             event_reason_heartbeat_count = float((er == "HEARTBEAT").sum())
             if len(g) > 0:
                 event_reason_threshold_frac = float(event_reason_threshold_count / len(g))
@@ -1495,6 +1506,48 @@ def _write_report_md(
         ]
         lines.append("| " + " | ".join(cells) + " |")
 
+    lines.append("")
+    lines.append("### Adaptive vs periodic interpretation")
+    lines.append("")
+    lines.append("Lower is better for Rate/AoI/MAE; positive improvement means better.")
+    comp_adapt = comparisons[comparisons["policy"].astype("string") == "adaptive"]
+    if comp_adapt.empty:
+        lines.append("- adaptive: no comparison rows available (baseline missing).")
+    else:
+        for _, r in comp_adapt.iterrows():
+            prof = str(r.get("profile", ""))
+            sensor = str(r.get("sensor", ""))
+            rate_imp = float(r.get("rate_Bps_improvement_pct", float("nan")))
+            aoi_imp = float(r.get("aoi_mean_ms_improvement_pct", float("nan")))
+            mae_imp = float(r.get("mae_event_mean_improvement_pct", float("nan")))
+            if not (math.isfinite(rate_imp) and math.isfinite(aoi_imp) and math.isfinite(mae_imp)):
+                lines.append(
+                    f"- {prof}/{sensor}: insufficient baseline or non-finite metrics; "
+                    "cannot conclude improvement."
+                )
+                continue
+            rate_txt = f"{rate_imp:+.1f}%"
+            aoi_txt = f"{aoi_imp:+.1f}%"
+            mae_txt = f"{mae_imp:+.1f}%"
+            tradeoffs = []
+            if rate_imp < 0:
+                tradeoffs.append("rate")
+            if aoi_imp < 0:
+                tradeoffs.append("AoI")
+            if mae_imp < 0:
+                tradeoffs.append("MAE")
+            if tradeoffs:
+                tradeoff_txt = ", ".join(tradeoffs)
+                lines.append(
+                    f"- {prof}/{sensor}: rate {rate_txt}, AoI mean {aoi_txt}, "
+                    f"MAE mean {mae_txt} (tradeoff in: {tradeoff_txt})."
+                )
+            else:
+                lines.append(
+                    f"- {prof}/{sensor}: rate {rate_txt}, AoI mean {aoi_txt}, "
+                    f"MAE mean {mae_txt} (all improved)."
+                )
+
     # --- Figures (추가) ---
     figs_path = out_dir / figures_dir
     if figs_path.exists():
@@ -1988,6 +2041,7 @@ def _try_make_plots(
                 ax.axhline(0.0, color="#9CA3AF", linewidth=1.0)
                 ax.set_xticks(xs)
                 ax.set_xticklabels([lab for _, lab in comp_cols], rotation=0)
+                ax.set_xlabel(LABEL_COMPONENT)
                 ax.set_ylabel("Reward component [reward units]")
                 ax.set_title(f"Reward components (mean) 쨌 {sensor_s}/{prof_s}")
                 ax.grid(axis="y", alpha=0.25)
@@ -2146,6 +2200,7 @@ def _try_make_pipeline_plots(
                 color=[colors.get(x, "#6B7280") for x in xs],
             )
             ax.set_ylim(0, 100)
+            ax.set_xlabel(LABEL_POLICY)
             ax.set_ylabel(LABEL_DUP_BYTES_RATIO_PCT)
             ax.set_title(f"Duplicate bytes ratio (QoS1 de-dup) | profile={prof}")
             ax.grid(axis="y", alpha=0.25)
@@ -3079,6 +3134,7 @@ def _try_make_diagnostic_plots(
             fig, ax = plt.subplots(figsize=(7.6, fig_h))
             ax.barh(gg["label"].tolist(), gg["pct"].tolist(), color=colors["adaptive"])
             ax.set_xlabel("Arm selection fraction [%]")
+            ax.set_ylabel(LABEL_ARM)
             ax.set_title(f"Arm selection distribution · {sensor}/{prof} · run={run_id}")
             ax.grid(axis="x", alpha=0.25)
             ax.set_axisbelow(True)
@@ -3254,6 +3310,7 @@ def _try_make_diagnostic_plots(
                 )
                 ax.set_xticks(x)
                 ax.set_xticklabels(profiles, rotation=0)
+                ax.set_xlabel(LABEL_LINK_PROFILE)
                 ax.set_ylim(0, 100)
                 ax.set_ylabel("Safe-arm forced rate [%]")
                 ax.set_title(f"Safe-arm interventions (adaptive) · sensor={sensor}")
@@ -3314,6 +3371,7 @@ def _try_make_diagnostic_plots(
             )
             ax.set_xticks(x)
             ax.set_xticklabels(profiles, rotation=0)
+            ax.set_xlabel(LABEL_LINK_PROFILE)
             ax.set_ylim(0, 1.0)
             ax.set_ylabel("Switch rate P[arm_t ≠ arm_{t-1}]")
             ax.set_title(f"Policy switching rate (adaptive) · sensor={sensor}")
@@ -3359,6 +3417,7 @@ def _try_make_diagnostic_plots(
             )
             ax.set_xticks(x)
             ax.set_xticklabels(profiles, rotation=0)
+            ax.set_xlabel(LABEL_LINK_PROFILE)
             ax.set_ylabel("Rate-limit skips / decision [count]")
             ax.set_title(f"Rate-limit skips (adaptive) · sensor={sensor}")
             ax.grid(axis="y", alpha=0.25)
@@ -3414,6 +3473,7 @@ def _try_make_diagnostic_plots(
                 )
                 ax1.set_xticks(x)
                 ax1.set_xticklabels(labels, rotation=0)
+                ax1.set_xlabel(LABEL_UCB_TERM)
                 ax1.set_ylabel("UCB terms [reward units]")
                 ax1.grid(axis="y", alpha=0.25)
                 ax1.set_axisbelow(True)
@@ -3421,6 +3481,7 @@ def _try_make_diagnostic_plots(
                 ax2.bar([0], [u_val], color="#6B7280")
                 ax2.set_xticks([0])
                 ax2.set_xticklabels(["uncertainty u"])
+                ax2.set_xlabel(LABEL_UCB_TERM)
                 ax2.set_ylabel("u [a.u.]")
                 ax2.grid(axis="y", alpha=0.25)
                 ax2.set_axisbelow(True)
@@ -3517,6 +3578,7 @@ def _try_make_diagnostic_plots(
             ax.bar(x, sk_y, bottom=thr_y + hb_y, label="RATE_LIMIT_SKIP", color="#9CA3AF")
             ax.set_xticks(x)
             ax.set_xticklabels(dfp["profile"].astype("string").tolist(), rotation=0)
+            ax.set_xlabel(LABEL_LINK_PROFILE)
             ax.set_ylim(0, 100)
             ax.set_ylabel("Reason fraction [%]  (events + skips)")
             ax.set_title(f"Event reasons (adaptive) · sensor={sensor}")
@@ -3618,7 +3680,8 @@ def _try_make_diagnostic_plots(
                 color=[colors.get(x, "#6B7280") for x in xs],
             )
             ax.set_ylim(0, 100)
-            ax.set_ylabel("Duplicate bytes ratio [%]")
+            ax.set_xlabel(LABEL_POLICY)
+            ax.set_ylabel(LABEL_DUP_BYTES_RATIO_PCT)
             ax.set_title(f"Duplicate bytes ratio (QoS1 de-dup) · profile={prof}")
             ax.grid(axis="y", alpha=0.25)
             ax.set_axisbelow(True)
@@ -3679,6 +3742,7 @@ def _try_make_diagnostic_plots(
                 for box, lab in zip(bp.get("boxes", []), labels):
                     box.set_facecolor(colors.get(lab, "#E5E7EB"))
                     box.set_alpha(0.35)
+                ax.set_xlabel(LABEL_POLICY)
                 ax.set_ylabel("E2E latency (rx - gen) [ms]")
                 ax.set_title(f"E2E latency distribution · {sensor}/{prof}")
                 ax.grid(axis="y", alpha=0.25)
@@ -3982,6 +4046,31 @@ def main():
     comparisons = compare_policies(summary, baseline_policy=baseline_policy)
 
     out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        meta = {
+            "created_at": datetime.now(timezone.utc).replace(microsecond=0).isoformat(),
+            "analysis_dir": str(out_dir),
+            "inputs": [str(x) for x in args.input],
+            "baseline_policy": baseline_policy,
+            "flags": {
+                "plots": bool(args.plots),
+                "paper_plots": bool(args.paper_plots),
+                "diagnostic_plots": bool(args.diagnostic_plots),
+                "ucb_timeseries": bool(args.ucb_timeseries),
+                "pareto_p95": bool(args.pareto_p95),
+            },
+            "plot_cfg": {
+                "dir_name": str(plot_cfg.dir_name),
+                "formats": list(plot_cfg.formats),
+                "dpi": int(plot_cfg.dpi),
+            },
+        }
+        (out_dir / "analysis_meta.json").write_text(
+            json.dumps(meta, indent=2, ensure_ascii=False),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.exception("failed to write analysis_meta.json")
     if not arm_dist.empty:
         arm_dist_path = out_dir / "linucb_arm_distribution.csv"
         arm_dist.sort_values(

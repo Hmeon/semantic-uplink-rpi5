@@ -6,8 +6,14 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 from typing import Any
+
+try:  # resource is not available on all platforms (e.g., Windows)
+    import resource  # type: ignore
+except Exception:  # pragma: no cover - platform dependent
+    resource = None
 
 from common.metrics import OnlineVar
 from common.schema import (
@@ -77,6 +83,12 @@ class SensorPolicyRuntime:
         event: EventMsg | None = None
         decision: PolicyDecisionMsg | None = None
         reward: float | None = None
+        diag_enabled = bool(self._linucb is not None and self._linucb.cfg.diagnostics_enabled)
+        step_wall_start_ns = time.perf_counter_ns() if diag_enabled else 0
+        step_cpu_start_ns = time.process_time_ns() if diag_enabled else 0
+        t_predict_ms = None
+        t_decide_ms = None
+        t_observe_ms = None
 
         ts_ns, _seq, x_raw, valid, _last_pred, resid = self._predictor.preview(sample)
         if not valid:
@@ -107,6 +119,8 @@ class SensorPolicyRuntime:
 
         tau = self._ewma_cfg.tau
         kbits = self._ewma_cfg.kbits
+        force_emit = False
+        force_reason = None
         if self.mode == PolicyMode.ADAPTIVE:
             state = PolicyState(
                 ts_ns=int(ts_ns),
@@ -117,7 +131,15 @@ class SensorPolicyRuntime:
                 q_len=int(q_len),
             )
             assert self._linucb is not None
+            if diag_enabled:
+                decide_start_ns = time.perf_counter_ns()
             (tau, kbits), decision = self._linucb.decide(state)
+            if diag_enabled:
+                t_decide_ms = (time.perf_counter_ns() - decide_start_ns) / 1e6
+            cfg = self._linucb.cfg
+            if bool(cfg.safety_force_emit_on_aoi) and aoi_ms >= float(cfg.aoi_max_ms):
+                force_emit = True
+                force_reason = "SAFETY_AOI"
         elif self.mode == PolicyMode.PERIODIC:
             tau = -1e-9  # 항상 전송
             kbits = self._ewma_cfg.kbits
@@ -126,12 +148,18 @@ class SensorPolicyRuntime:
         mae_est = self._estimate_mae(x_raw)
         rate_bps = 0.0
 
+        if diag_enabled:
+            pred_start_ns = time.perf_counter_ns()
         event = self._predictor.predict_and_maybe_emit(
             sample,
             override_tau=tau,
             override_kbits=kbits,
             policy_mode=self.mode,
+            force_emit=force_emit,
+            force_reason=force_reason,
         )
+        if diag_enabled:
+            t_predict_ms = (time.perf_counter_ns() - pred_start_ns) / 1e6
         if event is not None:
             # 전송 시점 AoI를 메시지에 기록(선택 필드)
             event = EventMsg(
@@ -153,6 +181,8 @@ class SensorPolicyRuntime:
             self._last_sent_val = event.val
 
         if self._linucb is not None:
+            if diag_enabled:
+                observe_start_ns = time.perf_counter_ns()
             reward = float(
                 self._linucb.observe_outcome(
                     aoi_ms=aoi_ms,
@@ -160,6 +190,8 @@ class SensorPolicyRuntime:
                     rate_bps=rate_bps,
                 )
             )
+            if diag_enabled:
+                t_observe_ms = (time.perf_counter_ns() - observe_start_ns) / 1e6
             # 링크 사용량을 줄이기 위해 이벤트 발생 시에만 결정 메시지 송신
             if event is not None and decision is not None:
                 diag_enabled = bool(self._linucb.cfg.diagnostics_enabled)
@@ -167,6 +199,9 @@ class SensorPolicyRuntime:
                 reward_mae = None
                 reward_rate = None
                 rate_limit_skips = None
+                t_step_ms = None
+                cpu_step_ms = None
+                maxrss_kb = None
                 if diag_enabled:
                     cfg = self._linucb.cfg
                     aoi_n = float(aoi_ms) / max(1e-9, cfg.aoi_scale_ms)
@@ -176,6 +211,13 @@ class SensorPolicyRuntime:
                     reward_mae = float(-(cfg.w_mae * mae_n))
                     reward_rate = float(-(cfg.w_rate * rate_n))
                     rate_limit_skips = int(self._predictor.consume_rate_limit_skips())
+                    t_step_ms = (time.perf_counter_ns() - step_wall_start_ns) / 1e6
+                    cpu_step_ms = (time.process_time_ns() - step_cpu_start_ns) / 1e6
+                    if resource is not None:
+                        try:
+                            maxrss_kb = float(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss)
+                        except Exception:
+                            maxrss_kb = None
                 decision = PolicyDecisionMsg(
                     ts=int(ts_ns),
                     device_id=self.device_id,
@@ -198,6 +240,12 @@ class SensorPolicyRuntime:
                     reward_mae=reward_mae,
                     reward_rate=reward_rate,
                     rate_limit_skips=rate_limit_skips,
+                    t_predict_ms=t_predict_ms,
+                    t_decide_ms=t_decide_ms,
+                    t_observe_ms=t_observe_ms,
+                    t_step_ms=t_step_ms,
+                    cpu_step_ms=cpu_step_ms,
+                    maxrss_kb=maxrss_kb,
                 )
 
         return StepResult(
@@ -259,6 +307,7 @@ def load_linucb_config(
         w_rate=float(reward.get("gamma", 1.0)),
         aoi_max_ms=float(safety.get("aoi_max_ms", 5000.0)),
         mae_max=float(safety.get("mae_max", 2.0)),
+        safety_force_emit_on_aoi=bool(safety.get("safety_force_emit_on_aoi", False)),
         mae_scale=float(mae_scale) if mae_scale is not None else 1.0,
         res_scale=float(res_scale) if res_scale is not None else 1.0,
         resvar_scale=float(resvar_scale) if resvar_scale is not None else 1.0,

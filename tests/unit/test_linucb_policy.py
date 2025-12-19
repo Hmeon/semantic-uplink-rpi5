@@ -1,81 +1,165 @@
 from __future__ import annotations
 
+import math
+
+import numpy as np
+import pytest
+
 from common.schema import LinkProfile, SensorType
 from edge.policy.linucb import Arm, LinUCBConfig, LinUCBPolicy, PolicyState
 
 
-def test_linucb_policy_safe_guard_selects_safe_arm() -> None:
-    arms = [Arm(tau=0.05, kbits=6), Arm(tau=0.05, kbits=10), Arm(tau=0.2, kbits=6)]
+def _make_state(*, aoi_ms: float = 0.0, res: float = 0.1) -> PolicyState:
+    return PolicyState(
+        ts_ns=1,
+        aoi_ms=aoi_ms,
+        res=res,
+        res_var=0.0,
+        loss=0.0,
+        q_len=0,
+    )
+
+
+def test_linucb_warmup_per_arm_selection_order() -> None:
+    arms = [Arm(0.1, 6), Arm(0.2, 8), Arm(0.3, 10)]
     cfg = LinUCBConfig(
         device_id="dev1",
         sensor=SensorType.TEMP,
         profile=LinkProfile.SLOW_10KBPS,
-        seed=None,
         arms=arms,
+        warmup_per_arm=2,
+        aoi_max_ms=1e9,
+        mae_max=1e9,
+        diagnostics_enabled=True,
+    )
+    pol = LinUCBPolicy(cfg)
+    seq = []
+    for _ in range(6):
+        _, decision = pol.decide(_make_state())
+        seq.append(decision.arm_id)
+    assert seq == [0, 0, 1, 1, 2, 2]
+
+
+def test_linucb_ucb_scoring_components() -> None:
+    arms = [Arm(0.1, 6)]
+    cfg = LinUCBConfig(
+        device_id="dev1",
+        sensor=SensorType.TEMP,
+        profile=LinkProfile.SLOW_10KBPS,
+        arms=arms,
+        alpha_ucb=0.5,
+        warmup_per_arm=0,
+        aoi_max_ms=1e9,
+        mae_max=1e9,
+        diagnostics_enabled=True,
+    )
+    pol = LinUCBPolicy(cfg)
+    pol._A[0] = np.eye(pol.d, dtype=np.float64)
+    pol._b[0] = np.array([1, 2, 3, 4, 5, 6], dtype=np.float64)
+    state = _make_state(aoi_ms=1000.0, res=1.0)
+    _, decision = pol.decide(state)
+
+    x = pol._context(state)
+    exploitation = float(np.dot(pol._b[0], x))
+    uncertainty = float(np.sqrt(np.dot(x, x)))
+    exploration = cfg.alpha_ucb * uncertainty
+    score = exploitation + exploration
+
+    assert decision.ucb_exploitation == pytest.approx(exploitation)
+    assert decision.ucb_exploration == pytest.approx(exploration)
+    assert decision.ucb_score == pytest.approx(score)
+    assert decision.ucb_alpha == pytest.approx(cfg.alpha_ucb)
+
+
+def test_linucb_update_only_selected_arm_once() -> None:
+    arms = [Arm(0.1, 6), Arm(0.2, 8)]
+    cfg = LinUCBConfig(
+        device_id="dev1",
+        sensor=SensorType.TEMP,
+        profile=LinkProfile.SLOW_10KBPS,
+        arms=arms,
+        warmup_per_arm=0,
+        aoi_max_ms=1e9,
+        mae_max=1e9,
+        diagnostics_enabled=True,
+    )
+    pol = LinUCBPolicy(cfg)
+    a_before = pol._A[1].copy()
+    b_before = pol._b[1].copy()
+    pol.decide(_make_state())
+    r = pol.observe_outcome(aoi_ms=10.0, mae=0.1, rate_bps=100.0)
+    assert math.isfinite(r)
+    assert np.allclose(pol._A[1], a_before)
+    assert np.allclose(pol._b[1], b_before)
+    a_after = pol._A[0].copy()
+    b_after = pol._b[0].copy()
+    r2 = pol.observe_outcome(aoi_ms=10.0, mae=0.1, rate_bps=100.0)
+    assert r2 == 0.0
+    assert np.allclose(pol._A[0], a_after)
+    assert np.allclose(pol._b[0], b_after)
+
+
+def test_linucb_nan_context_skips_update() -> None:
+    arms = [Arm(0.1, 6)]
+    cfg = LinUCBConfig(
+        device_id="dev1",
+        sensor=SensorType.TEMP,
+        profile=LinkProfile.SLOW_10KBPS,
+        arms=arms,
+        warmup_per_arm=0,
+        aoi_max_ms=1e9,
+        mae_max=1e9,
+        diagnostics_enabled=True,
+    )
+    pol = LinUCBPolicy(cfg)
+    pol.decide(_make_state(res=float("nan")))
+    a_before = pol._A[0].copy()
+    b_before = pol._b[0].copy()
+    r = pol.observe_outcome(aoi_ms=10.0, mae=0.1, rate_bps=100.0)
+    assert r == 0.0
+    assert np.allclose(pol._A[0], a_before)
+    assert np.allclose(pol._b[0], b_before)
+
+
+def test_linucb_safe_arm_forcing_reasons() -> None:
+    safe_arm = Arm(0.1, 10)
+    arms = [Arm(0.2, 6), safe_arm]
+    cfg = LinUCBConfig(
+        device_id="dev1",
+        sensor=SensorType.TEMP,
+        profile=LinkProfile.SLOW_10KBPS,
+        arms=arms,
+        safe_arm=safe_arm,
         aoi_max_ms=1.0,
-        mae_max=999.0,
+        mae_max=1.0,
+        diagnostics_enabled=True,
     )
     pol = LinUCBPolicy(cfg)
+    _, decision = pol.decide(_make_state(aoi_ms=10.0, res=0.0))
+    assert decision.safe_arm_forced is True
+    assert decision.forced_reason == "AOI_LIMIT"
+    assert decision.tau == safe_arm.tau
+    assert decision.kbits == safe_arm.kbits
 
-    state = PolicyState(ts_ns=1, aoi_ms=10.0, res=0.0, res_var=0.0, loss=0.0, q_len=0)
-    (tau, kbits), msg = pol.decide(state)
-    assert (tau, kbits) == (0.05, 10)  # tau_min + kbits_max
-    assert msg.tau == 0.05
-    assert msg.kbits == 10
-    assert msg.reward == 0.0
+    _, decision2 = pol.decide(_make_state(aoi_ms=10.0, res=2.0))
+    assert decision2.safe_arm_forced is True
+    assert decision2.forced_reason == "BOTH"
 
 
-def test_linucb_policy_safe_guard_works_without_full_grid() -> None:
-    # This mirrors the default example in configs/policy.yaml: a "diagonal" (not full grid).
-    arms = [Arm(tau=1.5, kbits=6), Arm(tau=3.0, kbits=8), Arm(tau=6.0, kbits=10)]
+def test_linucb_singular_matrix_fallback() -> None:
+    arms = [Arm(0.1, 6)]
     cfg = LinUCBConfig(
         device_id="dev1",
         sensor=SensorType.TEMP,
         profile=LinkProfile.SLOW_10KBPS,
-        seed=None,
         arms=arms,
-        aoi_max_ms=1.0,
-        mae_max=999.0,
+        warmup_per_arm=0,
+        diagnostics_enabled=True,
     )
     pol = LinUCBPolicy(cfg)
-
-    state = PolicyState(ts_ns=1, aoi_ms=10.0, res=0.0, res_var=0.0, loss=0.0, q_len=0)
-    (tau, kbits), _msg = pol.decide(state)
-    assert (tau, kbits) == (1.5, 6)
-
-
-def test_linucb_policy_warmup_cycles_arms_in_order() -> None:
-    arms = [Arm(tau=0.1, kbits=6), Arm(tau=0.2, kbits=6), Arm(tau=0.3, kbits=6)]
-    cfg = LinUCBConfig(
-        device_id="dev1",
-        sensor=SensorType.TEMP,
-        profile=LinkProfile.SLOW_10KBPS,
-        seed=None,
-        arms=arms,
-        warmup_per_arm=1,
-        aoi_max_ms=10_000.0,
-        mae_max=10_000.0,
-        alpha_ucb=0.1,
-    )
-    pol = LinUCBPolicy(cfg)
-
-    state = PolicyState(ts_ns=1, aoi_ms=10.0, res=0.0, res_var=0.0, loss=0.0, q_len=0)
-    chosen = []
-    for _ in range(len(arms)):
-        (tau, kbits), _msg = pol.decide(state)
-        chosen.append((tau, kbits))
-        pol.observe_outcome(aoi_ms=10.0, mae=0.0, rate_bps=0.0)
-
-    assert chosen == [(0.1, 6), (0.2, 6), (0.3, 6)]
-
-
-def test_linucb_policy_observe_outcome_without_decide_is_noop() -> None:
-    cfg = LinUCBConfig(
-        device_id="dev1",
-        sensor=SensorType.TEMP,
-        profile=LinkProfile.SLOW_10KBPS,
-        seed=None,
-        arms=[Arm(tau=0.1, kbits=6)],
-    )
-    pol = LinUCBPolicy(cfg)
-    assert pol.observe_outcome(aoi_ms=1.0, mae=1.0, rate_bps=1.0) == 0.0
+    pol._A[0] = np.zeros((pol.d, pol.d), dtype=np.float64)
+    pol._b[0] = np.zeros((pol.d,), dtype=np.float64)
+    _, decision = pol.decide(_make_state())
+    assert decision.ucb_exploitation == 0.0
+    assert decision.ucb_exploration == 0.0
+    assert decision.ucb_score == 0.0

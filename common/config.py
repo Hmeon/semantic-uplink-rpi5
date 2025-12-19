@@ -43,6 +43,7 @@ class SafetyConfig(BaseModel):
 
     aoi_max_ms: float = 5_000.0
     mae_max: float = 2.0
+    safety_force_emit_on_aoi: bool = False
 
 
 class PolicyDiagnosticsConfig(BaseModel):

@@ -10,5 +10,6 @@ reward:
 safety:
   aoi_max_ms: 5000
   mae_max: 2.0
+  safety_force_emit_on_aoi: false
 diagnostics:
   enabled: false

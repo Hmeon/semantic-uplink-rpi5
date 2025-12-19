@@ -629,7 +629,8 @@ class EdgeDaemon:
         logger.debug(
             "policy_diag run_id=%s device_id=%s sensor=%s seq=%s arm_id=%s tau=%s kbits=%s "
             "safe_arm_forced=%s forced_reason=%s exploitation=%s exploration=%s score=%s ucb_alpha=%s "
-            "reward_aoi=%s reward_mae=%s reward_rate=%s rate_limit_skips=%s",
+            "reward_aoi=%s reward_mae=%s reward_rate=%s rate_limit_skips=%s "
+            "t_predict_ms=%s t_decide_ms=%s t_observe_ms=%s t_step_ms=%s cpu_step_ms=%s maxrss_kb=%s",
             self.run_id,
             self.device_id,
             sensor.value,
@@ -647,6 +648,12 @@ class EdgeDaemon:
             getattr(decision, "reward_mae", None),
             getattr(decision, "reward_rate", None),
             getattr(decision, "rate_limit_skips", None),
+            getattr(decision, "t_predict_ms", None),
+            getattr(decision, "t_decide_ms", None),
+            getattr(decision, "t_observe_ms", None),
+            getattr(decision, "t_step_ms", None),
+            getattr(decision, "cpu_step_ms", None),
+            getattr(decision, "maxrss_kb", None),
         )
 
     def _build_policy_runtime(

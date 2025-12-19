@@ -94,6 +94,8 @@ class EWMAPredictor:
         policy_mode: PolicyMode | None = None,
         override_heartbeat_s: float | None = None,
         override_min_emit_ms: int | None = None,
+        force_emit: bool = False,
+        force_reason: str | None = None,
     ) -> EventMsg | None:
         """
         센서 샘플 하나를 입력 받아, 조건을 만족하면 EventMsg를 생성.
@@ -136,9 +138,17 @@ class EWMAPredictor:
                     emit_due_to_hb = True
 
         should_emit = emit_due_to_resid or emit_due_to_boot or emit_due_to_hb
+        emit_due_to_force = bool(force_emit)
+        if emit_due_to_force:
+            should_emit = True
 
         # 최소 간격 가드
-        if should_emit and min_emit_ms > 0 and self._last_emit_ns is not None:
+        if (
+            should_emit
+            and not emit_due_to_force
+            and min_emit_ms > 0
+            and self._last_emit_ns is not None
+        ):
             if now_ns - self._last_emit_ns < int(min_emit_ms * 1e6):
                 should_emit = False  # rate-limit
                 if bool(self.cfg.diagnostics_enabled):
@@ -148,7 +158,9 @@ class EWMAPredictor:
         if should_emit:
             event_reason: str | None = None
             if bool(self.cfg.diagnostics_enabled):
-                if emit_due_to_resid:
+                if emit_due_to_force:
+                    event_reason = str(force_reason or "FORCE")
+                elif emit_due_to_resid:
                     event_reason = "THRESHOLD"
                 elif emit_due_to_hb:
                     event_reason = "HEARTBEAT"
