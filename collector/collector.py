@@ -110,9 +110,10 @@ class Collector:
         self._events_part = self._next_part_index("events")
         self._decisions_part = self._next_part_index("decisions")
         self._markers_part = self._next_part_index("markers")
+        self._storage_format = "parquet"
 
     def _next_part_index(self, prefix: str) -> int:
-        pat = re.compile(rf"^{re.escape(prefix)}_(\d+)\.parquet$")
+        pat = re.compile(rf"^{re.escape(prefix)}_(\d+)\.(parquet|csv)$")
         max_idx = 0
         try:
             for name in os.listdir(self._logs_dir):
@@ -460,11 +461,49 @@ class Collector:
                     markers_part = int(self._markers_part)
                     self._markers_part += 1
 
-            def _write_parquet(df: pd.DataFrame, fname: str) -> None:
+            def _write_csv(df: pd.DataFrame, fname: str) -> None:
                 tmp = os.path.join(self._logs_dir, f"{fname}.tmp")
                 dst = os.path.join(self._logs_dir, fname)
-                df.to_parquet(tmp, index=False)
+                df.to_csv(tmp, index=False)
                 os.replace(tmp, dst)
+
+            def _write_table(df: pd.DataFrame, base: str) -> None:
+                if self._storage_format == "csv":
+                    _write_csv(df, f"{base}.csv")
+                    return
+                tmp = os.path.join(self._logs_dir, f"{base}.parquet.tmp")
+                dst = os.path.join(self._logs_dir, f"{base}.parquet")
+                try:
+                    df.to_parquet(tmp, index=False)
+                    os.replace(tmp, dst)
+                except ImportError as exc:
+                    if os.path.exists(tmp):
+                        try:
+                            os.remove(tmp)
+                        except OSError:
+                            pass
+                    self._storage_format = "csv"
+                    logger.warning(
+                        "parquet_unavailable_fallback_to_csv error=%s",
+                        exc,
+                    )
+                    _write_csv(df, f"{base}.csv")
+                except ValueError as exc:
+                    msg = str(exc)
+                    if "usable engine" in msg or "parquet" in msg:
+                        if os.path.exists(tmp):
+                            try:
+                                os.remove(tmp)
+                            except OSError:
+                                pass
+                        self._storage_format = "csv"
+                        logger.warning(
+                            "parquet_unavailable_fallback_to_csv error=%s",
+                            exc,
+                        )
+                        _write_csv(df, f"{base}.csv")
+                    else:
+                        raise
 
             events_written = 0
             decisions_written = 0
@@ -497,7 +536,7 @@ class Collector:
                     for c, dt in dtype_map.items():
                         if c in df_e.columns:
                             df_e[c] = df_e[c].astype(dt)
-                    _write_parquet(df_e, f"events_{events_part:06d}.parquet")
+                    _write_table(df_e, f"events_{events_part:06d}")
                     events_written = len(df_e)
                     events_ok = True
 
@@ -532,13 +571,13 @@ class Collector:
                     for c, dt in dtype_map.items():
                         if c in df_d.columns:
                             df_d[c] = df_d[c].astype(dt)
-                    _write_parquet(df_d, f"decisions_{decisions_part:06d}.parquet")
+                    _write_table(df_d, f"decisions_{decisions_part:06d}")
                     decisions_written = len(df_d)
                     decisions_ok = True
 
                 if pending_markers and markers_part is not None:
                     df_m = pd.DataFrame.from_records(list(pending_markers))
-                    _write_parquet(df_m, f"markers_{markers_part:06d}.parquet")
+                    _write_table(df_m, f"markers_{markers_part:06d}")
                     markers_written = len(df_m)
                     markers_ok = True
             except Exception:
