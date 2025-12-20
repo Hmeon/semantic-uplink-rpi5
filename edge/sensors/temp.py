@@ -165,8 +165,11 @@ class TempSensor:
         self._src = self._select_backend(backend, w1_path=w1_path, sysfs_path=sysfs_path)
         self._backend_name = self._src.source_name
         # 시그널 안전 종료
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
+        try:
+            signal.signal(signal.SIGINT, self._handle_signal)
+            signal.signal(signal.SIGTERM, self._handle_signal)
+        except ValueError:
+            pass
 
     # ---------------- 내부 유틸 ----------------
 

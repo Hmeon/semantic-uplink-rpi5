@@ -796,6 +796,31 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             ui_kind_default = "console"
         elif backend in {"ssd1306", "auto"}:
             ui_kind_default = backend
+    buttons_enable_default = (
+        bool(device_cfg.buttons.enabled)
+        if device_cfg is not None and device_cfg.buttons is not None
+        else False
+    )
+    btn_mode_pin_default = (
+        int(device_cfg.buttons.mode_pin)
+        if device_cfg is not None and device_cfg.buttons is not None
+        else 17
+    )
+    btn_profile_pin_default = (
+        int(device_cfg.buttons.profile_pin)
+        if device_cfg is not None and device_cfg.buttons is not None
+        else 27
+    )
+    btn_marker_pin_default = (
+        int(device_cfg.buttons.marker_pin)
+        if device_cfg is not None and device_cfg.buttons is not None
+        else 22
+    )
+    btn_debounce_ms_default = (
+        int(device_cfg.buttons.debounce_ms)
+        if device_cfg is not None and device_cfg.buttons is not None
+        else 200
+    )
 
     p = argparse.ArgumentParser(description="Edge daemon: sensors → EWMA(τ) → Outbox → MQTT QoS1")
     # 공통
@@ -909,11 +934,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_false",
         help="GPIO 버튼 비활성화",
     )
-    p.set_defaults(buttons_enable=False)
-    p.add_argument("--btn-mode-pin", type=int, default=17, help="정책 모드 버튼 BCM 핀")
-    p.add_argument("--btn-profile-pin", type=int, default=27, help="링크 프로파일 버튼 BCM 핀")
-    p.add_argument("--btn-marker-pin", type=int, default=22, help="마커 버튼 BCM 핀")
-    p.add_argument("--btn-debounce-ms", type=int, default=200, help="버튼 디바운스(ms)")
+    p.set_defaults(buttons_enable=buttons_enable_default)
+    p.add_argument("--btn-mode-pin", type=int, default=btn_mode_pin_default, help="정책 모드 버튼 BCM 핀")
+    p.add_argument("--btn-profile-pin", type=int, default=btn_profile_pin_default, help="링크 프로파일 버튼 BCM 핀")
+    p.add_argument("--btn-marker-pin", type=int, default=btn_marker_pin_default, help="마커 버튼 BCM 핀")
+    p.add_argument("--btn-debounce-ms", type=int, default=btn_debounce_ms_default, help="버튼 디바운스(ms)")
     p.add_argument("--tc-iface", default="eth0", help="tc 적용할 인터페이스 (버튼 프로파일 변경 시)")
     p.add_argument("--tc-both", action="store_true", help="ingress(ifb0)도 shaping")
     p.add_argument(

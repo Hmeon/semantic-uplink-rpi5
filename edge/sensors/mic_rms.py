@@ -177,8 +177,11 @@ class MicRMS:
             self._src = _ARecordSource(self.sample_rate, self.frame_samples, device=arecord_device)
             self._backend_name = "arecord"
         # 시그널 시 안전 종료
-        signal.signal(signal.SIGINT, self._handle_signal)
-        signal.signal(signal.SIGTERM, self._handle_signal)
+        try:
+            signal.signal(signal.SIGINT, self._handle_signal)
+            signal.signal(signal.SIGTERM, self._handle_signal)
+        except ValueError:
+            pass
 
     # ---------- 공개 API ----------
 
