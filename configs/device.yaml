@@ -10,6 +10,8 @@ sensors:
 ui:
   enabled: true
   backend: "lcd"   # lcd | console
+buttons:
+  enabled: true
 mqtt:
   host: localhost
   port: 1883

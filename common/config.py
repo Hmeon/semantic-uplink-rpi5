@@ -129,6 +129,32 @@ class DeviceUIConfig(BaseModel):
     backend: str = "console"
 
 
+class DeviceButtonsConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    mode_pin: int = 17
+    profile_pin: int = 27
+    marker_pin: int = 22
+    debounce_ms: int = 200
+
+    @field_validator("mode_pin", "profile_pin", "marker_pin")
+    @classmethod
+    def _pin_positive(cls, v: int) -> int:
+        iv = int(v)
+        if iv <= 0:
+            raise ValueError("pin must be > 0")
+        return iv
+
+    @field_validator("debounce_ms")
+    @classmethod
+    def _debounce_nonneg(cls, v: int) -> int:
+        iv = int(v)
+        if iv < 0:
+            raise ValueError("debounce_ms must be >= 0")
+        return iv
+
+
 class DeviceMQTTConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -143,6 +169,7 @@ class DeviceConfig(BaseModel):
     device_id: str
     sensors: DeviceSensorsConfig
     ui: DeviceUIConfig | None = None
+    buttons: DeviceButtonsConfig | None = None
     mqtt: DeviceMQTTConfig
 
 
