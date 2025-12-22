@@ -2,8 +2,11 @@
 
 ## Methodology
 - Benchmark script: `scripts/bench_policy_rpi5.py`
-- Command: `.\.venv_audit\Scripts\python scripts\bench_policy_rpi5.py --steps 2000 --out artifacts\bench_policy_rpi5.csv`
-- Notes: this run executed on a Windows host (not RPi5). Use the same command on RPi5 to validate real hardware timings and maxrss.
+- Host run (Windows reference): `.\.venv_audit\Scripts\python scripts\bench_policy_rpi5.py --steps 2000 --out artifacts\bench_policy_rpi5.csv`
+- RPi5 run (recommended):
+  - `python -m venv .venv && source .venv/bin/activate`
+  - `python scripts/bench_policy_rpi5.py --steps 2000 --out artifacts/bench_policy_rpi5.csv`
+- Notes: timings below are from a Windows host; re-run on RPi5 to validate real hardware timings and `maxrss`.
 
 ## Timing summary (p50/p95)
 | metric | p50_ms | p95_ms | mean_ms | n | cpu_total_ms | maxrss_kb |
@@ -21,5 +24,5 @@
 
 ## Scalability considerations
 - Multi-sensor runs scale linearly with per-sensor policy loops; confirm p95 under target thresholds at expected sensor counts.
-- Increase `--steps` and synthetic rates to mimic 10?20 Hz for MIC and 1 Hz for TEMP.
+- Increase `--steps` and synthetic rates to mimic 10-20 Hz for MIC and 1 Hz for TEMP.
 - Watch outbox size and `rate_limit_skips` when min_emit_interval_ms is low.

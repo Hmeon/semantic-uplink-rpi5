@@ -296,6 +296,7 @@ def load_linucb_config(
     reward = cfg_dict.get("reward", {}) or {}
     safety = cfg_dict.get("safety", {}) or {}
     diagnostics = cfg_dict.get("diagnostics", {}) or {}
+    scales = cfg_dict.get("scales", {}) or {}
     return LinUCBConfig(
         device_id=device_id,
         sensor=sensor,
@@ -305,6 +306,8 @@ def load_linucb_config(
         w_aoi=float(reward.get("alpha", 1.0)),
         w_mae=float(reward.get("beta", 1.0)),
         w_rate=float(reward.get("gamma", 1.0)),
+        aoi_scale_ms=float(scales.get("aoi_ms", 1000.0)),
+        rate_scale_bps=float(scales.get("rate_bps", 1024.0)),
         aoi_max_ms=float(safety.get("aoi_max_ms", 5000.0)),
         mae_max=float(safety.get("mae_max", 2.0)),
         safety_force_emit_on_aoi=bool(safety.get("safety_force_emit_on_aoi", False)),

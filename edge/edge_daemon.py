@@ -107,6 +107,11 @@ class LinkCfg:
     profiles_config: str | None = None  # YAML로 tc profile override (옵션)
 
 
+@dataclass(slots=True)
+class DecisionCfg:
+    publish: str = "always"  # always|event|never
+
+
 class EdgeDaemon:
     def __init__(
         self,
@@ -127,6 +132,7 @@ class EdgeDaemon:
         ui: UICfg | None = None,
         buttons: ButtonsCfg | None = None,
         link: LinkCfg | None = None,
+        decision: DecisionCfg | None = None,
     ):
         self.device_id = device_id
         self.profile = profile
@@ -146,6 +152,7 @@ class EdgeDaemon:
         self.ui_cfg = ui or UICfg()
         self.buttons_cfg = buttons or ButtonsCfg()
         self.link_cfg = link or LinkCfg()
+        self.decision_cfg = decision or DecisionCfg()
         self._tc_profiles_override = None
 
         # 런타임
@@ -600,7 +607,7 @@ class EdgeDaemon:
                 )
             except Exception:
                 logger.exception("outbox_enqueue_failed type=event label=%s sensor=%s", label, sensor.value)
-        if res.decision is not None:
+        if res.decision is not None and self._should_publish_decision(res):
             if res.event is not None:
                 self._maybe_log_policy_diag(sensor=sensor, seq=int(res.event.seq), decision=res.decision)
             try:
@@ -617,6 +624,14 @@ class EdgeDaemon:
                 logger.exception(
                     "outbox_enqueue_failed type=decision label=%s sensor=%s", label, sensor.value
                 )
+
+    def _should_publish_decision(self, res: StepResult) -> bool:
+        mode = str(self.decision_cfg.publish).strip().lower()
+        if mode == "never":
+            return False
+        if mode == "event" and res.event is None:
+            return False
+        return True
 
     def _maybe_log_policy_diag(self, *, sensor: SensorType, seq: int, decision) -> None:
         if decision is None:
@@ -697,6 +712,13 @@ class EdgeDaemon:
 
     def _make_linucb_config(self, sensor: SensorType):
         cfg = self._arms_cfg or {}
+        sensor_cfg = (cfg.get("sensors") or {}).get(sensor.value) or {}
+        if sensor_cfg:
+            merged = dict(cfg)
+            for key in ("arms", "reward", "safety", "diagnostics", "scales"):
+                if key in sensor_cfg and sensor_cfg[key] is not None:
+                    merged[key] = sensor_cfg[key]
+            cfg = merged
         arms = cfg.get("arms") or []
         if not arms:
             raise ValueError("adaptive mode requires arms in config (see configs/policy.yaml)")
@@ -843,6 +865,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="policy mode: periodic | fixed_tau | adaptive (LinUCB)",
     )
     p.add_argument("--arms", default="configs/policy.yaml", help="(adaptive) arms YAML path")
+    p.add_argument(
+        "--decision-publish",
+        choices=["always", "event", "never"],
+        default="always",
+        help="publish policy decision messages (always|event|never)",
+    )
     p.add_argument("--run-dir", default=None, help="기록 루트(artifacts/<ts>_<device_id> 기본)")
     p.add_argument("--broker", default=broker_default)
     p.add_argument("--port", type=int, default=port_default)
@@ -1052,6 +1080,7 @@ def main(argv: list[str] | None = None):
         apply_on_start=bool(args.tc_apply_on_start),
         profiles_config=args.tc_profiles_config,
     )
+    decision_cfg = DecisionCfg(publish=str(args.decision_publish))
 
     if not mic_cfg.enable and not temp_cfg.enable:
         logger.error(
@@ -1085,6 +1114,7 @@ def main(argv: list[str] | None = None):
         ui=ui_cfg,
         buttons=buttons_cfg,
         link=link_cfg,
+        decision=decision_cfg,
     )
     try:
         daemon.start()

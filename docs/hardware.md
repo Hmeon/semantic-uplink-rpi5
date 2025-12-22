@@ -57,3 +57,4 @@ This document captures the fixed wiring used by the RPi5 semantic uplink platfor
 - I2C: enable `i2c_arm` and verify `/dev/i2c-1`.
 - Buttons use internal pull-ups; wiring is active-low to ground.
 - If you change any pin or address, update this file and the corresponding CLI defaults in `edge/edge_daemon.py`.
+- For repeatable mic measurements, keep capture gain fixed and disable AGC across all runs.

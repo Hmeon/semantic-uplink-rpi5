@@ -38,6 +38,13 @@ class RewardConfig(BaseModel):
     gamma: float = 1.0
 
 
+class ScaleConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    aoi_ms: float = 1000.0
+    rate_bps: float = 1024.0
+
+
 class SafetyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -52,6 +59,16 @@ class PolicyDiagnosticsConfig(BaseModel):
     enabled: bool = False
 
 
+class SensorPolicyConfig(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    arms: list[ArmConfig] | None = None
+    reward: RewardConfig | None = None
+    safety: SafetyConfig | None = None
+    diagnostics: PolicyDiagnosticsConfig | None = None
+    scales: ScaleConfig | None = None
+
+
 class PolicyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -59,6 +76,8 @@ class PolicyConfig(BaseModel):
     reward: RewardConfig = Field(default_factory=RewardConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     diagnostics: PolicyDiagnosticsConfig = Field(default_factory=PolicyDiagnosticsConfig)
+    scales: ScaleConfig = Field(default_factory=ScaleConfig)
+    sensors: dict[str, SensorPolicyConfig] = Field(default_factory=dict)
 
     @field_validator("arms")
     @classmethod

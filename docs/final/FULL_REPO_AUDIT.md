@@ -1,5 +1,8 @@
 # Full repository audit
 
+Snapshot note: this audit is a point-in-time report. Regenerate after major changes.
+
+
 - Generated: 2025-12-19T18:06:20Z
 - Scope: all files in repo excluding .git and .venv* directories
 

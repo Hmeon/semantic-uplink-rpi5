@@ -1,5 +1,7 @@
 # Completeness score
 
+Snapshot: 2025-12-19 (update after new runs/audits).
+
 ## Rubric (0-100)
 - Metrics/plots quality: 30
 - AI correctness & stability: 30

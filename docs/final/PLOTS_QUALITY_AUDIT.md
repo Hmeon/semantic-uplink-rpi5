@@ -1,5 +1,7 @@
 # Plots quality audit
 
+Snapshot from `artifacts/analysis_shipit`. Re-run `python -m collector.quality_audit --analysis-dir <DIR>` after new analyses.
+
 - Analysis dir: `artifacts/analysis_shipit`
 - Figs dir: `artifacts/analysis_shipit/figs`
 - Formats inferred: `png,pdf`

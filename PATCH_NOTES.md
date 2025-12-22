@@ -4,6 +4,28 @@
 
 ---
 
+## 2025-12-22 — 실험 자동화/시간 동기화/문서 최신화
+
+### 추가된 자동화 스크립트
+- `scripts/run_3h_sequence.sh`로 **Periodic → Fixed τ → Adaptive** 3시간 시퀀스를 자동 실행.
+- `START_FROM` 지원(중간 재개), `PYTHON` 지정으로 venv Parquet 보장.
+- `timeout` 종료 코드(124)는 정상 종료로 처리하도록 수정.
+
+### 시간 동기화
+- 시퀀스 실행 전에 `timedatectl` 로그 기록.
+- 기본값으로 NTP를 일시 중지/재시작(`NTP_FREEZE=1`)해 AoI time-step 방지.
+
+### 정책/실험 설정
+- AIoT 튜닝용 arms 파일 추가: `configs/policy_adaptive_aiot.yaml`
+- 품질 기준 arms 파일 추가: `configs/policy_adaptive_quality.yaml`
+- min_emit 기본값을 0으로 맞춰 품질 위주 실험에 대응.
+
+### 문서/가이드 보완
+- README를 최신 실험 플로우/지표/분석/진단 섹션으로 재구성.
+- CODEX/AGENTS 문서에서 깨진 인코딩과 오래된 예시를 정리.
+
+---
+
 ## 2025-12-19 — 지표/시각화 고품질 보증 + 로그 체계 확립
 
 ### ✅ Quality audit (보고서/논문용 QC 증빙)
@@ -21,7 +43,7 @@
 ### ✅ Logging 표준화(운영/재현/디버깅)
 - 공통 초기화: `common/logging_setup.py` (timestamp 포함, console+file rotation)
   - CLI: `--log-level`, `--log-file`, `--log-max-bytes`, `--log-backup-count`, `--no-log-console`
-- 디버깅(성능 가드): `configs/policy.yaml`에서 `diagnostics.enabled: true` + 실행 `--log-level DEBUG`
+- 디버깅(성능 가드): 사용하는 정책 YAML에서 `diagnostics.enabled: true` + 실행 `--log-level DEBUG`
   - 한 줄 `policy_diag key=value ...` 형태로 핵심 필드 출력
 
 ### ⚠️ 현재 남은 커버리지(정상 SKIP 조건)

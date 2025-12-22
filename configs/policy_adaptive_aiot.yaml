@@ -1,0 +1,40 @@
+# AIoT-balanced adaptive policy (quality 유지 + temp rate 절감 목표).
+# - temp에 대해 rate penalty를 강화하고 low-rate 팔을 추가.
+# - AoI/MAE 품질 유지를 위해 alpha/beta 유지 및 safety 강화.
+# - diagnostics enabled to produce full LinUCB plots.
+arms:
+  - { tau: 1.0, kbits: 10 }
+  - { tau: 2.0, kbits: 8 }
+  - { tau: 3.0, kbits: 6 }
+  - { tau: 5.0, kbits: 4 }
+reward:
+  alpha: 1.4
+  beta: 1.0
+  gamma: 0.7
+safety:
+  aoi_max_ms: 3000
+  mae_max: 2.0
+  safety_force_emit_on_aoi: true
+diagnostics:
+  enabled: true
+scales:
+  aoi_ms: 1000
+  rate_bps: 256
+sensors:
+  temp:
+    arms:
+      - { tau: 0.1, kbits: 10 }
+      - { tau: 0.2, kbits: 8 }
+      - { tau: 0.4, kbits: 6 }
+      - { tau: 0.6, kbits: 4 }
+    reward:
+      alpha: 1.6
+      beta: 1.2
+      gamma: 1.4
+    safety:
+      aoi_max_ms: 3000
+      mae_max: 2.0
+      safety_force_emit_on_aoi: true
+    scales:
+      aoi_ms: 1000
+      rate_bps: 64

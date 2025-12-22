@@ -2273,16 +2273,19 @@ def _try_make_pipeline_plots(
                     continue
 
                 fig, ax = plt.subplots(figsize=(7.4, 4.2))
-                bp = ax.boxplot(
-                    data,
-                    tick_labels=labels,
-                    showfliers=False,
-                    patch_artist=True,
-                    medianprops={"color": "#111827", "linewidth": 1.8},
-                    boxprops={"edgecolor": "#374151"},
-                    whiskerprops={"color": "#374151"},
-                    capprops={"color": "#374151"},
-                )
+                boxplot_kwargs = {
+                    "showfliers": False,
+                    "patch_artist": True,
+                    "medianprops": {"color": "#111827", "linewidth": 1.8},
+                    "boxprops": {"edgecolor": "#374151"},
+                    "whiskerprops": {"color": "#374151"},
+                    "capprops": {"color": "#374151"},
+                }
+                try:
+                    bp = ax.boxplot(data, tick_labels=labels, **boxplot_kwargs)
+                except TypeError:
+                    # Older matplotlib uses "labels" instead of "tick_labels".
+                    bp = ax.boxplot(data, labels=labels, **boxplot_kwargs)
                 for box, lab in zip(bp.get("boxes", []), labels):
                     box.set_facecolor(colors.get(lab, "#E5E7EB"))
                     box.set_alpha(0.35)
@@ -3754,16 +3757,19 @@ def _try_make_diagnostic_plots(
                     continue
 
                 fig, ax = plt.subplots(figsize=(7.4, 4.2))
-                bp = ax.boxplot(
-                    data,
-                    tick_labels=labels,
-                    showfliers=False,
-                    patch_artist=True,
-                    medianprops={"color": "#111827", "linewidth": 1.8},
-                    boxprops={"edgecolor": "#374151"},
-                    whiskerprops={"color": "#374151"},
-                    capprops={"color": "#374151"},
-                )
+                boxplot_kwargs = {
+                    "showfliers": False,
+                    "patch_artist": True,
+                    "medianprops": {"color": "#111827", "linewidth": 1.8},
+                    "boxprops": {"edgecolor": "#374151"},
+                    "whiskerprops": {"color": "#374151"},
+                    "capprops": {"color": "#374151"},
+                }
+                try:
+                    bp = ax.boxplot(data, tick_labels=labels, **boxplot_kwargs)
+                except TypeError:
+                    # Older matplotlib uses "labels" instead of "tick_labels".
+                    bp = ax.boxplot(data, labels=labels, **boxplot_kwargs)
                 for box, lab in zip(bp.get("boxes", []), labels):
                     box.set_facecolor(colors.get(lab, "#E5E7EB"))
                     box.set_alpha(0.35)

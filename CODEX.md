@@ -68,13 +68,14 @@ python -m collector.analyze --input artifacts/run1/logs --out results/run1
 - Analyzer: `python -m collector.analyze`
 - Link shaper: `python -m link.shaper.tc_profiles`
 - Scenario runner: `python -m experiments.run_scenarios`
+- 3-정책 자동 시퀀스: `bash scripts/run_3h_sequence.sh`
 
 ### 디렉터리 역할
 - `edge/`: 센싱 → 예측 → 정책 → 양자화 → 업로더(UI 포함)
 - `collector/`: MQTT 구독/중복 제거/저장/분석 도구
 - `link/`: tc/netem 링크 셰이핑
 - `common/`: 스키마/양자화/시간/지표/Discord webhook
-- `configs/`: 정책 arms YAML 등 (현재 `policy.yaml`만 런타임에서 사용)
+- `configs/`: 정책/디바이스/링크 YAML (`policy.yaml` 기본, `policy_adaptive_aiot.yaml`/`policy_adaptive_quality.yaml` 제공)
 - `scripts/`: 편의 실행 스크립트(리눅스/라즈베리파이용)
 - `tests/`: 유닛/통합(placeholder)
 
@@ -153,13 +154,36 @@ sudo systemctl start semantic-uplink-stack
 ```
 
 **온도 센서(DS18B20)**
-- Raspberry Pi OS에서 1‑Wire 활성화 필요(`dtoverlay=w1-gpio,gpiopin=4`)
+- Raspberry Pi OS에서 1-Wire 활성화 필요(`dtoverlay=w1-gpio,gpiopin=4`)
 - Edge 실행 시 `--temp-enable --temp-backend w1` 또는 `auto`
 
 **LCD/버튼**
 - I2C 활성화 필요(`/dev/i2c-1`)
 - LCD: `--ui-enable --ui-kind lcd1602 --ui-address 0x27`
 - Buttons: `--buttons-enable`
+
+---
+
+### 4.3 3-policy 3-hour quality benchmark (automated)
+`scripts/run_3h_sequence.sh` runs **Periodic -> Fixed tau -> Adaptive** sequentially.
+By default it freezes NTP to avoid AoI time-step artifacts (`NTP_FREEZE=1`).
+
+```bash
+export IFACE=lo
+export PROFILE=slow_10kbps
+export W1_PATH="$(ls /sys/bus/w1/devices/28-*/w1_slave | head -n 1)"
+export RUN_SECONDS=10800
+export RUN_GRACE=30
+export ADAPTIVE_ARMS=configs/policy_adaptive_aiot.yaml
+
+# Use venv python to keep Parquet enabled.
+PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
+```
+
+Resume from mid-run:
+```bash
+START_FROM=fixed_tau bash scripts/run_3h_sequence.sh
+```
 
 ---
 
@@ -247,6 +271,7 @@ PY
 ### 흔한 문제
 - `tc` 적용 실패: root 또는 `CAP_NET_ADMIN` 권한 필요 + 인터페이스 이름 확인(`ip link`)
 - 오디오 입력 실패: `arecord` 설치/장치 선택, 또는 `--mic-enable` 끄기
+- Parquet 대신 CSV가 생성됨: `pyarrow` 설치/임포트 실패. venv 사용 후 `import pyarrow` 확인
 - Windows 콘솔 한글/특수문자 깨짐: `chcp 65001` 또는 `PYTHONIOENCODING=utf-8`
 
 ---

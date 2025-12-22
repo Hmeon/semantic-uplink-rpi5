@@ -1,13 +1,13 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `edge/`: sensing → prediction → policy (LinUCB) → quantization → uploader/UI entry (`edge.edge_daemon`).
+- `edge/`: sensing -> prediction -> policy (LinUCB) -> quantization -> uploader/UI entry (`edge.edge_daemon`).
 - `collector/`: MQTT subscriber, metrics, persistence, analysis tools.
 - `link/`: `tc`/`netem` profiles and helpers to shape constrained links.
 - `common/`: shared schemas, quantization, time/MQTT helpers.
 - `configs/`: YAML for device, policy, and link profiles; tweak here to change runs without code edits.
 - `stack/`: single-Pi supervisor for broker+collector+edge (`stack.pi_stack`).
-- `scripts/`: thin wrappers for typical flows (`run_stack.sh`, `apply_profile.sh`, `start_collector.sh`, `start_edge.sh`).
+- `scripts/`: thin wrappers for typical flows (`run_stack.sh`, `run_3h_sequence.sh`, `apply_profile.sh`, `start_collector.sh`, `start_edge.sh`).
 - `tests/`: `unit/` and `integration/`; `data/` and `logs/` hold run artifacts.
 
 ## Build, Test, and Development Commands
@@ -33,7 +33,7 @@ bash scripts/run_stack.sh
 ```
 `scripts/` exposes the same flows if you prefer shell entrypoints; keep the virtualenv active.
 
-## “Start Here” Docs
+## Start Here Docs
 - `CODEX.md`: quick manual (repo map, run commands, debugging checklist)
 - `PATCH_NOTES.md`: recent changes + resume guide
 
@@ -56,5 +56,5 @@ bash scripts/run_stack.sh
 
 ## Security & Configuration Tips
 - Never commit real broker credentials or private link profiles; sample YAML in `configs/` should stay generic.
-- Outbox/collector paths (`data/`, `logs/`) hold run artifacts—clean or gitignore before publishing.
+- Outbox/collector paths (`data/`, `logs/`) hold run artifacts - clean or gitignore before publishing.
 - When shaping links, prefer loopback (`lo`) during dev to avoid disrupting host connectivity.
