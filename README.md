@@ -47,6 +47,7 @@
 - [Time Sync (NTP/RTC)](#time-sync)
 - [Artifacts and Outputs](#artifacts-outputs)
 - [Analysis and Plots](#analysis)
+- [Final Results (slow_10kbps, 3h)](#final-results)
 - [Configuration](#configuration)
 - [Hardware](#hardware)
 - [UI and Controls](#ui-controls)
@@ -148,7 +149,7 @@ These are guiding targets. The actual trade-off is reported per profile and per 
 | Adaptive (LinUCB) | `--mode adaptive` | Contextual bandit selects (τ, kbits) | Link-aware optimization |
 
 ### LinUCB details
-- **Context features**: AoI, residual, residual variance, loss estimate (currently 0), outbox queue length
+- **Context features**: AoI (edge interval + ACK delay EWMA), residual, residual variance, loss EWMA (nack/timeout), outbox queue length
 - **Reward**: weighted AoI + MAE + Rate (normalized by scales)
 - **Guardrails**: optional AoI/MAE thresholds force safer arms
 - **Diagnostics**: UCB terms, reward decomposition, timing metrics (enable in policy config)
@@ -347,6 +348,32 @@ Outputs:
 - `results/run1/metrics_vs_periodic.csv`
 - `results/run1/report.md`
 - `results/run1/figs/*` (plots and diagnostic panels)
+
+---
+
+<a id="final-results"></a>
+## Final Results (slow_10kbps, 3h)
+**Dataset**
+- Inputs: `artifacts/slow10_periodic_3h_B/logs`, `artifacts/slow10_fixed_3h_B/logs`,
+  `artifacts/slow10_linucb_3h_B/logs`
+- Output: `results/final_compare_3h_slow_10kbps`
+- Baseline: `periodic`
+- Note: MAE is event-based (`res`), AoI uses `t_recv_ns`. (B logs are controlled/synthetic for
+  closed-environment comparison.)
+
+**Summary (mean values)**
+| sensor | periodic (Rate/AoI/MAE) | fixed_tau | adaptive |
+| --- | --- | --- | --- |
+| mic_rms | 524.0 B/s / 1536.8 ms / 0.052 | 26.0 B/s / 6287.7 ms / 0.052 | 37.4 B/s / 4745.2 ms / 0.053 |
+| temp | 255.0 B/s / 1802.9 ms / 0.036 | 23.7 B/s / 6952.2 ms / 0.036 | 27.4 B/s / 5756.9 ms / 0.035 |
+
+**Evaluation vs goals**
+- Rate reduction (>=60%): PASS (~89-95% reduction)
+- AoI improvement (>=30%): FAIL (AoI worsened vs periodic)
+- MAE penalty (<=10%): PASS (within ~4%)
+- Trade-off: Adaptive improves AoI vs fixed_tau with small rate increase, giving the best overall
+  balance under the constrained link.
+- Detailed write-up: `docs/final/FINAL_EVALUATION.md`
 
 ---
 

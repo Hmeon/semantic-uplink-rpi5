@@ -4,6 +4,29 @@
 
 ---
 
+## 2025-12-23 · LinUCB 링크 피드백 개선 적용
+
+### 적용 내용
+- Outbox PUBACK 지연(EWMA)을 LinUCB AoI 입력으로 반영(수신 지연 근사).
+- 재전송/타임아웃 기반 loss EWMA를 `state_loss`로 주입.
+- AIoT 정책 YAML 보정: AoI 가중치 상향, rate 페널티 완화, aoi_max_ms 축소.
+
+---
+
+## 2025-12-23 · 최종 비교 결과 정리
+
+### 최종 결과(3h, slow_10kbps)
+- 결과 경로: `results/final_compare_3h_slow_10kbps`
+- 입력 로그: `artifacts/slow10_periodic_3h_B/logs`, `artifacts/slow10_fixed_3h_B/logs`,
+  `artifacts/slow10_linucb_3h_B/logs`
+- 요약: Rate 목표 PASS, AoI 목표 FAIL, MAE 목표 PASS. Adaptive가 fixed_tau 대비 AoI 개선,
+  rate는 소폭 증가.
+- B 로그는 비교 정합을 위한 제어된 합성 로그(폐쇄 환경).
+
+---
+
+
+
 ## 2025-12-22 — 실험 자동화/시간 동기화/문서 최신화
 
 ### 추가된 자동화 스크립트

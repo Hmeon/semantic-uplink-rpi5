@@ -26,7 +26,13 @@ from common.schema import (
 from edge.policy.linucb import Arm, LinUCBConfig, LinUCBPolicy, PolicyState
 from edge.predict.ewma import EWMAConfig, EWMAPredictor
 
-__all__ = ["StepResult", "SensorPolicyRuntime", "load_linucb_config"]
+__all__ = ["LinkFeedback", "StepResult", "SensorPolicyRuntime", "load_linucb_config"]
+
+
+@dataclass(slots=True)
+class LinkFeedback:
+    ack_delay_ms: float | None = None
+    loss_rate: float | None = None
 
 
 @dataclass(slots=True)
@@ -75,7 +81,12 @@ class SensorPolicyRuntime:
 
     # ---------------- 공개 API ----------------
 
-    def step(self, sample: Any, outbox_pending: int) -> StepResult:
+    def step(
+        self,
+        sample: Any,
+        outbox_pending: int,
+        link_feedback: LinkFeedback | None = None,
+    ) -> StepResult:
         """
         샘플 1개 처리 → (EventMsg?, PolicyDecisionMsg?, reward?)
         - adaptive 모드가 아닌 경우 decision/reward는 None
@@ -89,13 +100,34 @@ class SensorPolicyRuntime:
         t_predict_ms = None
         t_decide_ms = None
         t_observe_ms = None
+        ack_delay_ms = 0.0
+        loss_est = 0.0
+        if link_feedback is not None:
+            if link_feedback.ack_delay_ms is not None:
+                try:
+                    ack_delay_ms = float(link_feedback.ack_delay_ms)
+                except Exception:
+                    ack_delay_ms = 0.0
+                if not math.isfinite(ack_delay_ms) or ack_delay_ms < 0.0:
+                    ack_delay_ms = 0.0
+            if link_feedback.loss_rate is not None:
+                try:
+                    loss_est = float(link_feedback.loss_rate)
+                except Exception:
+                    loss_est = 0.0
+                if not math.isfinite(loss_est):
+                    loss_est = 0.0
+                loss_est = min(1.0, max(0.0, loss_est))
 
         ts_ns, _seq, x_raw, valid, _last_pred, resid = self._predictor.preview(sample)
         if not valid:
-            # 센서 오류 시 상태만 갱신하고 종료
+            # sensor invalid sample: update predictor state and return metrics
             self._predictor.predict_and_maybe_emit(sample)
             last_emit_ns = self._predictor.last_emit_ns
-            aoi_ms = 0.0 if last_emit_ns is None else max(0.0, (ts_ns - last_emit_ns) / 1e6)
+            edge_aoi_ms = (
+                0.0 if last_emit_ns is None else max(0.0, (ts_ns - last_emit_ns) / 1e6)
+            )
+            aoi_ms = edge_aoi_ms + ack_delay_ms
             mae_est = self._estimate_mae(x_raw) if math.isfinite(x_raw) else 0.0
             return StepResult(
                 event=None,
@@ -111,10 +143,10 @@ class SensorPolicyRuntime:
         if not math.isfinite(res_var):
             res_var = 0.0
         last_emit_ns = self._predictor.last_emit_ns
-        aoi_ms = (
+        edge_aoi_ms = (
             0.0 if last_emit_ns is None else max(0.0, (ts_ns - last_emit_ns) / 1e6)
         )
-        loss_est = 0.0  # 링크 손실 측정치 없음 → 0 가정(collector에서 실제 계산)
+        aoi_ms = edge_aoi_ms + ack_delay_ms
         q_len = max(0, int(outbox_pending))
 
         tau = self._ewma_cfg.tau
@@ -177,7 +209,7 @@ class SensorPolicyRuntime:
                 aoi_ms=int(aoi_ms),
                 event_reason=event.event_reason,
             )
-            rate_bps = self._rate_from_event(event, aoi_ms)
+            rate_bps = self._rate_from_event(event, edge_aoi_ms)
             self._last_sent_val = event.val
 
         if self._linucb is not None:

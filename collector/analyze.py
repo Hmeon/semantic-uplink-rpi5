@@ -205,8 +205,8 @@ def load_events(paths: list[str | os.PathLike]) -> pd.DataFrame:
         "profile": "string",
         "policy": "string",
         # optional
-        "t_recv_ns": "int64",
-        "mqtt_bytes": "int64",
+        "t_recv_ns": "Int64",
+        "mqtt_bytes": "Int64",
     }
     for k, t in cast_cols.items():
         if k in out.columns:
@@ -797,11 +797,11 @@ def estimate_payload_bytes(df: pd.DataFrame) -> pd.Series:
     EventMsg를 재구성하여 MQTT v3.1.1 PUBLISH 바이트(헤더 포함)를 추정.
     df에 'mqtt_bytes' 또는 'mqtt_size_bytes' 컬럼이 이미 있다면 그대로 사용.
     """
-    if "mqtt_bytes" in df.columns:
+    if "mqtt_bytes" in df.columns and not df["mqtt_bytes"].isna().any():
         s = df["mqtt_bytes"].astype("int64")
         s.name = "mqtt_bytes"
         return s
-    if "mqtt_size_bytes" in df.columns:
+    if "mqtt_size_bytes" in df.columns and not df["mqtt_size_bytes"].isna().any():
         s = df["mqtt_size_bytes"].astype("int64")
         s.name = "mqtt_bytes"
         return s

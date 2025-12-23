@@ -8,18 +8,18 @@ arms:
   - { tau: 3.0, kbits: 6 }
   - { tau: 5.0, kbits: 4 }
 reward:
-  alpha: 1.4
+  alpha: 1.8
   beta: 1.0
-  gamma: 0.7
+  gamma: 0.5
 safety:
-  aoi_max_ms: 3000
+  aoi_max_ms: 2500
   mae_max: 2.0
   safety_force_emit_on_aoi: true
 diagnostics:
   enabled: true
 scales:
   aoi_ms: 1000
-  rate_bps: 256
+  rate_bps: 512
 sensors:
   temp:
     arms:
@@ -28,13 +28,13 @@ sensors:
       - { tau: 0.4, kbits: 6 }
       - { tau: 0.6, kbits: 4 }
     reward:
-      alpha: 1.6
+      alpha: 1.9
       beta: 1.2
-      gamma: 1.4
+      gamma: 1.0
     safety:
-      aoi_max_ms: 3000
+      aoi_max_ms: 2500
       mae_max: 2.0
       safety_force_emit_on_aoi: true
     scales:
       aoi_ms: 1000
-      rate_bps: 64
+      rate_bps: 128

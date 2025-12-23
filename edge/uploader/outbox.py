@@ -12,15 +12,16 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 import sqlite3
 import threading
 import time
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List
 
 _LOG = logging.getLogger(__name__)
-__all__ = ["Outbox", "OutboxItem"]
+__all__ = ["Outbox", "OutboxItem", "DeliveryStats"]
 
 
 @dataclass(slots=True)
@@ -36,6 +37,16 @@ class OutboxItem:
     last_attempt_ns: int | None = None
 
 
+@dataclass(slots=True)
+class DeliveryStats:
+    ack_latency_ms: float | None
+    ack_latency_ewma_ms: float | None
+    loss_ewma: float
+    acked: int
+    nacked: int
+    timeouts: int
+
+
 class Outbox:
     """
     Durable FIFO outbox (SQLite WAL).
@@ -48,7 +59,9 @@ class Outbox:
                  db_path: str,
                  ack_timeout_s: float = 20.0,
                  backoff_base_s: float = 1.0,
-                 backoff_cap_s: float = 60.0):
+                 backoff_cap_s: float = 60.0,
+                 ack_latency_alpha: float = 0.2,
+                 loss_ewma_alpha: float = 0.2):
         if not db_path:
             raise ValueError("db_path is required")
         self.db_path = db_path
@@ -67,6 +80,16 @@ class Outbox:
         )
         self._conn.row_factory = sqlite3.Row
         self._bootstrap_db()
+        # Delivery/feedback stats (adaptive policy input).
+        self._ack_latency_ms_last: float | None = None
+        self._ack_latency_ms_ewma: float | None = None
+        self._ack_latency_alpha = _clamp_alpha(ack_latency_alpha)
+        self._loss_ewma: float = 0.0
+        self._loss_alpha = _clamp_alpha(loss_ewma_alpha)
+        self._loss_samples = 0
+        self._acked = 0
+        self._nacked = 0
+        self._timeouts = 0
         _LOG.info("Outbox opened: %s (ack_timeout_s=%.1f, backoff_base_s=%.1f, cap_s=%.1f)",
                   db_path, ack_timeout_s, backoff_base_s, backoff_cap_s)
 
@@ -215,14 +238,35 @@ class Outbox:
         return items
 
     def ack(self, msg_id: int) -> bool:
-        """브로커에서 PUBACK(또는 성공 판정)을 받은 메시지 삭제."""
+        """????? PUBACK(?? ?? ??)? ?? ??? ??."""
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
+            row = cur.execute(
+                "SELECT created_ns, topic FROM messages WHERE id=?",
+                (int(msg_id),),
+            ).fetchone()
             cur.execute("DELETE FROM messages WHERE id=?", (int(msg_id),))
             deleted = cur.rowcount
             cur.execute("COMMIT")
             cur.close()
+            if deleted > 0:
+                self._acked += 1
+                self._update_loss_ewma(0.0)
+                if row is not None:
+                    topic = str(row["topic"])
+                    if topic.startswith("edge/"):
+                        created_ns = int(row["created_ns"])
+                        latency_ms = (time.time_ns() - created_ns) / 1e6
+                        if math.isfinite(latency_ms) and latency_ms >= 0.0:
+                            self._ack_latency_ms_last = float(latency_ms)
+                            if self._ack_latency_ms_ewma is None:
+                                self._ack_latency_ms_ewma = float(latency_ms)
+                            else:
+                                self._ack_latency_ms_ewma = (
+                                    (1.0 - self._ack_latency_alpha) * float(self._ack_latency_ms_ewma)
+                                    + self._ack_latency_alpha * float(latency_ms)
+                                )
         return deleted > 0
 
     def nack(self, msg_id: int) -> None:
@@ -245,6 +289,8 @@ class Outbox:
             )
             cur.execute("COMMIT")
             cur.close()
+            self._nacked += 1
+            self._update_loss_ewma(1.0)
 
     def requeue_stuck(self) -> int:
         """ACK 타임아웃을 초과한 inflight 전부를 재큐잉. 반환: 재큐잉 수."""
@@ -266,6 +312,8 @@ class Outbox:
                     (now_ns + int(delay_ns), mid),
                 )
                 count += 1
+                self._timeouts += 1
+                self._update_loss_ewma(1.0)
             cur.execute("COMMIT")
             cur.close()
         return count
@@ -302,6 +350,31 @@ class Outbox:
         row = row or {"queued": 0, "inflight": 0, "total": 0, "next_id": None}
         return {k: (int(v) if v is not None else 0) for k, v in dict(row).items()}
 
+    def delivery_stats(self) -> DeliveryStats:
+        with self._lock:
+            return DeliveryStats(
+                ack_latency_ms=self._ack_latency_ms_last,
+                ack_latency_ewma_ms=self._ack_latency_ms_ewma,
+                loss_ewma=float(self._loss_ewma),
+                acked=int(self._acked),
+                nacked=int(self._nacked),
+                timeouts=int(self._timeouts),
+            )
+
+    def _update_loss_ewma(self, sample: float) -> None:
+        sample_val = 1.0 if float(sample) > 0 else 0.0
+        if self._loss_samples <= 0 or not math.isfinite(self._loss_ewma):
+            self._loss_ewma = float(sample_val)
+        else:
+            self._loss_ewma = (
+                (1.0 - self._loss_alpha) * float(self._loss_ewma)
+                + self._loss_alpha * float(sample_val)
+            )
+        if not math.isfinite(self._loss_ewma):
+            self._loss_ewma = float(sample_val)
+        self._loss_ewma = float(min(1.0, max(0.0, self._loss_ewma)))
+        self._loss_samples += 1
+
     def close(self) -> None:
         with self._lock:
             try:
@@ -314,3 +387,13 @@ class Outbox:
         return self
     def __exit__(self, exc_type, exc, tb) -> None:
         self.close()
+
+
+def _clamp_alpha(value: float, default: float = 0.2) -> float:
+    try:
+        v = float(value)
+    except Exception:
+        return float(default)
+    if not math.isfinite(v) or v <= 0.0:
+        return float(default)
+    return float(min(1.0, v))

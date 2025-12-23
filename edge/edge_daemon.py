@@ -33,7 +33,7 @@ from edge.uploader.mqtt_publisher import MQTTPublisher
 from edge.rtc import DS3231, RTCGuardian
 from edge.ui.lcd import DisplayConfig, build_display
 from edge.ui.status import StatusTracker
-from edge.policy.runtime import SensorPolicyRuntime, StepResult, load_linucb_config
+from edge.policy.runtime import LinkFeedback, SensorPolicyRuntime, StepResult, load_linucb_config
 from edge.ui.buttons import ButtonsConfig, build_buttons
 from link.shaper import tc_profiles
 
@@ -485,6 +485,16 @@ class EdgeDaemon:
                 ),
             )
 
+    def _link_feedback(self) -> LinkFeedback:
+        try:
+            stats = self.outbox.delivery_stats()
+        except Exception:
+            return LinkFeedback()
+        return LinkFeedback(
+            ack_delay_ms=stats.ack_latency_ewma_ms,
+            loss_rate=stats.loss_ewma,
+        )
+
     def _mic_loop(self):
         cfg = self.mic_cfg
         try:
@@ -523,7 +533,10 @@ class EdgeDaemon:
                     break
                 self._status.update_mic(s.dbfs, s.clip_ratio)
                 pending = self.outbox.pending()
-                res = self._mic_policy.step(s, outbox_pending=pending)
+                link_feedback = self._link_feedback()
+                res = self._mic_policy.step(
+                    s, outbox_pending=pending, link_feedback=link_feedback
+                )
                 self._handle_step_result(res, label="mic", sensor=SensorType.MIC_RMS)
         except SystemExit:
             pass
@@ -573,7 +586,10 @@ class EdgeDaemon:
                     break
                 self._status.update_temp(s.celsius, s.valid)
                 pending = self.outbox.pending()
-                res = self._temp_policy.step(s, outbox_pending=pending)
+                link_feedback = self._link_feedback()
+                res = self._temp_policy.step(
+                    s, outbox_pending=pending, link_feedback=link_feedback
+                )
                 self._handle_step_result(res, label="temp", sensor=SensorType.TEMP)
         except SystemExit:
             pass

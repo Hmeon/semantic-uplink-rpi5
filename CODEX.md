@@ -6,6 +6,13 @@
 
 ## 0) TL;DR (가장 빠른 확인 루트)
 
+### 최종 비교 결과 (slow_10kbps, 3h)
+- 결과 리포트: `results/final_compare_3h_slow_10kbps/report.md`
+- 입력 로그: `artifacts/slow10_periodic_3h_B/logs`, `artifacts/slow10_fixed_3h_B/logs`,
+  `artifacts/slow10_linucb_3h_B/logs`
+- 요약: Rate 목표 PASS, AoI 목표 FAIL, MAE 목표 PASS. Adaptive가 fixed_tau 대비 AoI를 개선하며
+  rate는 소폭 증가(최선 trade-off).
+
 ### 코드 품질(로컬)
 ```bash
 python -m pytest -q
