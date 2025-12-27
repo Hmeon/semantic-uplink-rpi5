@@ -63,35 +63,31 @@ def mqtt_v311_publish_size(
     dup: bool = False,
     retain: bool = False,
 ) -> int:
-    """
-    MQTT 3.1.1 PUBLISH 패킷의 총 바이트 수(고정헤더 + 가변헤더 + 페이로드)를 반환한다.
+    """Compute MQTT 3.1.1 PUBLISH packet size in bytes.
 
-    Parameters
-    ----------
-    topic : str
-        PUBLISH Topic Name (UTF-8). 와일드카드(+/#) 금지, 빈 문자열 금지.
-    payload_len : int
-        페이로드의 바이트 수. 문자열을 보낼 경우 반드시 UTF-8로 인코딩한 bytes 길이를 사용.
-    qos : int, default 1
-        0, 1, 2만 허용. QoS>0 일 때만 Packet Identifier(2바이트)가 포함된다.
-    dup : bool, default False
-        고정헤더 플래그(DUP). QoS 0에서는 DUP=True가 허용되지 않으므로 에러.
-        (크기에는 영향 없음: 플래그는 1바이트 안에서 비트만 변경)
-    retain : bool, default False
-        RETAIN 플래그. 크기에는 영향 없음.
+    Args:
+        topic: PUBLISH topic name (UTF-8, no wildcards).
+        payload_len: Payload byte length.
+        qos: QoS level (0, 1, or 2).
+        dup: DUP flag (invalid for QoS 0).
+        retain: RETAIN flag.
 
-    Returns
-    -------
-    int
-        총 인코딩 바이트 수.
+    Returns:
+        Total encoded bytes (fixed header + variable header + payload).
 
-    Notes
-    -----
-    총 길이 = FixedHeader(1바이트 + RemainingLength 가변바이트) +
-             VariableHeader(TopicNameLen 2바이트 + TopicName + [PacketId 2바이트 if QoS>0]) +
-             Payload(payload_len)
+    Raises:
+        TypeError: If inputs are not the expected types.
+        ValueError: If topic/QoS/DUP constraints are violated.
 
-    RemainingLength = VariableHeader + Payload 의 합이며, 값에 따라 1~4바이트로 인코딩된다.
+    Side Effects:
+        - None.
+
+    Contract:
+        - Validates topic length and wildcard usage per MQTT 3.1.1.
+        - Includes packet identifier only when QoS > 0.
+
+    Failure Modes:
+        - Validation errors propagate to the caller.
     """
     # --- 입력 검증 ---
     topic_len = _validate_publish_topic(topic)

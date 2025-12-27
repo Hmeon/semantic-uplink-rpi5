@@ -30,6 +30,13 @@
 #
 # 의존: pandas, numpy, pyarrow(옵션), common.schema.EventMsg, common.mqttutil
 
+"""Offline analyzer for collector logs (Rate/AoI/MAE).
+
+Loads event/decision/marker logs, normalizes schema, and produces summary tables
+plus a Markdown report. AoI/Rate are computed from receiver time when available,
+which is a deliberate choice that affects all downstream comparisons.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -141,7 +148,29 @@ def _discover_named_files(
 
 
 def load_events(paths: list[str | os.PathLike]) -> pd.DataFrame:
-    """여러 파일에서 Event 레코드를 읽어 단일 DataFrame으로 결합."""
+    """Load Event records from parquet/CSV inputs into one normalized DataFrame.
+
+    Args:
+        paths: Files or directories to search for event logs.
+
+    Returns:
+        A DataFrame normalized to the event schema expected by downstream metrics.
+
+    Raises:
+        FileNotFoundError: If no parquet/CSV files are discovered.
+        RuntimeError: If a parquet file cannot be read (missing optional dependency).
+        ValueError: If required event columns are missing after normalization.
+
+    Side Effects:
+        - Reads files from disk.
+
+    Contract:
+        - Assumes inputs contain EventMsg-compatible records.
+        - Ensures `run_id` exists for de-duplication boundaries.
+
+    Failure Modes:
+        - Propagates pandas/parquet parsing errors for caller handling.
+    """
     files = _discover_files(paths)
     if not files:
         raise FileNotFoundError("no input files found (parquet/csv)")
@@ -216,12 +245,26 @@ def load_events(paths: list[str | os.PathLike]) -> pd.DataFrame:
 
 
 def load_decisions(paths: list[str | os.PathLike]) -> pd.DataFrame:
-    """
-    decisions.(parquet|csv) 파일들을 읽어 결합한다.
+    """Load LinUCB decision logs into a normalized DataFrame.
 
-    필수 컬럼(표준화 후):
-    - ts(ns), device_id, state_aoi, state_res, state_res_var, state_loss, state_q_len,
-      tau, kbits, reward
+    Args:
+        paths: Files or directories to search for decision logs.
+
+    Returns:
+        A normalized DataFrame; empty if no decision files are found.
+
+    Raises:
+        RuntimeError: If a parquet file cannot be read (missing optional dependency).
+        ValueError: If required decision columns are missing after normalization.
+
+    Side Effects:
+        - Reads files from disk.
+
+    Contract:
+        - Assumes decisions contain the policy state and chosen arm metadata.
+
+    Failure Modes:
+        - Propagates parsing errors so the caller can decide whether to skip decisions.
     """
     files = _discover_named_files(
         paths,
@@ -313,13 +356,25 @@ def load_decisions(paths: list[str | os.PathLike]) -> pd.DataFrame:
 
 
 def load_collector_meta(paths: list[str | os.PathLike]) -> pd.DataFrame:
-    """
-    Load Collector meta (logs/collector_meta.json) and expose dedup-related diagnostics.
+    """Load collector metadata logs into a DataFrame.
 
-    Expected keys (collector/collector.py):
-    - bytes_total_including_dups
-    - dup_bytes_dropped
-    - dup_messages_dropped
+    Args:
+        paths: Files or directories to search for `collector_meta.json`.
+
+    Returns:
+        A DataFrame with per-run dedup/byte counters; empty if none are found.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - Reads files from disk.
+
+    Contract:
+        - Assumes metadata keys follow collector/collector.py output schema.
+
+    Failure Modes:
+        - Malformed JSON is logged and skipped; caller receives partial results.
     """
     files = _discover_named_files(paths, names=("collector_meta.json",))
     if not files:
@@ -384,13 +439,27 @@ def _normalize_decisions_schema(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def enrich_decisions_with_events(decisions: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
-    """
-    decisions(PolicyDecision) 로그에 sensor/profile/policy를 보강한다.
+    """Backfill sensor/profile/policy fields in decisions using event logs.
 
-    NOTE:
-    - PolicyDecisionMsg에는 sensor/profile이 포함되어 있지 않으므로,
-      동일 ts/tau/kbits/res의 events 레코드와 매칭하여 추론한다.
-    - 매칭 실패 시 sensor/profile/policy는 'unknown'으로 남는다.
+    Args:
+        decisions: Decision log DataFrame (PolicyDecision).
+        events: Event log DataFrame for the same runs/devices.
+
+    Returns:
+        Decisions with sensor/profile/policy columns populated when matches exist.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None (returns a new DataFrame).
+
+    Contract:
+        - Assumes decisions and events share `run_id`, `device_id`, and timestamp keys.
+        - Uses a best-effort join on ts/tau/kbits/res; unmatched rows remain "unknown".
+
+    Failure Modes:
+        - Mismatched schemas result in partial enrichment rather than hard failure.
     """
     if decisions.empty or events.empty:
         return decisions.copy()
@@ -510,13 +579,28 @@ def summarize_decisions_diagnostics_by_run(
     *,
     window_s: int = 60,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """
-    LinUCB/파이프라인 진단 지표를 decisions 로그에서 집계한다.
+    """Summarize LinUCB diagnostics from decision logs.
+
+    Args:
+        decisions: Decision log DataFrame (normalized).
+        window_s: Window size for action entropy smoothing (seconds).
 
     Returns:
-      - diag_by_run: (run_id, profile, policy, sensor) 단위 요약
-      - arm_distribution: arm_id 분포(long-form; 논문/보고서용)
-      - entropy_windows: 고정 시간창 entropy(long-form)
+        - diag_by_run: Aggregated diagnostics per (run_id, profile, policy, sensor).
+        - arm_distribution: Long-form arm usage distribution.
+        - entropy_windows: Long-form action entropy by fixed window.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None (pure aggregation).
+
+    Contract:
+        - Assumes decision rows contain arm_id, tau/kbits, and optional diagnostics fields.
+
+    Failure Modes:
+        - Empty inputs yield empty DataFrames without error.
     """
     if decisions.empty:
         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
@@ -775,8 +859,25 @@ def _infer_run_id_from_path(p: Path) -> str:
 # ------------------------- 전처리/유틸 -------------------------
 
 def dedup_and_sort(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    (run_id, device_id, sensor, seq) 기준 QoS1 중복 제거, ts 오름차순 정렬.
+    """De-duplicate QoS1 events and enforce deterministic ordering.
+
+    Args:
+        df: Event DataFrame with run_id/device_id/sensor/seq columns.
+
+    Returns:
+        De-duplicated DataFrame sorted by run and time.
+
+    Raises:
+        ValueError: If required key columns are missing.
+
+    Side Effects:
+        - None (returns a new DataFrame).
+
+    Contract:
+        - Retains the earliest arrival per (run_id, device_id, sensor, seq).
+
+    Failure Modes:
+        - Sorting errors propagate if timestamps cannot be compared.
     """
     key = ["run_id", "device_id", "sensor", "seq"]
     if not set(key).issubset(df.columns):
@@ -793,9 +894,25 @@ def dedup_and_sort(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def estimate_payload_bytes(df: pd.DataFrame) -> pd.Series:
-    """
-    EventMsg를 재구성하여 MQTT v3.1.1 PUBLISH 바이트(헤더 포함)를 추정.
-    df에 'mqtt_bytes' 또는 'mqtt_size_bytes' 컬럼이 이미 있다면 그대로 사용.
+    """Estimate MQTT publish byte size per event row.
+
+    Args:
+        df: Event DataFrame.
+
+    Returns:
+        Series of estimated MQTT publish bytes (payload + protocol overhead).
+
+    Raises:
+        ValueError: If required event fields are missing to reconstruct EventMsg.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - If `mqtt_bytes`/`mqtt_size_bytes` is present and complete, uses it as-is.
+
+    Failure Modes:
+        - Reconstruction errors propagate if rows are malformed.
     """
     if "mqtt_bytes" in df.columns and not df["mqtt_bytes"].isna().any():
         s = df["mqtt_bytes"].astype("int64")
@@ -881,11 +998,27 @@ def _aoi_mean_and_p95_from_segments(
 
 
 def aoi_mean_and_p95_from_rx(gen_ns: np.ndarray, recv_ns: np.ndarray) -> tuple[float, float]:
-    """
-    수신 시각(recv_ns)과 생성 시각(gen_ns)을 이용해 수집기 관점 AoI(ms)의 평균/P95를 계산한다.
+    """Compute mean/P95 AoI using receiver timestamps.
 
-    - AoI(t) = t - u(t), u(t)는 '지금까지 수신한 업데이트 중 최신(생성 시각 최대)'의 생성 시각
-    - 구간은 recv_i ~ recv_{i+1} 로 정의하며, 구간 시작 AoI는 recv_i - max(gen_0..gen_i).
+    Args:
+        gen_ns: Event generation timestamps (ns).
+        recv_ns: Receiver timestamps (ns), same length as gen_ns.
+
+    Returns:
+        (mean_ms, p95_ms) AoI statistics in milliseconds.
+
+    Raises:
+        ValueError: If input arrays have different lengths.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Assumes `recv_ns` is the timebase for AoI (receiver perspective).
+        - Returns NaN when there are fewer than 2 samples.
+
+    Failure Modes:
+        - Non-finite inputs are filtered by segment computation; may return NaN.
     """
     if gen_ns.size < 2 or recv_ns.size < 2:
         return float("nan"), float("nan")
@@ -906,10 +1039,26 @@ def aoi_mean_and_p95_from_rx(gen_ns: np.ndarray, recv_ns: np.ndarray) -> tuple[f
 
 
 def aoi_mean_and_p95(ts_ns: np.ndarray) -> tuple[float, float]:
-    """
-    이벤트 시각(ts_ns, 오름차순)에 대한 평균/95% AoI(ms)를 폐형식으로 계산.
-    - 평균:   mean = Σ Δ_i^2 / (2 Σ Δ_i)
-    - P95  :  a*   s.t. Σ min(a*, Δ_i) = 0.95 Σ Δ_i   (Δ_i는 ms 단위)
+    """Compute mean/P95 AoI using inter-event gaps (no receive time).
+
+    Args:
+        ts_ns: Event timestamps in ns (assumed sorted).
+
+    Returns:
+        (mean_ms, p95_ms) AoI statistics in milliseconds.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Assumes zero delivery delay; uses gaps only.
+        - Returns NaN when there are fewer than 2 samples.
+
+    Failure Modes:
+        - Non-finite inputs may yield NaN outputs.
     """
     if ts_ns.size < 2:
         return float("nan"), float("nan")
@@ -922,10 +1071,25 @@ def aoi_mean_and_p95(ts_ns: np.ndarray) -> tuple[float, float]:
 # ------------------------- 집계 로직 -------------------------
 
 def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    run_id × profile × policy × sensor 단위로 Rate/AoI/MAE를 집계.
-    - 반복 실험(리플리케이트)이 있는 경우 run 단위 지표를 먼저 만든 뒤,
-      그 결과를 평균/분산으로 요약해야 논문/보고서에 적합한 비교가 가능하다.
+    """Aggregate metrics per run/profile/policy/sensor.
+
+    Args:
+        df: De-duplicated event DataFrame.
+
+    Returns:
+        Per-run metrics used as the basis for summary statistics.
+
+    Raises:
+        ValueError: If required columns are missing.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Aggregates at run granularity to keep replicate variance explicit.
+
+    Failure Modes:
+        - Returns NaN for metrics that cannot be computed from inputs.
     """
     need = {"run_id", "ts", "device_id", "sensor", "seq", "profile", "policy", "res", "kbits"}
     if not need.issubset(df.columns):
@@ -1062,14 +1226,25 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def summarize(summary_by_run: pd.DataFrame) -> pd.DataFrame:
-    """
-    profile × policy × sensor 단위로 (run 단위 지표의) 평균/표준편차를 요약.
+    """Summarize per-run metrics into profile/policy/sensor aggregates.
 
-    반환 컬럼:
-    - rate_Bps, aoi_mean_ms 등: run 평균(mean)
-    - *_std: run 표준편차(std; n_runs<2이면 NaN)
-    - n_events: 전체 이벤트 수 합(sum)  (참고용)
-    - n_runs: 리플리케이트 수(count)
+    Args:
+        summary_by_run: Output of `summarize_by_run`.
+
+    Returns:
+        Aggregated metrics with mean/std columns and run counts.
+
+    Raises:
+        ValueError: If required columns are missing.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - `*_std` is NaN when fewer than two runs are available.
+
+    Failure Modes:
+        - Missing inputs yield errors early to avoid silent mis-reporting.
     """
     need = {
         "run_id",
@@ -1164,12 +1339,27 @@ def compare_policies(
     *,
     baseline_policy: str = "periodic",
 ) -> pd.DataFrame:
-    """
-    baseline_policy(기본: periodic) 대비 개선/변화량을 계산해 비교 테이블을 만든다.
+    """Compute policy deltas against a baseline policy.
 
-    - improvement(%)는 "낮을수록 좋은 지표" 기준으로 계산:
-      improvement = (baseline - candidate) / baseline * 100
-      → Rate/AoI/MAE 모두 '작을수록 좋다' 가정이며, MAE는 보통 음수(=악화)가 발생할 수 있다.
+    Args:
+        summary: Aggregated metrics from `summarize`.
+        baseline_policy: Policy name to compare against (default: periodic).
+
+    Returns:
+        DataFrame with per-policy deltas and improvement percentages.
+
+    Raises:
+        ValueError: If required columns are missing.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Improvement is defined as (baseline - candidate) / baseline * 100.
+        - Lower-is-better metrics are assumed for Rate/AoI/MAE.
+
+    Failure Modes:
+        - Missing baseline rows yield NaN improvements for that profile/sensor.
     """
     if summary.empty:
         return pd.DataFrame()
@@ -1532,6 +1722,100 @@ def _write_report_md(
         lines.append("| " + " | ".join(cells) + " |")
 
     lines.append("")
+    lines.append("## 목표 평가 (Option 2)")
+    lines.append("")
+    lines.append(
+        "- 기준: Rate>=60% vs periodic, MAE<=10% vs fixed_tau, AoI>=15% vs fixed_tau, "
+        "Rate<=+50% vs fixed_tau."
+    )
+    lines.append("")
+    lines.append(
+        "| profile | sensor | Rate>=60% vs periodic | MAE<=10% vs fixed_tau | "
+        "AoI>=15% vs fixed_tau | Rate<=+50% vs fixed_tau | Overall |"
+    )
+    lines.append("|---|---|---:|---:|---:|---:|---:|")
+
+    comp_periodic = compare_policies(summary, baseline_policy="periodic")
+    comp_fixed = compare_policies(summary, baseline_policy="fixed_tau")
+
+    def _keyed_adaptive(df: pd.DataFrame) -> dict[tuple[str, str], pd.Series]:
+        if df.empty:
+            return {}
+        sub = df[df["policy"].astype("string") == "adaptive"].copy()
+        if sub.empty:
+            return {}
+        return {
+            (str(r["profile"]), str(r["sensor"])): r
+            for _, r in sub.iterrows()
+        }
+
+    def _goal_cell(val: float, threshold: float) -> tuple[str, str]:
+        if not math.isfinite(val):
+            return "SKIP", "SKIP"
+        status = "PASS" if val >= threshold else "FAIL"
+        return status, f"{status} ({val:+.1f}%)"
+
+    adapt_periodic = _keyed_adaptive(comp_periodic)
+    adapt_fixed = _keyed_adaptive(comp_fixed)
+    adapt_rows = summary[summary["policy"].astype("string") == "adaptive"]
+
+    if adapt_rows.empty:
+        lines.append("| - | - | SKIP | SKIP | SKIP | SKIP | SKIP |")
+    else:
+        seen_keys: set[tuple[str, str]] = set()
+        for _, r in adapt_rows.iterrows():
+            key = (str(r["profile"]), str(r["sensor"]))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            r_periodic = adapt_periodic.get(key)
+            r_fixed = adapt_fixed.get(key)
+
+            rate_imp = (
+                float(r_periodic.get("rate_Bps_improvement_pct"))
+                if r_periodic is not None
+                else float("nan")
+            )
+            mae_imp = (
+                float(r_fixed.get("mae_event_mean_improvement_pct"))
+                if r_fixed is not None
+                else float("nan")
+            )
+            aoi_imp = (
+                float(r_fixed.get("aoi_mean_ms_improvement_pct"))
+                if r_fixed is not None
+                else float("nan")
+            )
+            rate_imp_fixed = (
+                float(r_fixed.get("rate_Bps_improvement_pct"))
+                if r_fixed is not None
+                else float("nan")
+            )
+
+            rate_status, rate_cell = _goal_cell(rate_imp, 60.0)
+            mae_status, mae_cell = _goal_cell(mae_imp, -10.0)
+            aoi_status, aoi_cell = _goal_cell(aoi_imp, 15.0)
+            rate_fixed_status, rate_fixed_cell = _goal_cell(rate_imp_fixed, -50.0)
+
+            statuses = [rate_status, mae_status, aoi_status, rate_fixed_status]
+            if "FAIL" in statuses:
+                overall = "FAIL"
+            elif all(s == "PASS" for s in statuses):
+                overall = "PASS"
+            else:
+                overall = "SKIP"
+
+            cells = [
+                key[0],
+                key[1],
+                rate_cell,
+                mae_cell,
+                aoi_cell,
+                rate_fixed_cell,
+                overall,
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
+
     lines.append("### Adaptive vs periodic interpretation")
     lines.append("")
     lines.append("Lower is better for Rate/AoI/MAE; positive improvement means better.")
@@ -3883,7 +4167,27 @@ def _fmt_num(value, fmt: str) -> str:
 
 
 def format_summary_for_discord(summary: pd.DataFrame, *, limit: int = 10) -> str:
-    """Create a compact Discord-friendly text report from the summary table."""
+    """Format a compact Discord-ready summary.
+
+    Args:
+        summary: Aggregated metrics from `summarize`.
+        limit: Max number of rows to include in the message.
+
+    Returns:
+        A Markdown string suitable for Discord webhook payloads.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Assumes summary columns match the analyzer output schema.
+
+    Failure Modes:
+        - Missing columns are rendered as placeholders rather than raising.
+    """
 
     title = "**Semantic Uplink 분석 요약**"
     if summary.empty:
@@ -3919,6 +4223,26 @@ def format_summary_for_discord(summary: pd.DataFrame, *, limit: int = 10) -> str
 # ----------------------------- CLI -----------------------------
 
 def parse_args():
+    """Parse CLI arguments for the analyzer.
+
+    Args:
+        None.
+
+    Returns:
+        Parsed argparse namespace with analysis parameters.
+
+    Raises:
+        SystemExit: If CLI arguments are invalid.
+
+    Side Effects:
+        - None (argparse may print to stderr on failure).
+
+    Contract:
+        - Ensures required input paths are provided.
+
+    Failure Modes:
+        - Argument parsing errors exit the process.
+    """
     ap = argparse.ArgumentParser(description="Analyze semantic uplink experiments (Rate/AoI/MAE)")
     ap.add_argument("--input", "-i", action="append", required=True,
                     help="분석할 파일 또는 디렉터리 (여러 번 지정 가능)")
@@ -4032,6 +4356,26 @@ def parse_args():
 
 
 def main():
+    """CLI entry point for offline analysis.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: If CLI arguments are invalid or processing fails.
+
+    Side Effects:
+        - Reads input files and writes analysis artifacts to disk.
+
+    Contract:
+        - Requires at least one --input path.
+
+    Failure Modes:
+        - Propagates SystemExit for fatal errors.
+    """
     args = parse_args()
     setup_logging_from_args(args)
     _PLOT_MANIFEST.clear()

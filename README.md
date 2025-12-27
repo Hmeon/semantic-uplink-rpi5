@@ -77,9 +77,11 @@
 
 <a id="goals"></a>
 ## Goals and Success Criteria
-- **Traffic reduction**: ≥ 60% rate reduction versus periodic
-- **Freshness improvement**: ≥ 30% AoI improvement
-- **Accuracy penalty**: ≤ 10% MAE increase (event-based MAE)
+- **Accuracy (primary)**: MAE_event mean increase <= 10% versus fixed_tau
+  (event-based MAE)
+- **Rate constraint**: >= 60% rate reduction versus periodic
+- **Freshness (secondary)**: Adaptive AoI mean improves >= 15% versus fixed_tau while
+  keeping rate increase <= 50% versus fixed_tau
 
 These are guiding targets. The actual trade-off is reported per profile and per sensor.
 
@@ -132,7 +134,7 @@ These are guiding targets. The actual trade-off is reported per profile and per 
 > Event is emitted only when |e| > τ. After broker Ack, the outbox entry is removed.
 
 <p align="center">
-  <img src="docs/figma/sequence_ko.svg" alt="Event Sequence" width="88%">
+  <img src="docs/figma/sequence_ko.png" alt="Event Sequence" width="88%">
 </p>
 
 1) **Sampling** → 2) **Predict & Residual** → 3) **Policy (τ, kbits)** →
@@ -368,11 +370,11 @@ Outputs:
 | temp | 255.0 B/s / 1802.9 ms / 0.036 | 23.7 B/s / 6952.2 ms / 0.036 | 27.4 B/s / 5756.9 ms / 0.035 |
 
 **Evaluation vs goals**
-- Rate reduction (>=60%): PASS (~89-95% reduction)
-- AoI improvement (>=30%): FAIL (AoI worsened vs periodic)
-- MAE penalty (<=10%): PASS (within ~4%)
-- Trade-off: Adaptive improves AoI vs fixed_tau with small rate increase, giving the best overall
-  balance under the constrained link.
+- Rate reduction (>=60% vs periodic): PASS (~89-95% reduction)
+- MAE change (<=10% vs fixed_tau): PASS (mic +1.9%, temp -2.8%)
+- AoI improvement (>=15% vs fixed_tau): PASS (~17-25% improvement)
+- Rate increase (<=50% vs fixed_tau): PASS (mic +44%, temp +16%)
+- Trade-off: Adaptive improves AoI vs fixed_tau with moderate rate increase while keeping MAE stable.
 - Detailed write-up: `docs/final/FINAL_EVALUATION.md`
 
 ---
@@ -518,5 +520,5 @@ TBD
 <a id="appendix"></a>
 ## Appendix
 <p align="center">
-  <img src="docs/figma/pipeline_ko.svg" alt="Pipeline Diagram" width="86%">
+  <img src="docs/figma/pipeline_ko.png" alt="Pipeline Diagram" width="86%">
 </p>

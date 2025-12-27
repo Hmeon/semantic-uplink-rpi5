@@ -11,6 +11,26 @@ from pathlib import Path
 
 
 def ensure_schema(path: str | Path = "collector.sqlite") -> None:
+    """Ensure the SQLite schema exists for collector storage.
+
+    Args:
+        path: Path to the SQLite database file.
+
+    Returns:
+        None.
+
+    Raises:
+        sqlite3.Error: If schema creation fails.
+
+    Side Effects:
+        - Creates directories and initializes tables/indexes.
+
+    Contract:
+        - Idempotent; safe to call multiple times.
+
+    Failure Modes:
+        - Database errors propagate to the caller.
+    """
     p = Path(path)
     if p.parent:
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -69,4 +89,3 @@ def ensure_schema(path: str | Path = "collector.sqlite") -> None:
         con.execute("CREATE INDEX IF NOT EXISTS idx_events_ts_ns ON events(ts_ns)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts)")
         con.execute("CREATE INDEX IF NOT EXISTS idx_markers_ts ON markers(ts)")
-

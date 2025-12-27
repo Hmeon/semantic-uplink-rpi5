@@ -23,6 +23,28 @@ from dataclasses import dataclass
 
 @dataclass(slots=True)
 class AR1RLS:
+    """Scalar AR(1) RLS estimator.
+
+    Args:
+        a: Initial AR(1) coefficient.
+        lam: Forgetting factor in (0, 1].
+        p: Initial covariance value (> 0).
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If lam is out of range or p is non-positive.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Updates are bounded to keep coefficients finite.
+
+    Failure Modes:
+        - Invalid values reset to defaults during update.
+    """
     a: float = 1.0
     lam: float = 0.99
     p: float = 1_000.0
@@ -39,9 +61,50 @@ class AR1RLS:
             raise ValueError("a must be finite")
 
     def predict(self, x_prev: float) -> float:
+        """Predict the next value using the current AR(1) coefficient.
+
+        Args:
+            x_prev: Previous sample value.
+
+        Returns:
+            Predicted next value.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Uses the current coefficient without updating state.
+
+        Failure Modes:
+            - Non-finite inputs propagate through float conversion.
+        """
         return float(self.a) * float(x_prev)
 
     def update(self, x: float, x_prev: float) -> float:
+        """Update the AR(1) coefficient with a new sample.
+
+        Args:
+            x: Current sample value.
+            x_prev: Previous sample value.
+
+        Returns:
+            Updated coefficient estimate.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - Updates internal coefficient and covariance.
+
+        Contract:
+            - Returns the previous coefficient on invalid inputs.
+
+        Failure Modes:
+            - Non-finite inputs skip the update and return the prior coefficient.
+        """
         y = float(x)
         phi = float(x_prev)
         if not (math.isfinite(y) and math.isfinite(phi)):
@@ -62,4 +125,3 @@ class AR1RLS:
             self.p = 1_000.0
 
         return float(self.a)
-

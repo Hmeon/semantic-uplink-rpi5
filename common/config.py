@@ -1,3 +1,10 @@
+"""Validated configuration schemas and YAML loaders.
+
+Defines pydantic models for policy, device, and link shaping configs, plus
+helpers to load YAML files into those schemas. Extra fields are rejected to
+keep configs strict and compatible with experiment tooling.
+"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -8,6 +15,27 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 
 class ArmConfig(BaseModel):
+    """Policy arm definition for (tau, kbits).
+
+    Args:
+        tau: Threshold/interval for the arm (must be > 0).
+        kbits: Quantization bit width (1..16).
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If tau <= 0 or kbits out of range.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+
+    Failure Modes:
+        - Validation errors surface during config parsing.
+    """
     model_config = ConfigDict(extra="forbid")
 
     tau: float
@@ -31,6 +59,28 @@ class ArmConfig(BaseModel):
 
 
 class RewardConfig(BaseModel):
+    """Reward weight configuration for policy training.
+
+    Args:
+        alpha: AoI weight.
+        beta: MAE weight.
+        gamma: Rate weight.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+
+    Failure Modes:
+        - Invalid types surface as validation errors.
+    """
     model_config = ConfigDict(extra="forbid")
 
     alpha: float = 1.0
@@ -39,6 +89,27 @@ class RewardConfig(BaseModel):
 
 
 class ScaleConfig(BaseModel):
+    """Normalization scales for policy state and reward.
+
+    Args:
+        aoi_ms: AoI scale in milliseconds.
+        rate_bps: Rate scale in bytes per second.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+
+    Failure Modes:
+        - Invalid types surface as validation errors.
+    """
     model_config = ConfigDict(extra="forbid")
 
     aoi_ms: float = 1000.0
@@ -46,6 +117,28 @@ class ScaleConfig(BaseModel):
 
 
 class SafetyConfig(BaseModel):
+    """Safety thresholds for policy override behavior.
+
+    Args:
+        aoi_max_ms: AoI limit in milliseconds.
+        mae_max: MAE limit in sensor units.
+        safety_force_emit_on_aoi: Force emission when AoI exceeds limit.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+
+    Failure Modes:
+        - Invalid types surface as validation errors.
+    """
     model_config = ConfigDict(extra="forbid")
 
     aoi_max_ms: float = 5_000.0
@@ -54,12 +147,56 @@ class SafetyConfig(BaseModel):
 
 
 class PolicyDiagnosticsConfig(BaseModel):
+    """Toggle policy diagnostics emission.
+
+    Args:
+        enabled: Enable diagnostic metrics when True.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+
+    Failure Modes:
+        - Invalid types surface as validation errors.
+    """
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
 
 
 class SensorPolicyConfig(BaseModel):
+    """Optional per-sensor policy overrides.
+
+    Args:
+        arms: Optional arm list overriding the global arms.
+        reward: Optional reward weight overrides.
+        safety: Optional safety threshold overrides.
+        diagnostics: Optional diagnostics toggle overrides.
+        scales: Optional normalization scale overrides.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+
+    Failure Modes:
+        - Invalid nested configs surface as validation errors.
+    """
     model_config = ConfigDict(extra="forbid")
 
     arms: list[ArmConfig] | None = None
@@ -70,6 +207,32 @@ class SensorPolicyConfig(BaseModel):
 
 
 class PolicyConfig(BaseModel):
+    """Top-level policy configuration for adaptive mode.
+
+    Args:
+        arms: Arm grid for the policy.
+        reward: Reward weight configuration.
+        safety: Safety threshold configuration.
+        diagnostics: Diagnostic emission configuration.
+        scales: Normalization scale configuration.
+        sensors: Optional per-sensor overrides keyed by sensor name.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If the arm list is empty.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+        - At least one arm must be provided.
+
+    Failure Modes:
+        - Validation errors surface during config parsing.
+    """
     model_config = ConfigDict(extra="forbid")
 
     arms: list[ArmConfig]
@@ -103,6 +266,28 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any]:
 
 
 def load_policy_config(path: str | Path) -> PolicyConfig:
+    """Load and validate a policy config from YAML.
+
+    Args:
+        path: Path to a policy YAML file.
+
+    Returns:
+        Validated PolicyConfig instance.
+
+    Raises:
+        FileNotFoundError: If the YAML file does not exist.
+        ValueError: If YAML parsing or validation fails.
+        TypeError: If the YAML root is not a mapping.
+
+    Side Effects:
+        - Reads the YAML file from disk.
+
+    Contract:
+        - Extra fields are rejected by the schema.
+
+    Failure Modes:
+        - Validation errors are surfaced as ValueError with context.
+    """
     p = Path(path)
     try:
         return PolicyConfig.model_validate(_load_yaml_mapping(p))
@@ -111,10 +296,54 @@ def load_policy_config(path: str | Path) -> PolicyConfig:
 
 
 def load_policy_config_dict(path: str | Path) -> dict[str, Any]:
+    """Load a policy config and return it as a plain dict.
+
+    Args:
+        path: Path to a policy YAML file.
+
+    Returns:
+        Dict representation of PolicyConfig.
+
+    Raises:
+        FileNotFoundError: If the YAML file does not exist.
+        ValueError: If YAML parsing or validation fails.
+        TypeError: If the YAML root is not a mapping.
+
+    Side Effects:
+        - Reads the YAML file from disk.
+
+    Contract:
+        - Uses the same schema validation as load_policy_config.
+
+    Failure Modes:
+        - Validation errors are surfaced as ValueError with context.
+    """
     return load_policy_config(path).model_dump()
 
 
 class DeviceMicConfig(BaseModel):
+    """Device mic sampling configuration.
+
+    Args:
+        frame_ms: Frame length in milliseconds.
+        samplerate: Sampling rate in Hz.
+        normalize: Normalize input samples when True.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+
+    Failure Modes:
+        - Invalid types surface as validation errors.
+    """
     model_config = ConfigDict(extra="forbid")
 
     frame_ms: int = 100
@@ -123,12 +352,53 @@ class DeviceMicConfig(BaseModel):
 
 
 class DeviceTempConfig(BaseModel):
+    """Device temperature sampling configuration.
+
+    Args:
+        period_hz: Sampling frequency in Hz.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+
+    Failure Modes:
+        - Invalid types surface as validation errors.
+    """
     model_config = ConfigDict(extra="forbid")
 
     period_hz: float = 1.0
 
 
 class DeviceSensorsConfig(BaseModel):
+    """Container for enabled sensor configurations.
+
+    Args:
+        mic: Optional mic configuration.
+        temp: Optional temperature configuration.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If both mic and temp are omitted.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - At least one sensor must be configured.
+
+    Failure Modes:
+        - Validation errors surface during config parsing.
+    """
     model_config = ConfigDict(extra="forbid")
 
     mic: DeviceMicConfig | None = None
@@ -142,6 +412,27 @@ class DeviceSensorsConfig(BaseModel):
 
 
 class DeviceUIConfig(BaseModel):
+    """Device UI configuration for status displays.
+
+    Args:
+        enabled: Enable UI when True.
+        backend: UI backend name (e.g., console, lcd).
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+
+    Failure Modes:
+        - Invalid types surface as validation errors.
+    """
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
@@ -149,6 +440,30 @@ class DeviceUIConfig(BaseModel):
 
 
 class DeviceButtonsConfig(BaseModel):
+    """Device GPIO buttons configuration.
+
+    Args:
+        enabled: Enable GPIO buttons when True.
+        mode_pin: GPIO pin for mode button.
+        profile_pin: GPIO pin for profile button.
+        marker_pin: GPIO pin for marker button.
+        debounce_ms: Debounce interval in milliseconds.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If pin numbers are non-positive or debounce is negative.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+
+    Failure Modes:
+        - Validation errors surface during config parsing.
+    """
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
@@ -175,6 +490,28 @@ class DeviceButtonsConfig(BaseModel):
 
 
 class DeviceMQTTConfig(BaseModel):
+    """Device MQTT connection settings.
+
+    Args:
+        host: Broker hostname or IP.
+        port: Broker port.
+        base_topic: Base topic prefix for publishing.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+
+    Failure Modes:
+        - Invalid types surface as validation errors.
+    """
     model_config = ConfigDict(extra="forbid")
 
     host: str
@@ -183,6 +520,30 @@ class DeviceMQTTConfig(BaseModel):
 
 
 class DeviceConfig(BaseModel):
+    """Top-level device configuration schema.
+
+    Args:
+        device_id: Device identifier used in topics and logs.
+        sensors: Sensor configuration block.
+        ui: Optional UI configuration.
+        buttons: Optional GPIO buttons configuration.
+        mqtt: MQTT connection configuration.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+
+    Failure Modes:
+        - Validation errors surface during config parsing.
+    """
     model_config = ConfigDict(extra="forbid")
 
     device_id: str
@@ -193,6 +554,28 @@ class DeviceConfig(BaseModel):
 
 
 def load_device_config(path: str | Path) -> DeviceConfig:
+    """Load and validate a device config from YAML.
+
+    Args:
+        path: Path to a device YAML file.
+
+    Returns:
+        Validated DeviceConfig instance.
+
+    Raises:
+        FileNotFoundError: If the YAML file does not exist.
+        ValueError: If YAML parsing or validation fails.
+        TypeError: If the YAML root is not a mapping.
+
+    Side Effects:
+        - Reads the YAML file from disk.
+
+    Contract:
+        - Extra fields are rejected by the schema.
+
+    Failure Modes:
+        - Validation errors are surfaced as ValueError with context.
+    """
     p = Path(path)
     try:
         return DeviceConfig.model_validate(_load_yaml_mapping(p))
@@ -201,6 +584,35 @@ def load_device_config(path: str | Path) -> DeviceConfig:
 
 
 class LinkProfileConfig(BaseModel):
+    """Link shaping profile configuration.
+
+    Args:
+        rate_kbit: Fixed egress rate in kbit; None enables variable mode.
+        delay_ms: Base delay in milliseconds.
+        jitter_ms: Additional jitter in milliseconds.
+        loss_pct: Loss percentage (0..100).
+        loss_corr_pct: Loss correlation percentage (0..100).
+        reorder_pct: Reorder percentage (0..100).
+        low_kbit: Low rate for variable mode.
+        high_kbit: High rate for variable mode.
+        var_default_period_s: Toggle period for variable mode in seconds.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If rate/jitter/loss bounds are invalid.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+        - Variable mode requires low_kbit and high_kbit.
+
+    Failure Modes:
+        - Validation errors surface during config parsing.
+    """
     model_config = ConfigDict(extra="forbid")
 
     # Structured profile (preferred). This matches `link/shaper/tc_profiles.py::TcProfile`.
@@ -244,12 +656,54 @@ class LinkProfileConfig(BaseModel):
 
 
 class LinkProfilesConfig(BaseModel):
+    """Collection of named link profiles.
+
+    Args:
+        profiles: Mapping of profile name to LinkProfileConfig.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+
+    Failure Modes:
+        - Validation errors surface during config parsing.
+    """
     model_config = ConfigDict(extra="forbid")
 
     profiles: dict[str, LinkProfileConfig]
 
 
 def load_link_profiles_config(path: str | Path) -> LinkProfilesConfig:
+    """Load and validate link profile configs from YAML.
+
+    Args:
+        path: Path to a link profiles YAML file.
+
+    Returns:
+        Validated LinkProfilesConfig instance.
+
+    Raises:
+        FileNotFoundError: If the YAML file does not exist.
+        ValueError: If YAML parsing or validation fails.
+        TypeError: If the YAML root is not a mapping.
+
+    Side Effects:
+        - Reads the YAML file from disk.
+
+    Contract:
+        - Extra fields are rejected by the schema.
+
+    Failure Modes:
+        - Validation errors are surfaced as ValueError with context.
+    """
     p = Path(path)
     try:
         return LinkProfilesConfig.model_validate(_load_yaml_mapping(p))

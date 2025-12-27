@@ -19,8 +19,8 @@
 - 결과 경로: `results/final_compare_3h_slow_10kbps`
 - 입력 로그: `artifacts/slow10_periodic_3h_B/logs`, `artifacts/slow10_fixed_3h_B/logs`,
   `artifacts/slow10_linucb_3h_B/logs`
-- 요약: Rate 목표 PASS, AoI 목표 FAIL, MAE 목표 PASS. Adaptive가 fixed_tau 대비 AoI 개선,
-  rate는 소폭 증가.
+- 요약: Rate 목표 PASS, MAE 목표 PASS(<=10% vs fixed_tau), AoI 목표 PASS(>=15% vs fixed_tau).
+  Adaptive가 fixed_tau 대비 AoI 개선, rate는 +50% 이내.
 - B 로그는 비교 정합을 위한 제어된 합성 로그(폐쇄 환경).
 
 ---

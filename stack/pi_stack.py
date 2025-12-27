@@ -1,3 +1,10 @@
+"""Single-Pi supervisor for broker, collector, and edge services.
+
+Spawns mosquitto (optional), collector, and edge processes with shared run
+directories and log files. The stack is intended for lab runs and will stop
+the whole pipeline if any child exits unexpectedly.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -46,6 +53,43 @@ def _timestamp_id() -> str:
 
 @dataclass(slots=True)
 class StackConfig:
+    """Configuration for the single-Pi stack supervisor.
+
+    Args:
+        run_dir: Root directory for run artifacts and logs.
+        device_config: Device YAML path for edge daemon.
+        policy_arms: Policy arms YAML path for adaptive mode.
+        broker_host: MQTT broker host.
+        broker_port: MQTT broker port.
+        broker_mode: Broker mode ("auto", "subprocess", "none").
+        mosquitto_bin: Path to mosquitto executable.
+        mosquitto_listen_host: Listen address for mosquitto.
+        mosquitto_verbose: Enable verbose mosquitto logging.
+        collector_flush_interval_s: Collector flush interval in seconds.
+        collector_client_id: Collector MQTT client id.
+        edge_client_id: Edge MQTT client id.
+        edge_keepalive: MQTT keepalive for edge.
+        buttons_enable: Enable GPIO buttons for edge.
+        tc_enable: Enable link shaping integration.
+        tc_iface: Interface for tc shaping.
+        tc_both: Apply tc shaping to ingress when True.
+        tc_profiles_config: YAML path for tc profiles.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are not allowed; this is a dataclass container.
+
+    Failure Modes:
+        - Invalid values surface when building child command lines.
+    """
     run_dir: str
     device_config: str
     policy_arms: str
@@ -159,12 +203,53 @@ class _Child:
 
 
 class PiStack:
+    """Supervisor for running broker, collector, and edge together.
+
+    Args:
+        cfg: StackConfig with run paths and process settings.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - Spawns subprocesses and writes log files.
+
+    Contract:
+        - Stops all children when any child exits unexpectedly.
+
+    Failure Modes:
+        - Child exit causes non-zero return from run().
+    """
     def __init__(self, cfg: StackConfig):
         self.cfg = cfg
         self._stop = False
         self._children: list[_Child] = []
 
     def run(self) -> int:
+        """Run the stack until stopped or a child exits.
+
+        Args:
+            None.
+
+        Returns:
+            Process exit code (0 on clean shutdown, 1 on child failure).
+
+        Raises:
+            ValueError: If broker_mode is invalid.
+
+        Side Effects:
+            - Creates run directories and log files.
+            - Starts broker/collector/edge subprocesses.
+
+        Contract:
+            - Ensures child processes are terminated on exit.
+
+        Failure Modes:
+            - Returns non-zero when a child exits unexpectedly.
+        """
         self._install_signals()
 
         run_dir = Path(self.cfg.run_dir)
@@ -247,6 +332,26 @@ class PiStack:
         return 0
 
     def stop(self) -> None:
+        """Stop the stack and terminate child processes.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - Terminates all child subprocesses.
+
+        Contract:
+            - Idempotent; repeated calls are no-ops after first stop.
+
+        Failure Modes:
+            - Termination errors are suppressed.
+        """
         if self._stop:
             return
         self._stop = True
@@ -309,6 +414,26 @@ class PiStack:
 
 
 def parse_args(argv: list[str] | None = None) -> StackConfig:
+    """Parse CLI arguments for the stack supervisor.
+
+    Args:
+        argv: Optional argument list for testing; defaults to sys.argv.
+
+    Returns:
+        Parsed StackConfig instance.
+
+    Raises:
+        SystemExit: If CLI arguments are invalid.
+
+    Side Effects:
+        - Configures logging based on CLI flags.
+
+    Contract:
+        - Supplies defaults for missing paths.
+
+    Failure Modes:
+        - Argument parsing errors exit the process.
+    """
     ap = argparse.ArgumentParser(description="Single-Pi stack: broker(mosquitto)+collector+edge")
     add_logging_cli_args(ap)
     ap.add_argument("--run-dir", default="artifacts/live", help="shared run dir for edge+collector")
@@ -375,6 +500,26 @@ def parse_args(argv: list[str] | None = None) -> StackConfig:
 
 
 def main(argv: list[str] | None = None) -> None:
+    """CLI entry point for the stack supervisor.
+
+    Args:
+        argv: Optional argument list for testing; defaults to sys.argv.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: When the stack exits with a non-zero code.
+
+    Side Effects:
+        - Starts broker/collector/edge subprocesses.
+
+    Contract:
+        - Exits with the same code as PiStack.run().
+
+    Failure Modes:
+        - Propagates SystemExit on fatal errors.
+    """
     cfg = parse_args(argv)
     rc = PiStack(cfg).run()
     raise SystemExit(rc)

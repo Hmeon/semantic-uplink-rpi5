@@ -9,6 +9,13 @@
 #
 # 스키마/토픽/지표/DoD는 과제 동결안과 일치합니다. (유실 0, QoS1 중복 제거는 collector에서 검증)  # noqa
 
+"""Durable SQLite-backed outbox for QoS1 publishing.
+
+Provides enqueue/claim/ack/nack semantics with backoff and timeout handling to
+survive disconnects. The queue is thread-safe within a process and relies on
+SQLite WAL for durability.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -26,7 +33,33 @@ __all__ = ["Outbox", "OutboxItem", "DeliveryStats"]
 
 @dataclass(slots=True)
 class OutboxItem:
-    """퍼블리셔가 송신에 사용할 레코드(인메모리 표현)."""
+    """In-memory representation of a queued MQTT publish.
+
+    Args:
+        id: SQLite row id for the message.
+        topic: MQTT topic string.
+        payload: Message payload bytes.
+        qos: MQTT QoS level.
+        retain: MQTT retain flag.
+        attempts: Number of publish attempts so far.
+        created_ns: Enqueue timestamp in nanoseconds.
+        last_attempt_ns: Timestamp of the last attempt in nanoseconds.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Mirrors the `messages` table row state.
+
+    Failure Modes:
+        - None.
+    """
     id: int
     topic: str
     payload: bytes
@@ -39,6 +72,31 @@ class OutboxItem:
 
 @dataclass(slots=True)
 class DeliveryStats:
+    """Snapshot of delivery/ack latency and loss EWMAs.
+
+    Args:
+        ack_latency_ms: Last observed ACK latency in milliseconds.
+        ack_latency_ewma_ms: EWMA of ACK latency in milliseconds.
+        loss_ewma: EWMA of loss indicators.
+        acked: Count of acknowledged messages.
+        nacked: Count of negatively acknowledged messages.
+        timeouts: Count of ACK timeouts.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Values reflect in-memory counters since process start.
+
+    Failure Modes:
+        - None.
+    """
     ack_latency_ms: float | None
     ack_latency_ewma_ms: float | None
     loss_ewma: float
@@ -48,11 +106,33 @@ class DeliveryStats:
 
 
 class Outbox:
-    """
-    Durable FIFO outbox (SQLite WAL).
-    상태(state): 0=queued, 1=inflight
-    - queued: claim 대상 (available_at_ns <= now)
-    - inflight: 브로커로 송신 시도 중(ACK 대기)
+    """Durable FIFO outbox backed by SQLite WAL.
+
+    Args:
+        db_path: Path to the SQLite database file.
+        ack_timeout_s: ACK timeout window in seconds.
+        backoff_base_s: Base backoff delay in seconds.
+        backoff_cap_s: Maximum backoff delay in seconds.
+        ack_latency_alpha: EWMA alpha for ACK latency.
+        loss_ewma_alpha: EWMA alpha for loss estimation.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If db_path is empty.
+        OSError: If the database directory cannot be created.
+        sqlite3.Error: If the database cannot be opened or initialized.
+
+    Contract:
+        - Status 0=queued, 1=inflight; only queued rows are claimable.
+        - A message is removed only after ACK (`ack`), never on publish attempt.
+
+    Side Effects:
+        - Writes to SQLite on every enqueue/ack/nack.
+
+    Failure Modes:
+        - DB errors propagate to caller; caller should treat failures as non-delivery.
     """
 
     def __init__(self,
@@ -96,11 +176,49 @@ class Outbox:
     # ---- Compatibility helpers (legacy API expected by GitHub unit tests) ----
 
     def setup(self) -> None:
-        """Ensure the database schema exists (idempotent)."""
+        """Ensure the database schema exists (idempotent).
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            sqlite3.Error: If schema creation fails.
+
+        Side Effects:
+            - Creates tables/indexes in the SQLite file.
+
+        Contract:
+            - Safe to call multiple times.
+
+        Failure Modes:
+            - DB errors propagate to caller.
+        """
         self._bootstrap_db()
 
     def pending(self) -> int:
-        """Return the number of queued or inflight messages."""
+        """Return the number of queued or inflight messages.
+
+        Args:
+            None.
+
+        Returns:
+            Count of rows with status in (queued, inflight).
+
+        Raises:
+            sqlite3.Error: If the count query fails.
+
+        Side Effects:
+            - Reads from the SQLite database.
+
+        Contract:
+            - Counts only statuses 0 and 1.
+
+        Failure Modes:
+            - DB errors propagate to caller.
+        """
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("SELECT COUNT(*) FROM messages WHERE status IN (0, 1)")
@@ -109,7 +227,26 @@ class Outbox:
         return int(count)
 
     def mark_done(self, msg_id: int) -> bool:
-        """Alias for :meth:`ack` maintained for backwards compatibility."""
+        """Alias for `ack`, kept for backward compatibility.
+
+        Args:
+            msg_id: Outbox row id to acknowledge.
+
+        Returns:
+            True if a row was removed, False otherwise.
+
+        Raises:
+            sqlite3.Error: If the delete fails.
+
+        Side Effects:
+            - Deletes the row and updates ACK/loss statistics.
+
+        Contract:
+            - Equivalent to calling `ack(msg_id)`.
+
+        Failure Modes:
+            - DB errors propagate to caller; message may be retried.
+        """
         return self.ack(int(msg_id))
 
     # ---------------- 내부: DB 구성 ----------------
@@ -142,10 +279,30 @@ class Outbox:
 
     def enqueue(self, topic: str, payload: bytes | str, qos: int = 1,
                 retain: bool = False, created_ns: int | None = None) -> int:
-        """
-        새 메시지를 **queued** 상태로 저장하고 id를 반환.
-        - payload는 bytes 또는 str(UTF-8) 허용
-        - QoS는 {0,1,2} 허용(기본 1; 프로젝트 표준). retain은 bool.
+        """Persist a new queued message and return its row id.
+
+        Args:
+            topic: MQTT topic name (non-empty).
+            payload: Payload bytes or UTF-8 string.
+            qos: MQTT QoS level (0/1/2).
+            retain: MQTT retain flag.
+            created_ns: Optional creation timestamp override.
+
+        Returns:
+            New row id for the queued message.
+
+        Raises:
+            ValueError: If topic is empty or QoS is invalid.
+            sqlite3.Error: If the insert fails.
+
+        Side Effects:
+            - Writes a new row to SQLite with WAL durability.
+
+        Contract:
+            - Inserts in queued state (status=0).
+
+        Failure Modes:
+            - DB errors propagate to caller; caller should treat as not enqueued.
         """
         if not isinstance(topic, str) or not topic:
             raise ValueError("topic must be non-empty str")
@@ -173,9 +330,26 @@ class Outbox:
         return mid
 
     def claim_next(self, limit: int = 1) -> List[OutboxItem]:
-        """
-        현재 시각 기준 **ready(queued & available_at <= now)**인 메시지들을
-        id 오름차순으로 최대 `limit`개까지 **inflight**로 전이(마킹)하고 반환.
+        """Claim ready messages and mark them inflight.
+
+        Args:
+            limit: Maximum number of rows to claim.
+
+        Returns:
+            List of OutboxItem instances marked inflight.
+
+        Raises:
+            sqlite3.Error: If selection or update fails.
+
+        Side Effects:
+            - Requeues timed-out inflight rows with backoff.
+            - Marks claimed rows as inflight and increments attempts.
+
+        Contract:
+            - Returns items ordered by ascending id (FIFO).
+
+        Failure Modes:
+            - DB errors propagate to caller; caller should retry later.
         """
         if limit <= 0:
             return []
@@ -238,7 +412,26 @@ class Outbox:
         return items
 
     def ack(self, msg_id: int) -> bool:
-        """????? PUBACK(?? ?? ??)? ?? ??? ??."""
+        """Acknowledge delivery and remove a message from the outbox.
+
+        Args:
+            msg_id: Outbox row id to acknowledge.
+
+        Returns:
+            True if a row was deleted, False if not found.
+
+        Raises:
+            sqlite3.Error: If the delete fails.
+
+        Side Effects:
+            - Deletes the row and updates ACK latency/loss statistics.
+
+        Contract:
+            - Idempotent for already-acked ids (returns False).
+
+        Failure Modes:
+            - DB errors propagate to caller; message may be retried.
+        """
         with self._lock:
             cur = self._conn.cursor()
             cur.execute("BEGIN IMMEDIATE")
@@ -270,9 +463,26 @@ class Outbox:
         return deleted > 0
 
     def nack(self, msg_id: int) -> None:
-        """
-        송신 실패/거절 시 호출. 메시지를 **queued**로 되돌리고 지수백오프를 적용한다.
-        (브로커 연결 끊김 등 즉시 재시도 의미가 있을 때는 reset_inflight() 사용)
+        """Requeue a message with backoff after a publish failure.
+
+        Args:
+            msg_id: Outbox row id to requeue.
+
+        Returns:
+            None.
+
+        Raises:
+            sqlite3.Error: If the update fails.
+
+        Side Effects:
+            - Moves the row back to queued with exponential backoff.
+            - Updates loss EWMA counters.
+
+        Contract:
+            - Intended for publish failures; use `reset_inflight` on reconnect.
+
+        Failure Modes:
+            - DB errors propagate to caller; message remains inflight or queued.
         """
         now_ns = time.time_ns()
         with self._lock:
@@ -293,7 +503,26 @@ class Outbox:
             self._update_loss_ewma(1.0)
 
     def requeue_stuck(self) -> int:
-        """ACK 타임아웃을 초과한 inflight 전부를 재큐잉. 반환: 재큐잉 수."""
+        """Requeue inflight messages that exceeded ACK timeout.
+
+        Args:
+            None.
+
+        Returns:
+            Number of messages requeued.
+
+        Raises:
+            sqlite3.Error: If the update fails.
+
+        Side Effects:
+            - Updates queue state and applies backoff.
+
+        Contract:
+            - Uses ACK timeout as the only stuck criterion.
+
+        Failure Modes:
+            - DB errors propagate to caller.
+        """
         now_ns = time.time_ns()
         with self._lock:
             cur = self._conn.cursor()
@@ -319,9 +548,25 @@ class Outbox:
         return count
 
     def reset_inflight(self) -> int:
-        """
-        **브로커 재연결 직후** 호출: inflight를 즉시 재시도 가능하도록 queued로 되돌린다.
-        (ACK를 더는 기대할 수 없으므로, available_at=now로 즉시 재시도)
+        """Reset inflight messages to queued after reconnect.
+
+        Args:
+            None.
+
+        Returns:
+            Number of rows moved back to queued.
+
+        Raises:
+            sqlite3.Error: If the update fails.
+
+        Side Effects:
+            - Moves all inflight rows to queued with immediate availability.
+
+        Contract:
+            - Intended for use right after broker reconnect.
+
+        Failure Modes:
+            - DB errors propagate to caller.
         """
         now_ns = time.time_ns()
         with self._lock:
@@ -335,6 +580,26 @@ class Outbox:
         return int(affected)
 
     def stats(self) -> dict:
+        """Return queue size counters for monitoring.
+
+        Args:
+            None.
+
+        Returns:
+            Dict with queued/inflight/total counts and next_id.
+
+        Raises:
+            sqlite3.Error: If the query fails.
+
+        Side Effects:
+            - Reads from the SQLite database.
+
+        Contract:
+            - Counts reflect current DB state (not including in-memory buffers).
+
+        Failure Modes:
+            - DB errors propagate to caller.
+        """
         with self._lock:
             cur = self._conn.cursor()
             q = cur.execute("""
@@ -351,6 +616,26 @@ class Outbox:
         return {k: (int(v) if v is not None else 0) for k, v in dict(row).items()}
 
     def delivery_stats(self) -> DeliveryStats:
+        """Return delivery/ack statistics used by adaptive policies.
+
+        Args:
+            None.
+
+        Returns:
+            DeliveryStats snapshot of ACK latency and loss EWMAs.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Counters are process-local since startup.
+
+        Failure Modes:
+            - None.
+        """
         with self._lock:
             return DeliveryStats(
                 ack_latency_ms=self._ack_latency_ms_last,
@@ -376,6 +661,26 @@ class Outbox:
         self._loss_samples += 1
 
     def close(self) -> None:
+        """Close the underlying SQLite connection.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - Closes the database handle; further calls will fail.
+
+        Contract:
+            - Safe to call multiple times.
+
+        Failure Modes:
+            - Close errors are suppressed to avoid masking shutdown.
+        """
         with self._lock:
             try:
                 self._conn.close()
@@ -384,8 +689,10 @@ class Outbox:
 
     # 컨텍스트 매니저 지원
     def __enter__(self) -> "Outbox":
+        """Context manager entry; returns self."""
         return self
     def __exit__(self, exc_type, exc, tb) -> None:
+        """Context manager exit; closes the database connection."""
         self.close()
 
 

@@ -5,6 +5,12 @@
 # - 프로파일: slow_10kbps, delay_loss, cellular_var(50↔200kbps 토글), lora_sf10/lora_sf12(LoRa-like)  # noqa
 # - 안전성: apply는 replace 사용, clear는 존재하지 않아도 오류 없이 진행, SIGINT에서도 원복을 권장.
 
+"""Apply predefined tc/netem link shaping profiles.
+
+Provides utilities to apply/clear/query Linux tc shaping profiles with optional
+ingress support via ifb. Requires root or CAP_NET_ADMIN for any tc operations.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -28,6 +34,35 @@ logger = logging.getLogger(__name__)
 # ---------- 프로파일 정의 (동결안과 동일) ----------
 @dataclass(frozen=True)
 class TcProfile:
+    """Definition of a tc/netem shaping profile.
+
+    Args:
+        name: Profile name identifier.
+        rate_kbit: Egress rate in kbit; None enables variable mode.
+        delay_ms: Base delay in milliseconds.
+        jitter_ms: Jitter in milliseconds.
+        loss_pct: Loss percentage (0..100).
+        loss_corr_pct: Loss correlation percentage (0..100).
+        reorder_pct: Reorder percentage (0..100).
+        low_kbit: Low rate for variable mode.
+        high_kbit: High rate for variable mode.
+        var_default_period_s: Toggle period in seconds for variable mode.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Fields mirror LinkProfileConfig.
+
+    Failure Modes:
+        - Invalid values surface when applying profiles.
+    """
     name: str
     # egress 기준 속도(kbit); cellular_var는 None (토글 사용)
     rate_kbit: int | None
@@ -98,11 +133,27 @@ PROFILES: dict[str, TcProfile] = {
 }
 
 def load_profiles_config(path: str | os.PathLike) -> dict[str, TcProfile]:
-    """
-    configs/link_profiles.yaml 같은 YAML에서 프로파일을 로딩한다.
+    """Load tc profiles from a YAML config file.
 
-    - 이 함수는 "옵션"이며, 파일이 없거나 형식이 맞지 않더라도 PROFILES 상수를 계속 사용 가능하다.
-    - 스키마는 common.config.LinkProfilesConfig (pydantic)로 검증한다.
+    Args:
+        path: Path to link profiles YAML.
+
+    Returns:
+        Mapping of profile name to TcProfile.
+
+    Raises:
+        FileNotFoundError: If the YAML file does not exist.
+        ValueError: If YAML parsing or validation fails.
+        TypeError: If the YAML root is not a mapping.
+
+    Side Effects:
+        - Reads the YAML file from disk.
+
+    Contract:
+        - Uses LinkProfilesConfig validation.
+
+    Failure Modes:
+        - Validation errors propagate to the caller.
     """
     cfg = load_link_profiles_config(Path(path))
     out: dict[str, TcProfile] = {}
@@ -278,6 +329,26 @@ class _RateToggle:
 _toggle_registry: dict[str, _RateToggle] = {}  # iface -> toggle
 
 def get_profiles() -> dict[str, TcProfile]:
+    """Return built-in tc profile definitions.
+
+    Args:
+        None.
+
+    Returns:
+        Copy of the built-in profile mapping.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Returned mapping is a shallow copy.
+
+    Failure Modes:
+        - None.
+    """
     return dict(PROFILES)
 
 def apply_profile(
@@ -287,9 +358,32 @@ def apply_profile(
     var_period_s: int | None = None,
     profiles: dict[str, TcProfile] | None = None,
 ) -> None:
-    """
-    지정 인터페이스(iface)에 프로파일을 적용한다.
-    both=True면 ifb0를 사용해 ingress에도 동일 제약을 건다.
+    """Apply a tc/netem profile to an interface.
+
+    Args:
+        iface: Network interface to shape.
+        profile: Profile name to apply.
+        both: Apply to ingress via ifb when True.
+        var_period_s: Optional toggle period for cellular_var profiles.
+        profiles: Optional profile mapping override.
+
+    Returns:
+        None.
+
+    Raises:
+        PermissionError: If CAP_NET_ADMIN/root is missing.
+        ValueError: If the profile name is unknown.
+        OSError: If tc commands fail to execute.
+
+    Side Effects:
+        - Executes tc/ip commands to modify qdisc settings.
+        - Starts or replaces a rate toggle thread for variable profiles.
+
+    Contract:
+        - Egress shaping is always applied; ingress is optional.
+
+    Failure Modes:
+        - Command failures propagate as exceptions.
     """
     _require_root()
     profiles_map = profiles if profiles is not None else PROFILES
@@ -336,7 +430,29 @@ def apply_profile(
         _toggle_registry[iface] = toggler
 
 def clear(iface: str, both: bool = False) -> None:
-    """적용한 제약을 제거하고 시스템 기본 상태로 원복한다."""
+    """Clear tc/netem shaping and restore default state.
+
+    Args:
+        iface: Network interface to clear.
+        both: Clear ingress shaping via ifb when True.
+
+    Returns:
+        None.
+
+    Raises:
+        PermissionError: If CAP_NET_ADMIN/root is missing.
+        OSError: If tc commands fail to execute.
+
+    Side Effects:
+        - Executes tc/ip commands to remove qdisc settings.
+        - Stops any active rate toggle threads.
+
+    Contract:
+        - Ignores missing qdisc/interfaces via best-effort cleanup.
+
+    Failure Modes:
+        - Command failures propagate as exceptions.
+    """
     _require_root()
     # 토글 스레드 정지
     if iface in _toggle_registry:
@@ -358,7 +474,28 @@ def clear(iface: str, both: bool = False) -> None:
         _ignore("ip link delete ifb0 type ifb")
 
 def status(iface: str, both: bool = False) -> str:
-    """현재 qdisc/class 구성을 문자열로 반환."""
+    """Return current tc qdisc/class configuration as text.
+
+    Args:
+        iface: Network interface to query.
+        both: Include ingress (ifb) status when True.
+
+    Returns:
+        Human-readable qdisc/class output.
+
+    Raises:
+        PermissionError: If CAP_NET_ADMIN/root is missing.
+        OSError: If tc commands fail to execute.
+
+    Side Effects:
+        - Executes tc commands to fetch status.
+
+    Contract:
+        - Returns raw command output for debugging.
+
+    Failure Modes:
+        - Command failures propagate as exceptions.
+    """
     _require_root()
     out = []
     q = _run(f"tc qdisc show dev {iface}", check=False)
@@ -386,6 +523,26 @@ def _install_signal_handlers(iface: str, both: bool):
 
 
 def main():
+    """CLI entry point for tc profile application.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: If CLI arguments are invalid or tc operations fail.
+
+    Side Effects:
+        - Applies/clears/query tc profiles via system commands.
+
+    Contract:
+        - Requires CAP_NET_ADMIN/root for tc operations.
+
+    Failure Modes:
+        - Exits with non-zero status on command failures.
+    """
     parser = argparse.ArgumentParser(description="tc profile applier (HTB+netem)")
     add_logging_cli_args(parser)
     parser.add_argument(

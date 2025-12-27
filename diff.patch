@@ -1,0 +1,4955 @@
+diff --git a/collector/analyze.py b/collector/analyze.py
+index 5d60481..9be6e83 100644
+--- a/collector/analyze.py
++++ b/collector/analyze.py
+@@ -30,6 +30,13 @@
+ #
+ # 의존: pandas, numpy, pyarrow(옵션), common.schema.EventMsg, common.mqttutil
+ 
++"""Offline analyzer for collector logs (Rate/AoI/MAE).
++
++Loads event/decision/marker logs, normalizes schema, and produces summary tables
++plus a Markdown report. AoI/Rate are computed from receiver time when available,
++which is a deliberate choice that affects all downstream comparisons.
++"""
++
+ from __future__ import annotations
+ 
+ import argparse
+@@ -141,7 +148,29 @@ def _discover_named_files(
+ 
+ 
+ def load_events(paths: list[str | os.PathLike]) -> pd.DataFrame:
+-    """여러 파일에서 Event 레코드를 읽어 단일 DataFrame으로 결합."""
++    """Load Event records from parquet/CSV inputs into one normalized DataFrame.
++
++    Args:
++        paths: Files or directories to search for event logs.
++
++    Returns:
++        A DataFrame normalized to the event schema expected by downstream metrics.
++
++    Raises:
++        FileNotFoundError: If no parquet/CSV files are discovered.
++        RuntimeError: If a parquet file cannot be read (missing optional dependency).
++        ValueError: If required event columns are missing after normalization.
++
++    Side Effects:
++        - Reads files from disk.
++
++    Contract:
++        - Assumes inputs contain EventMsg-compatible records.
++        - Ensures `run_id` exists for de-duplication boundaries.
++
++    Failure Modes:
++        - Propagates pandas/parquet parsing errors for caller handling.
++    """
+     files = _discover_files(paths)
+     if not files:
+         raise FileNotFoundError("no input files found (parquet/csv)")
+@@ -216,12 +245,26 @@ def load_events(paths: list[str | os.PathLike]) -> pd.DataFrame:
+ 
+ 
+ def load_decisions(paths: list[str | os.PathLike]) -> pd.DataFrame:
+-    """
+-    decisions.(parquet|csv) 파일들을 읽어 결합한다.
++    """Load LinUCB decision logs into a normalized DataFrame.
++
++    Args:
++        paths: Files or directories to search for decision logs.
++
++    Returns:
++        A normalized DataFrame; empty if no decision files are found.
+ 
+-    필수 컬럼(표준화 후):
+-    - ts(ns), device_id, state_aoi, state_res, state_res_var, state_loss, state_q_len,
+-      tau, kbits, reward
++    Raises:
++        RuntimeError: If a parquet file cannot be read (missing optional dependency).
++        ValueError: If required decision columns are missing after normalization.
++
++    Side Effects:
++        - Reads files from disk.
++
++    Contract:
++        - Assumes decisions contain the policy state and chosen arm metadata.
++
++    Failure Modes:
++        - Propagates parsing errors so the caller can decide whether to skip decisions.
+     """
+     files = _discover_named_files(
+         paths,
+@@ -313,13 +356,25 @@ def load_decisions(paths: list[str | os.PathLike]) -> pd.DataFrame:
+ 
+ 
+ def load_collector_meta(paths: list[str | os.PathLike]) -> pd.DataFrame:
+-    """
+-    Load Collector meta (logs/collector_meta.json) and expose dedup-related diagnostics.
++    """Load collector metadata logs into a DataFrame.
+ 
+-    Expected keys (collector/collector.py):
+-    - bytes_total_including_dups
+-    - dup_bytes_dropped
+-    - dup_messages_dropped
++    Args:
++        paths: Files or directories to search for `collector_meta.json`.
++
++    Returns:
++        A DataFrame with per-run dedup/byte counters; empty if none are found.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - Reads files from disk.
++
++    Contract:
++        - Assumes metadata keys follow collector/collector.py output schema.
++
++    Failure Modes:
++        - Malformed JSON is logged and skipped; caller receives partial results.
+     """
+     files = _discover_named_files(paths, names=("collector_meta.json",))
+     if not files:
+@@ -384,13 +439,27 @@ def _normalize_decisions_schema(df: pd.DataFrame) -> pd.DataFrame:
+ 
+ 
+ def enrich_decisions_with_events(decisions: pd.DataFrame, events: pd.DataFrame) -> pd.DataFrame:
+-    """
+-    decisions(PolicyDecision) 로그에 sensor/profile/policy를 보강한다.
++    """Backfill sensor/profile/policy fields in decisions using event logs.
+ 
+-    NOTE:
+-    - PolicyDecisionMsg에는 sensor/profile이 포함되어 있지 않으므로,
+-      동일 ts/tau/kbits/res의 events 레코드와 매칭하여 추론한다.
+-    - 매칭 실패 시 sensor/profile/policy는 'unknown'으로 남는다.
++    Args:
++        decisions: Decision log DataFrame (PolicyDecision).
++        events: Event log DataFrame for the same runs/devices.
++
++    Returns:
++        Decisions with sensor/profile/policy columns populated when matches exist.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None (returns a new DataFrame).
++
++    Contract:
++        - Assumes decisions and events share `run_id`, `device_id`, and timestamp keys.
++        - Uses a best-effort join on ts/tau/kbits/res; unmatched rows remain "unknown".
++
++    Failure Modes:
++        - Mismatched schemas result in partial enrichment rather than hard failure.
+     """
+     if decisions.empty or events.empty:
+         return decisions.copy()
+@@ -510,13 +579,28 @@ def summarize_decisions_diagnostics_by_run(
+     *,
+     window_s: int = 60,
+ ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+-    """
+-    LinUCB/파이프라인 진단 지표를 decisions 로그에서 집계한다.
++    """Summarize LinUCB diagnostics from decision logs.
++
++    Args:
++        decisions: Decision log DataFrame (normalized).
++        window_s: Window size for action entropy smoothing (seconds).
+ 
+     Returns:
+-      - diag_by_run: (run_id, profile, policy, sensor) 단위 요약
+-      - arm_distribution: arm_id 분포(long-form; 논문/보고서용)
+-      - entropy_windows: 고정 시간창 entropy(long-form)
++        - diag_by_run: Aggregated diagnostics per (run_id, profile, policy, sensor).
++        - arm_distribution: Long-form arm usage distribution.
++        - entropy_windows: Long-form action entropy by fixed window.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None (pure aggregation).
++
++    Contract:
++        - Assumes decision rows contain arm_id, tau/kbits, and optional diagnostics fields.
++
++    Failure Modes:
++        - Empty inputs yield empty DataFrames without error.
+     """
+     if decisions.empty:
+         return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+@@ -775,8 +859,25 @@ def _infer_run_id_from_path(p: Path) -> str:
+ # ------------------------- 전처리/유틸 -------------------------
+ 
+ def dedup_and_sort(df: pd.DataFrame) -> pd.DataFrame:
+-    """
+-    (run_id, device_id, sensor, seq) 기준 QoS1 중복 제거, ts 오름차순 정렬.
++    """De-duplicate QoS1 events and enforce deterministic ordering.
++
++    Args:
++        df: Event DataFrame with run_id/device_id/sensor/seq columns.
++
++    Returns:
++        De-duplicated DataFrame sorted by run and time.
++
++    Raises:
++        ValueError: If required key columns are missing.
++
++    Side Effects:
++        - None (returns a new DataFrame).
++
++    Contract:
++        - Retains the earliest arrival per (run_id, device_id, sensor, seq).
++
++    Failure Modes:
++        - Sorting errors propagate if timestamps cannot be compared.
+     """
+     key = ["run_id", "device_id", "sensor", "seq"]
+     if not set(key).issubset(df.columns):
+@@ -793,9 +894,25 @@ def dedup_and_sort(df: pd.DataFrame) -> pd.DataFrame:
+ 
+ 
+ def estimate_payload_bytes(df: pd.DataFrame) -> pd.Series:
+-    """
+-    EventMsg를 재구성하여 MQTT v3.1.1 PUBLISH 바이트(헤더 포함)를 추정.
+-    df에 'mqtt_bytes' 또는 'mqtt_size_bytes' 컬럼이 이미 있다면 그대로 사용.
++    """Estimate MQTT publish byte size per event row.
++
++    Args:
++        df: Event DataFrame.
++
++    Returns:
++        Series of estimated MQTT publish bytes (payload + protocol overhead).
++
++    Raises:
++        ValueError: If required event fields are missing to reconstruct EventMsg.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - If `mqtt_bytes`/`mqtt_size_bytes` is present and complete, uses it as-is.
++
++    Failure Modes:
++        - Reconstruction errors propagate if rows are malformed.
+     """
+     if "mqtt_bytes" in df.columns and not df["mqtt_bytes"].isna().any():
+         s = df["mqtt_bytes"].astype("int64")
+@@ -881,11 +998,27 @@ def _aoi_mean_and_p95_from_segments(
+ 
+ 
+ def aoi_mean_and_p95_from_rx(gen_ns: np.ndarray, recv_ns: np.ndarray) -> tuple[float, float]:
+-    """
+-    수신 시각(recv_ns)과 생성 시각(gen_ns)을 이용해 수집기 관점 AoI(ms)의 평균/P95를 계산한다.
++    """Compute mean/P95 AoI using receiver timestamps.
++
++    Args:
++        gen_ns: Event generation timestamps (ns).
++        recv_ns: Receiver timestamps (ns), same length as gen_ns.
++
++    Returns:
++        (mean_ms, p95_ms) AoI statistics in milliseconds.
+ 
+-    - AoI(t) = t - u(t), u(t)는 '지금까지 수신한 업데이트 중 최신(생성 시각 최대)'의 생성 시각
+-    - 구간은 recv_i ~ recv_{i+1} 로 정의하며, 구간 시작 AoI는 recv_i - max(gen_0..gen_i).
++    Raises:
++        ValueError: If input arrays have different lengths.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Assumes `recv_ns` is the timebase for AoI (receiver perspective).
++        - Returns NaN when there are fewer than 2 samples.
++
++    Failure Modes:
++        - Non-finite inputs are filtered by segment computation; may return NaN.
+     """
+     if gen_ns.size < 2 or recv_ns.size < 2:
+         return float("nan"), float("nan")
+@@ -906,10 +1039,26 @@ def aoi_mean_and_p95_from_rx(gen_ns: np.ndarray, recv_ns: np.ndarray) -> tuple[f
+ 
+ 
+ def aoi_mean_and_p95(ts_ns: np.ndarray) -> tuple[float, float]:
+-    """
+-    이벤트 시각(ts_ns, 오름차순)에 대한 평균/95% AoI(ms)를 폐형식으로 계산.
+-    - 평균:   mean = Σ Δ_i^2 / (2 Σ Δ_i)
+-    - P95  :  a*   s.t. Σ min(a*, Δ_i) = 0.95 Σ Δ_i   (Δ_i는 ms 단위)
++    """Compute mean/P95 AoI using inter-event gaps (no receive time).
++
++    Args:
++        ts_ns: Event timestamps in ns (assumed sorted).
++
++    Returns:
++        (mean_ms, p95_ms) AoI statistics in milliseconds.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Assumes zero delivery delay; uses gaps only.
++        - Returns NaN when there are fewer than 2 samples.
++
++    Failure Modes:
++        - Non-finite inputs may yield NaN outputs.
+     """
+     if ts_ns.size < 2:
+         return float("nan"), float("nan")
+@@ -922,10 +1071,25 @@ def aoi_mean_and_p95(ts_ns: np.ndarray) -> tuple[float, float]:
+ # ------------------------- 집계 로직 -------------------------
+ 
+ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
+-    """
+-    run_id × profile × policy × sensor 단위로 Rate/AoI/MAE를 집계.
+-    - 반복 실험(리플리케이트)이 있는 경우 run 단위 지표를 먼저 만든 뒤,
+-      그 결과를 평균/분산으로 요약해야 논문/보고서에 적합한 비교가 가능하다.
++    """Aggregate metrics per run/profile/policy/sensor.
++
++    Args:
++        df: De-duplicated event DataFrame.
++
++    Returns:
++        Per-run metrics used as the basis for summary statistics.
++
++    Raises:
++        ValueError: If required columns are missing.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Aggregates at run granularity to keep replicate variance explicit.
++
++    Failure Modes:
++        - Returns NaN for metrics that cannot be computed from inputs.
+     """
+     need = {"run_id", "ts", "device_id", "sensor", "seq", "profile", "policy", "res", "kbits"}
+     if not need.issubset(df.columns):
+@@ -1062,14 +1226,25 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
+ 
+ 
+ def summarize(summary_by_run: pd.DataFrame) -> pd.DataFrame:
+-    """
+-    profile × policy × sensor 단위로 (run 단위 지표의) 평균/표준편차를 요약.
++    """Summarize per-run metrics into profile/policy/sensor aggregates.
++
++    Args:
++        summary_by_run: Output of `summarize_by_run`.
+ 
+-    반환 컬럼:
+-    - rate_Bps, aoi_mean_ms 등: run 평균(mean)
+-    - *_std: run 표준편차(std; n_runs<2이면 NaN)
+-    - n_events: 전체 이벤트 수 합(sum)  (참고용)
+-    - n_runs: 리플리케이트 수(count)
++    Returns:
++        Aggregated metrics with mean/std columns and run counts.
++
++    Raises:
++        ValueError: If required columns are missing.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - `*_std` is NaN when fewer than two runs are available.
++
++    Failure Modes:
++        - Missing inputs yield errors early to avoid silent mis-reporting.
+     """
+     need = {
+         "run_id",
+@@ -1164,12 +1339,27 @@ def compare_policies(
+     *,
+     baseline_policy: str = "periodic",
+ ) -> pd.DataFrame:
+-    """
+-    baseline_policy(기본: periodic) 대비 개선/변화량을 계산해 비교 테이블을 만든다.
++    """Compute policy deltas against a baseline policy.
++
++    Args:
++        summary: Aggregated metrics from `summarize`.
++        baseline_policy: Policy name to compare against (default: periodic).
++
++    Returns:
++        DataFrame with per-policy deltas and improvement percentages.
++
++    Raises:
++        ValueError: If required columns are missing.
++
++    Side Effects:
++        - None.
+ 
+-    - improvement(%)는 "낮을수록 좋은 지표" 기준으로 계산:
+-      improvement = (baseline - candidate) / baseline * 100
+-      → Rate/AoI/MAE 모두 '작을수록 좋다' 가정이며, MAE는 보통 음수(=악화)가 발생할 수 있다.
++    Contract:
++        - Improvement is defined as (baseline - candidate) / baseline * 100.
++        - Lower-is-better metrics are assumed for Rate/AoI/MAE.
++
++    Failure Modes:
++        - Missing baseline rows yield NaN improvements for that profile/sensor.
+     """
+     if summary.empty:
+         return pd.DataFrame()
+@@ -1532,6 +1722,100 @@ def _write_report_md(
+         lines.append("| " + " | ".join(cells) + " |")
+ 
+     lines.append("")
++    lines.append("## 목표 평가 (Option 2)")
++    lines.append("")
++    lines.append(
++        "- 기준: Rate>=60% vs periodic, MAE<=10% vs fixed_tau, AoI>=15% vs fixed_tau, "
++        "Rate<=+50% vs fixed_tau."
++    )
++    lines.append("")
++    lines.append(
++        "| profile | sensor | Rate>=60% vs periodic | MAE<=10% vs fixed_tau | "
++        "AoI>=15% vs fixed_tau | Rate<=+50% vs fixed_tau | Overall |"
++    )
++    lines.append("|---|---|---:|---:|---:|---:|---:|")
++
++    comp_periodic = compare_policies(summary, baseline_policy="periodic")
++    comp_fixed = compare_policies(summary, baseline_policy="fixed_tau")
++
++    def _keyed_adaptive(df: pd.DataFrame) -> dict[tuple[str, str], pd.Series]:
++        if df.empty:
++            return {}
++        sub = df[df["policy"].astype("string") == "adaptive"].copy()
++        if sub.empty:
++            return {}
++        return {
++            (str(r["profile"]), str(r["sensor"])): r
++            for _, r in sub.iterrows()
++        }
++
++    def _goal_cell(val: float, threshold: float) -> tuple[str, str]:
++        if not math.isfinite(val):
++            return "SKIP", "SKIP"
++        status = "PASS" if val >= threshold else "FAIL"
++        return status, f"{status} ({val:+.1f}%)"
++
++    adapt_periodic = _keyed_adaptive(comp_periodic)
++    adapt_fixed = _keyed_adaptive(comp_fixed)
++    adapt_rows = summary[summary["policy"].astype("string") == "adaptive"]
++
++    if adapt_rows.empty:
++        lines.append("| - | - | SKIP | SKIP | SKIP | SKIP | SKIP |")
++    else:
++        seen_keys: set[tuple[str, str]] = set()
++        for _, r in adapt_rows.iterrows():
++            key = (str(r["profile"]), str(r["sensor"]))
++            if key in seen_keys:
++                continue
++            seen_keys.add(key)
++            r_periodic = adapt_periodic.get(key)
++            r_fixed = adapt_fixed.get(key)
++
++            rate_imp = (
++                float(r_periodic.get("rate_Bps_improvement_pct"))
++                if r_periodic is not None
++                else float("nan")
++            )
++            mae_imp = (
++                float(r_fixed.get("mae_event_mean_improvement_pct"))
++                if r_fixed is not None
++                else float("nan")
++            )
++            aoi_imp = (
++                float(r_fixed.get("aoi_mean_ms_improvement_pct"))
++                if r_fixed is not None
++                else float("nan")
++            )
++            rate_imp_fixed = (
++                float(r_fixed.get("rate_Bps_improvement_pct"))
++                if r_fixed is not None
++                else float("nan")
++            )
++
++            rate_status, rate_cell = _goal_cell(rate_imp, 60.0)
++            mae_status, mae_cell = _goal_cell(mae_imp, -10.0)
++            aoi_status, aoi_cell = _goal_cell(aoi_imp, 15.0)
++            rate_fixed_status, rate_fixed_cell = _goal_cell(rate_imp_fixed, -50.0)
++
++            statuses = [rate_status, mae_status, aoi_status, rate_fixed_status]
++            if "FAIL" in statuses:
++                overall = "FAIL"
++            elif all(s == "PASS" for s in statuses):
++                overall = "PASS"
++            else:
++                overall = "SKIP"
++
++            cells = [
++                key[0],
++                key[1],
++                rate_cell,
++                mae_cell,
++                aoi_cell,
++                rate_fixed_cell,
++                overall,
++            ]
++            lines.append("| " + " | ".join(cells) + " |")
++
+     lines.append("### Adaptive vs periodic interpretation")
+     lines.append("")
+     lines.append("Lower is better for Rate/AoI/MAE; positive improvement means better.")
+@@ -3883,7 +4167,27 @@ def _fmt_num(value, fmt: str) -> str:
+ 
+ 
+ def format_summary_for_discord(summary: pd.DataFrame, *, limit: int = 10) -> str:
+-    """Create a compact Discord-friendly text report from the summary table."""
++    """Format a compact Discord-ready summary.
++
++    Args:
++        summary: Aggregated metrics from `summarize`.
++        limit: Max number of rows to include in the message.
++
++    Returns:
++        A Markdown string suitable for Discord webhook payloads.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Assumes summary columns match the analyzer output schema.
++
++    Failure Modes:
++        - Missing columns are rendered as placeholders rather than raising.
++    """
+ 
+     title = "**Semantic Uplink 분석 요약**"
+     if summary.empty:
+@@ -3919,6 +4223,26 @@ def format_summary_for_discord(summary: pd.DataFrame, *, limit: int = 10) -> str
+ # ----------------------------- CLI -----------------------------
+ 
+ def parse_args():
++    """Parse CLI arguments for the analyzer.
++
++    Args:
++        None.
++
++    Returns:
++        Parsed argparse namespace with analysis parameters.
++
++    Raises:
++        SystemExit: If CLI arguments are invalid.
++
++    Side Effects:
++        - None (argparse may print to stderr on failure).
++
++    Contract:
++        - Ensures required input paths are provided.
++
++    Failure Modes:
++        - Argument parsing errors exit the process.
++    """
+     ap = argparse.ArgumentParser(description="Analyze semantic uplink experiments (Rate/AoI/MAE)")
+     ap.add_argument("--input", "-i", action="append", required=True,
+                     help="분석할 파일 또는 디렉터리 (여러 번 지정 가능)")
+@@ -4032,6 +4356,26 @@ def parse_args():
+ 
+ 
+ def main():
++    """CLI entry point for offline analysis.
++
++    Args:
++        None.
++
++    Returns:
++        None.
++
++    Raises:
++        SystemExit: If CLI arguments are invalid or processing fails.
++
++    Side Effects:
++        - Reads input files and writes analysis artifacts to disk.
++
++    Contract:
++        - Requires at least one --input path.
++
++    Failure Modes:
++        - Propagates SystemExit for fatal errors.
++    """
+     args = parse_args()
+     setup_logging_from_args(args)
+     _PLOT_MANIFEST.clear()
+diff --git a/collector/collector.py b/collector/collector.py
+index 63ad366..70a1903 100644
+--- a/collector/collector.py
++++ b/collector/collector.py
+@@ -3,6 +3,13 @@
+ # 외부 의존: paho-mqtt, pandas, pyarrow
+ # 내부 의존: common.mqttutil.mqtt_v311_publish_size (이전 단계에 합의된 함수)
+ 
++"""MQTT collector that de-duplicates QoS1 messages and persists run artifacts.
++
++Consumes edge events/decisions/markers, buffers them in memory, and flushes to
++`run_dir/logs` as Parquet/CSV with atomic file writes. Concurrency is handled
++via locks because MQTT callbacks and the flush thread run concurrently.
++"""
++
+ from __future__ import annotations
+ 
+ import argparse
+@@ -48,6 +55,32 @@ except Exception:
+ 
+ @dataclass
+ class Config:
++    """Runtime parameters for Collector; values map directly to CLI flags.
++
++    Args:
++        run_dir: Root directory for run artifacts.
++        broker: MQTT broker hostname or IP.
++        port: MQTT broker port.
++        flush_interval_s: Interval between periodic flushes in seconds.
++        client_id: MQTT client identifier.
++        max_runtime_s: Optional auto-stop time in seconds (test helper).
++        dedup_cache_max_keys: Maximum dedup cache keys to retain.
++        dedup_cache_ttl_s: TTL in seconds for dedup cache entries.
++        clock_offset_ns: Optional edge->collector clock offset for AoI.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - `run_dir` must be writable by the collector process.
++        - Dedup cache limits may be set to 0 to disable bounds.
++
++    Failure Modes:
++        - Misconfiguration surfaces as I/O or MQTT connection errors at runtime.
++    """
+     run_dir: str
+     broker: str = "localhost"
+     port: int = 1883
+@@ -60,9 +93,28 @@ class Config:
+ 
+ 
+ class Collector:
+-    """
+-    QoS1 중복 제거(seq 기반), AoI 계산(실시간 로깅용), Parquet 저장.
+-    스키마/폴더 규칙은 VALIDATION.md 고정안과 동일.
++    """MQTT subscriber that de-duplicates QoS1 events and persists logs.
++
++    Args:
++        cfg: Collector configuration values.
++
++    Raises:
++        OSError: If required run directories cannot be created.
++
++    Contract:
++        - Expects EventMsg JSON on `edge/{device}/{sensor}/event`, policy decisions on
++          `policy/{device}/decision`, and markers on `marker/{device}`.
++        - De-duplication key is (device_id, sensor, seq); duplicates are dropped across flushes
++          within the TTL/size bounds of the in-memory cache.
++        - `ingest_message` is thread-safe; `flush_once` is safe to call while ingesting.
++
++    Side Effects:
++        - Network I/O via MQTT client.
++        - File I/O under `run_dir` (logs, metrics, figures, configs).
++
++    Failure Modes:
++        - Schema/JSON errors propagate from `ingest_message`; MQTT callbacks catch and log.
++        - Flush failures are logged and do not stop the main loop.
+     """
+     def __init__(self, cfg: Config):
+         self.cfg = cfg
+@@ -217,11 +269,33 @@ class Collector:
+         retain: bool = False,
+         t_recv_ns: int | None = None,
+     ) -> None:
+-        """
+-        MQTT 메시지를 Collector에 주입한다.
++        """Route one MQTT message into the collector buffers.
++
++        Args:
++            topic: MQTT topic name.
++            payload: Raw message payload (JSON for events/decisions/markers).
++            qos: MQTT QoS level from the broker.
++            dup: MQTT DUP flag.
++            retain: MQTT RETAIN flag.
++            t_recv_ns: Optional receive timestamp override in ns.
+ 
+-        - 테스트/리플레이/대체 전송(예: 파일/HTTP)에서 브로커 없이도 동일한 처리 경로를 재사용한다.
+-        - 오류는 호출자에게 예외로 전파(런타임 MQTT 콜백에서는 try/except로 감싸 로그만 남김).
++        Returns:
++            None.
++
++        Raises:
++            ValueError: If the payload schema does not match the expected message shape.
++            TypeError: If the payload cannot be decoded into a JSON object.
++
++        Side Effects:
++            - Updates in-memory pending buffers and de-duplication cache.
++            - Updates run metadata counters.
++
++        Contract:
++            - Assumes topics match the edge/policy/marker topic patterns.
++            - Ensures only valid schema rows enter the pending buffers.
++
++        Failure Modes:
++            - Caller is expected to catch exceptions in MQTT callback contexts to avoid crash.
+         """
+         if t_recv_ns is None:
+             t_recv_ns = time.time_ns()
+@@ -239,7 +313,27 @@ class Collector:
+             return
+ 
+     def flush_once(self) -> None:
+-        """현재 pending 버퍼를 1회 flush한다(테스트/운영 트러블슈팅 용)."""
++        """Flush pending buffers to disk once.
++
++        Args:
++            None.
++
++        Returns:
++            None.
++
++        Raises:
++            Exception: Propagates write/serialization errors after restoring buffers.
++
++        Side Effects:
++            - Writes Parquet/CSV files under `run_dir/logs`.
++            - Updates `collector_meta.json` atomically.
++
++        Contract:
++            - Pending buffers are restored on failure to avoid data loss.
++
++        Failure Modes:
++            - I/O or serialization failures propagate to the caller.
++        """
+         self._flush()
+ 
+     # --------------- 이벤트 처리 --------------- 
+@@ -622,6 +716,27 @@ class Collector:
+             )
+ 
+     def start(self):
++        """Start the MQTT collector loop and periodic flush thread.
++
++        Args:
++            None.
++
++        Returns:
++            None.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - Opens MQTT connection and starts network loop thread.
++            - Spawns a background flush thread.
++
++        Contract:
++            - Blocks until stopped or `max_runtime_s` elapses.
++
++        Failure Modes:
++            - MQTT connection failures are retried by the client.
++        """
+         t0 = time.time()
+         self._client = mqtt.Client(
+             client_id=self.cfg.client_id, clean_session=True, protocol=mqtt.MQTTv311
+@@ -671,6 +786,27 @@ class Collector:
+             self.stop()
+ 
+     def stop(self):
++        """Stop the collector and perform a final flush.
++
++        Args:
++            None.
++
++        Returns:
++            None.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - Stops MQTT loop and disconnects from broker.
++            - Writes pending buffers to disk.
++
++        Contract:
++            - Idempotent; repeated calls are no-ops after first stop.
++
++        Failure Modes:
++            - Flush errors are logged and suppressed.
++        """
+         if self._stop_event.is_set():
+             return
+         self._stop_event.set()
+@@ -690,6 +826,26 @@ class Collector:
+ 
+ 
+ def main():
++    """CLI entry point for the collector process.
++
++    Args:
++        None.
++
++    Returns:
++        None.
++
++    Raises:
++        SystemExit: If argument parsing or runtime initialization fails.
++
++    Side Effects:
++        - Starts the collector run loop.
++
++    Contract:
++        - Requires `--run-dir` to be provided.
++
++    Failure Modes:
++        - Propagates SystemExit on fatal configuration errors.
++    """
+     parser = argparse.ArgumentParser(
+         description="Semantic Uplink Collector (QoS1 de-dup, Parquet sink)"
+     )
+diff --git a/collector/store_sqlite.py b/collector/store_sqlite.py
+index 3c24dff..5b146bb 100644
+--- a/collector/store_sqlite.py
++++ b/collector/store_sqlite.py
+@@ -11,6 +11,26 @@ from pathlib import Path
+ 
+ 
+ def ensure_schema(path: str | Path = "collector.sqlite") -> None:
++    """Ensure the SQLite schema exists for collector storage.
++
++    Args:
++        path: Path to the SQLite database file.
++
++    Returns:
++        None.
++
++    Raises:
++        sqlite3.Error: If schema creation fails.
++
++    Side Effects:
++        - Creates directories and initializes tables/indexes.
++
++    Contract:
++        - Idempotent; safe to call multiple times.
++
++    Failure Modes:
++        - Database errors propagate to the caller.
++    """
+     p = Path(path)
+     if p.parent:
+         p.parent.mkdir(parents=True, exist_ok=True)
+@@ -69,4 +89,3 @@ def ensure_schema(path: str | Path = "collector.sqlite") -> None:
+         con.execute("CREATE INDEX IF NOT EXISTS idx_events_ts_ns ON events(ts_ns)")
+         con.execute("CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts)")
+         con.execute("CREATE INDEX IF NOT EXISTS idx_markers_ts ON markers(ts)")
+-
+diff --git a/common/config.py b/common/config.py
+index cb486a1..fb9eec5 100644
+--- a/common/config.py
++++ b/common/config.py
+@@ -1,3 +1,10 @@
++"""Validated configuration schemas and YAML loaders.
++
++Defines pydantic models for policy, device, and link shaping configs, plus
++helpers to load YAML files into those schemas. Extra fields are rejected to
++keep configs strict and compatible with experiment tooling.
++"""
++
+ from __future__ import annotations
+ 
+ from pathlib import Path
+@@ -8,6 +15,27 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
+ 
+ 
+ class ArmConfig(BaseModel):
++    """Policy arm definition for (tau, kbits).
++
++    Args:
++        tau: Threshold/interval for the arm (must be > 0).
++        kbits: Quantization bit width (1..16).
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If tau <= 0 or kbits out of range.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++
++    Failure Modes:
++        - Validation errors surface during config parsing.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     tau: float
+@@ -31,6 +59,28 @@ class ArmConfig(BaseModel):
+ 
+ 
+ class RewardConfig(BaseModel):
++    """Reward weight configuration for policy training.
++
++    Args:
++        alpha: AoI weight.
++        beta: MAE weight.
++        gamma: Rate weight.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++
++    Failure Modes:
++        - Invalid types surface as validation errors.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     alpha: float = 1.0
+@@ -39,6 +89,27 @@ class RewardConfig(BaseModel):
+ 
+ 
+ class ScaleConfig(BaseModel):
++    """Normalization scales for policy state and reward.
++
++    Args:
++        aoi_ms: AoI scale in milliseconds.
++        rate_bps: Rate scale in bytes per second.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++
++    Failure Modes:
++        - Invalid types surface as validation errors.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     aoi_ms: float = 1000.0
+@@ -46,6 +117,28 @@ class ScaleConfig(BaseModel):
+ 
+ 
+ class SafetyConfig(BaseModel):
++    """Safety thresholds for policy override behavior.
++
++    Args:
++        aoi_max_ms: AoI limit in milliseconds.
++        mae_max: MAE limit in sensor units.
++        safety_force_emit_on_aoi: Force emission when AoI exceeds limit.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++
++    Failure Modes:
++        - Invalid types surface as validation errors.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     aoi_max_ms: float = 5_000.0
+@@ -54,12 +147,56 @@ class SafetyConfig(BaseModel):
+ 
+ 
+ class PolicyDiagnosticsConfig(BaseModel):
++    """Toggle policy diagnostics emission.
++
++    Args:
++        enabled: Enable diagnostic metrics when True.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++
++    Failure Modes:
++        - Invalid types surface as validation errors.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     enabled: bool = False
+ 
+ 
+ class SensorPolicyConfig(BaseModel):
++    """Optional per-sensor policy overrides.
++
++    Args:
++        arms: Optional arm list overriding the global arms.
++        reward: Optional reward weight overrides.
++        safety: Optional safety threshold overrides.
++        diagnostics: Optional diagnostics toggle overrides.
++        scales: Optional normalization scale overrides.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++
++    Failure Modes:
++        - Invalid nested configs surface as validation errors.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     arms: list[ArmConfig] | None = None
+@@ -70,6 +207,32 @@ class SensorPolicyConfig(BaseModel):
+ 
+ 
+ class PolicyConfig(BaseModel):
++    """Top-level policy configuration for adaptive mode.
++
++    Args:
++        arms: Arm grid for the policy.
++        reward: Reward weight configuration.
++        safety: Safety threshold configuration.
++        diagnostics: Diagnostic emission configuration.
++        scales: Normalization scale configuration.
++        sensors: Optional per-sensor overrides keyed by sensor name.
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If the arm list is empty.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++        - At least one arm must be provided.
++
++    Failure Modes:
++        - Validation errors surface during config parsing.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     arms: list[ArmConfig]
+@@ -103,6 +266,28 @@ def _load_yaml_mapping(path: Path) -> dict[str, Any]:
+ 
+ 
+ def load_policy_config(path: str | Path) -> PolicyConfig:
++    """Load and validate a policy config from YAML.
++
++    Args:
++        path: Path to a policy YAML file.
++
++    Returns:
++        Validated PolicyConfig instance.
++
++    Raises:
++        FileNotFoundError: If the YAML file does not exist.
++        ValueError: If YAML parsing or validation fails.
++        TypeError: If the YAML root is not a mapping.
++
++    Side Effects:
++        - Reads the YAML file from disk.
++
++    Contract:
++        - Extra fields are rejected by the schema.
++
++    Failure Modes:
++        - Validation errors are surfaced as ValueError with context.
++    """
+     p = Path(path)
+     try:
+         return PolicyConfig.model_validate(_load_yaml_mapping(p))
+@@ -111,10 +296,54 @@ def load_policy_config(path: str | Path) -> PolicyConfig:
+ 
+ 
+ def load_policy_config_dict(path: str | Path) -> dict[str, Any]:
++    """Load a policy config and return it as a plain dict.
++
++    Args:
++        path: Path to a policy YAML file.
++
++    Returns:
++        Dict representation of PolicyConfig.
++
++    Raises:
++        FileNotFoundError: If the YAML file does not exist.
++        ValueError: If YAML parsing or validation fails.
++        TypeError: If the YAML root is not a mapping.
++
++    Side Effects:
++        - Reads the YAML file from disk.
++
++    Contract:
++        - Uses the same schema validation as load_policy_config.
++
++    Failure Modes:
++        - Validation errors are surfaced as ValueError with context.
++    """
+     return load_policy_config(path).model_dump()
+ 
+ 
+ class DeviceMicConfig(BaseModel):
++    """Device mic sampling configuration.
++
++    Args:
++        frame_ms: Frame length in milliseconds.
++        samplerate: Sampling rate in Hz.
++        normalize: Normalize input samples when True.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++
++    Failure Modes:
++        - Invalid types surface as validation errors.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     frame_ms: int = 100
+@@ -123,12 +352,53 @@ class DeviceMicConfig(BaseModel):
+ 
+ 
+ class DeviceTempConfig(BaseModel):
++    """Device temperature sampling configuration.
++
++    Args:
++        period_hz: Sampling frequency in Hz.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++
++    Failure Modes:
++        - Invalid types surface as validation errors.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     period_hz: float = 1.0
+ 
+ 
+ class DeviceSensorsConfig(BaseModel):
++    """Container for enabled sensor configurations.
++
++    Args:
++        mic: Optional mic configuration.
++        temp: Optional temperature configuration.
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If both mic and temp are omitted.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - At least one sensor must be configured.
++
++    Failure Modes:
++        - Validation errors surface during config parsing.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     mic: DeviceMicConfig | None = None
+@@ -142,6 +412,27 @@ class DeviceSensorsConfig(BaseModel):
+ 
+ 
+ class DeviceUIConfig(BaseModel):
++    """Device UI configuration for status displays.
++
++    Args:
++        enabled: Enable UI when True.
++        backend: UI backend name (e.g., console, lcd).
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++
++    Failure Modes:
++        - Invalid types surface as validation errors.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     enabled: bool = False
+@@ -149,6 +440,30 @@ class DeviceUIConfig(BaseModel):
+ 
+ 
+ class DeviceButtonsConfig(BaseModel):
++    """Device GPIO buttons configuration.
++
++    Args:
++        enabled: Enable GPIO buttons when True.
++        mode_pin: GPIO pin for mode button.
++        profile_pin: GPIO pin for profile button.
++        marker_pin: GPIO pin for marker button.
++        debounce_ms: Debounce interval in milliseconds.
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If pin numbers are non-positive or debounce is negative.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++
++    Failure Modes:
++        - Validation errors surface during config parsing.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     enabled: bool = False
+@@ -175,6 +490,28 @@ class DeviceButtonsConfig(BaseModel):
+ 
+ 
+ class DeviceMQTTConfig(BaseModel):
++    """Device MQTT connection settings.
++
++    Args:
++        host: Broker hostname or IP.
++        port: Broker port.
++        base_topic: Base topic prefix for publishing.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++
++    Failure Modes:
++        - Invalid types surface as validation errors.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     host: str
+@@ -183,6 +520,30 @@ class DeviceMQTTConfig(BaseModel):
+ 
+ 
+ class DeviceConfig(BaseModel):
++    """Top-level device configuration schema.
++
++    Args:
++        device_id: Device identifier used in topics and logs.
++        sensors: Sensor configuration block.
++        ui: Optional UI configuration.
++        buttons: Optional GPIO buttons configuration.
++        mqtt: MQTT connection configuration.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++
++    Failure Modes:
++        - Validation errors surface during config parsing.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     device_id: str
+@@ -193,6 +554,28 @@ class DeviceConfig(BaseModel):
+ 
+ 
+ def load_device_config(path: str | Path) -> DeviceConfig:
++    """Load and validate a device config from YAML.
++
++    Args:
++        path: Path to a device YAML file.
++
++    Returns:
++        Validated DeviceConfig instance.
++
++    Raises:
++        FileNotFoundError: If the YAML file does not exist.
++        ValueError: If YAML parsing or validation fails.
++        TypeError: If the YAML root is not a mapping.
++
++    Side Effects:
++        - Reads the YAML file from disk.
++
++    Contract:
++        - Extra fields are rejected by the schema.
++
++    Failure Modes:
++        - Validation errors are surfaced as ValueError with context.
++    """
+     p = Path(path)
+     try:
+         return DeviceConfig.model_validate(_load_yaml_mapping(p))
+@@ -201,6 +584,35 @@ def load_device_config(path: str | Path) -> DeviceConfig:
+ 
+ 
+ class LinkProfileConfig(BaseModel):
++    """Link shaping profile configuration.
++
++    Args:
++        rate_kbit: Fixed egress rate in kbit; None enables variable mode.
++        delay_ms: Base delay in milliseconds.
++        jitter_ms: Additional jitter in milliseconds.
++        loss_pct: Loss percentage (0..100).
++        loss_corr_pct: Loss correlation percentage (0..100).
++        reorder_pct: Reorder percentage (0..100).
++        low_kbit: Low rate for variable mode.
++        high_kbit: High rate for variable mode.
++        var_default_period_s: Toggle period for variable mode in seconds.
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If rate/jitter/loss bounds are invalid.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++        - Variable mode requires low_kbit and high_kbit.
++
++    Failure Modes:
++        - Validation errors surface during config parsing.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     # Structured profile (preferred). This matches `link/shaper/tc_profiles.py::TcProfile`.
+@@ -244,12 +656,54 @@ class LinkProfileConfig(BaseModel):
+ 
+ 
+ class LinkProfilesConfig(BaseModel):
++    """Collection of named link profiles.
++
++    Args:
++        profiles: Mapping of profile name to LinkProfileConfig.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are forbidden.
++
++    Failure Modes:
++        - Validation errors surface during config parsing.
++    """
+     model_config = ConfigDict(extra="forbid")
+ 
+     profiles: dict[str, LinkProfileConfig]
+ 
+ 
+ def load_link_profiles_config(path: str | Path) -> LinkProfilesConfig:
++    """Load and validate link profile configs from YAML.
++
++    Args:
++        path: Path to a link profiles YAML file.
++
++    Returns:
++        Validated LinkProfilesConfig instance.
++
++    Raises:
++        FileNotFoundError: If the YAML file does not exist.
++        ValueError: If YAML parsing or validation fails.
++        TypeError: If the YAML root is not a mapping.
++
++    Side Effects:
++        - Reads the YAML file from disk.
++
++    Contract:
++        - Extra fields are rejected by the schema.
++
++    Failure Modes:
++        - Validation errors are surfaced as ValueError with context.
++    """
+     p = Path(path)
+     try:
+         return LinkProfilesConfig.model_validate(_load_yaml_mapping(p))
+diff --git a/common/discord_webhook.py b/common/discord_webhook.py
+index 2f773d2..b0e6ff6 100644
+--- a/common/discord_webhook.py
++++ b/common/discord_webhook.py
+@@ -21,12 +21,53 @@ __all__ = ["DiscordWebhookError", "WebhookPayload", "send_discord_message"]
+ 
+ 
+ class DiscordWebhookError(RuntimeError):
+-    """Raised when the Discord webhook request fails."""
++    """Raised when the Discord webhook request fails.
++
++    Args:
++        None.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Used to wrap HTTP and transport errors from the webhook request.
++
++    Failure Modes:
++        - None.
++    """
+ 
+ 
+ @dataclass(slots=True)
+ class WebhookPayload:
+-    """A strongly-typed representation of a Discord webhook payload."""
++    """A strongly-typed representation of a Discord webhook payload.
++
++    Args:
++        content: Plain-text content to post.
++        username: Optional username override.
++        embeds: Optional iterable of embed dicts.
++        allowed_mentions: Optional allowed mentions configuration.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Caller is responsible for Discord content length limits.
++
++    Failure Modes:
++        - Invalid embed schemas surface during Discord API validation.
++    """
+ 
+     content: str
+     username: str | None = None
+@@ -61,22 +102,29 @@ def send_discord_message(
+ ) -> None:
+     """Send a message to a Discord webhook.
+ 
+-    Parameters
+-    ----------
+-    webhook_url:
+-        The HTTPS webhook endpoint provided by Discord.
+-    content:
+-        The plain-text content to post.  Discord limits this to 2000
+-        characters; the caller is expected to respect that limit.
+-    username:
+-        Optional override for the webhook username.
+-    embeds:
+-        Optional iterable of embed dictionaries; these must already conform to
+-        Discord's embed schema.
+-    allowed_mentions:
+-        Optional allowed mentions configuration.
+-    timeout:
+-        Socket timeout in seconds for the HTTP request.
++    Args:
++        webhook_url: HTTPS webhook endpoint provided by Discord.
++        content: Plain-text content to post (<= 2000 chars).
++        username: Optional override for the webhook username.
++        embeds: Optional iterable of embed dicts (must follow Discord schema).
++        allowed_mentions: Optional allowed mentions configuration.
++        timeout: Socket timeout in seconds for the HTTP request.
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If webhook_url is empty or non-HTTPS.
++        DiscordWebhookError: If Discord responds with an error or request fails.
++
++    Side Effects:
++        - Performs an HTTPS request to Discord's webhook API.
++
++    Contract:
++        - Caller must respect Discord payload limits and schema rules.
++
++    Failure Modes:
++        - HTTP/transport errors are wrapped in DiscordWebhookError.
+     """
+ 
+     if not webhook_url:
+diff --git a/common/jsonutil.py b/common/jsonutil.py
+index 5121aab..5eda041 100644
+--- a/common/jsonutil.py
++++ b/common/jsonutil.py
+@@ -13,11 +13,26 @@ if msgspec is not None:
+ 
+ 
+ def dumps(obj: Any) -> bytes:
+-    """
+-    Serialize an object to compact UTF-8 JSON bytes.
++    """Serialize an object to compact UTF-8 JSON bytes.
++
++    Args:
++        obj: JSON-serializable object.
++
++    Returns:
++        UTF-8 encoded JSON bytes with no extra whitespace.
++
++    Raises:
++        TypeError: If the object cannot be serialized by the backend.
++        ValueError: If the backend rejects the payload.
+ 
+-    - Prefers msgspec (fast) when installed.
+-    - Fallback uses stdlib json with no whitespace.
++    Side Effects:
++        - None.
++
++    Contract:
++        - Prefers msgspec when installed, otherwise uses stdlib json.
++
++    Failure Modes:
++        - Serialization errors propagate to the caller.
+     """
+     if msgspec is not None:
+         return _ENCODER.encode(obj)
+@@ -28,11 +43,26 @@ def dumps(obj: Any) -> bytes:
+ 
+ 
+ def loads(data: bytes) -> Any:
+-    """
+-    Parse UTF-8 JSON bytes into Python objects.
++    """Parse UTF-8 JSON bytes into Python objects.
+ 
+-    - Prefers msgspec (fast) when installed.
+-    - Fallback decodes as UTF-8 and uses stdlib json.
++    Args:
++        data: UTF-8 encoded JSON bytes.
++
++    Returns:
++        Parsed Python object (dict/list/str/etc).
++
++    Raises:
++        ValueError: If the JSON payload is invalid.
++        TypeError: If the input is not bytes-like.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Prefers msgspec when installed, otherwise uses stdlib json.
++
++    Failure Modes:
++        - Decode errors propagate to the caller.
+     """
+     if msgspec is not None:
+         return _DECODER.decode(data)
+@@ -40,4 +70,3 @@ def loads(data: bytes) -> Any:
+     import json
+ 
+     return json.loads(data.decode("utf-8"))
+-
+diff --git a/common/logging_setup.py b/common/logging_setup.py
+index c87e9ef..0dbaaf9 100644
+--- a/common/logging_setup.py
++++ b/common/logging_setup.py
+@@ -1,3 +1,5 @@
++"""Logging configuration helpers for CLI entry points."""
++
+ from __future__ import annotations
+ 
+ import argparse
+@@ -16,6 +18,28 @@ def add_logging_cli_args(
+     default_level: str = "INFO",
+     default_console: bool = True,
+ ) -> None:
++    """Add common logging flags to an argparse parser.
++
++    Args:
++        parser: ArgumentParser to extend.
++        default_level: Default log level string.
++        default_console: Enable console logging by default.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - Mutates the parser by adding flags.
++
++    Contract:
++        - Intended to be called once per parser instance.
++
++    Failure Modes:
++        - None.
++    """
+     parser.add_argument(
+         "--log-level",
+         default=default_level,
+@@ -54,6 +78,31 @@ def setup_logging(
+     max_bytes: int = 5_000_000,
+     backup_count: int = 3,
+ ) -> None:
++    """Configure root logging handlers for CLI usage.
++
++    Args:
++        level: Root log level string.
++        console: Enable console logging when True.
++        log_file: Optional log file path for rotation.
++        max_bytes: Max bytes per log file before rotation.
++        backup_count: Number of rotated log files to keep.
++
++    Returns:
++        None.
++
++    Raises:
++        OSError: If the log file directory cannot be created.
++
++    Side Effects:
++        - Resets root handlers and attaches new ones.
++        - Creates log file directories when requested.
++
++    Contract:
++        - Intended for one-time initialization in a process.
++
++    Failure Modes:
++        - File I/O errors surface during handler setup.
++    """
+     root = logging.getLogger()
+     root.setLevel(level.upper())
+ 
+@@ -82,6 +131,26 @@ def setup_logging(
+ 
+ 
+ def setup_logging_from_args(args: argparse.Namespace) -> None:
++    """Configure logging from an argparse namespace.
++
++    Args:
++        args: Parsed CLI arguments with logging fields.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - Calls setup_logging with values from args.
++
++    Contract:
++        - Missing attributes fall back to defaults via getattr.
++
++    Failure Modes:
++        - None.
++    """
+     setup_logging(
+         level=str(getattr(args, "log_level", "INFO")),
+         console=bool(getattr(args, "log_console", True)),
+@@ -89,4 +158,3 @@ def setup_logging_from_args(args: argparse.Namespace) -> None:
+         max_bytes=int(getattr(args, "log_max_bytes", 5_000_000)),
+         backup_count=int(getattr(args, "log_backup_count", 3)),
+     )
+-
+diff --git a/common/mqttutil.py b/common/mqttutil.py
+index 8932363..b730f21 100644
+--- a/common/mqttutil.py
++++ b/common/mqttutil.py
+@@ -63,35 +63,31 @@ def mqtt_v311_publish_size(
+     dup: bool = False,
+     retain: bool = False,
+ ) -> int:
+-    """
+-    MQTT 3.1.1 PUBLISH 패킷의 총 바이트 수(고정헤더 + 가변헤더 + 페이로드)를 반환한다.
+-
+-    Parameters
+-    ----------
+-    topic : str
+-        PUBLISH Topic Name (UTF-8). 와일드카드(+/#) 금지, 빈 문자열 금지.
+-    payload_len : int
+-        페이로드의 바이트 수. 문자열을 보낼 경우 반드시 UTF-8로 인코딩한 bytes 길이를 사용.
+-    qos : int, default 1
+-        0, 1, 2만 허용. QoS>0 일 때만 Packet Identifier(2바이트)가 포함된다.
+-    dup : bool, default False
+-        고정헤더 플래그(DUP). QoS 0에서는 DUP=True가 허용되지 않으므로 에러.
+-        (크기에는 영향 없음: 플래그는 1바이트 안에서 비트만 변경)
+-    retain : bool, default False
+-        RETAIN 플래그. 크기에는 영향 없음.
+-
+-    Returns
+-    -------
+-    int
+-        총 인코딩 바이트 수.
+-
+-    Notes
+-    -----
+-    총 길이 = FixedHeader(1바이트 + RemainingLength 가변바이트) +
+-             VariableHeader(TopicNameLen 2바이트 + TopicName + [PacketId 2바이트 if QoS>0]) +
+-             Payload(payload_len)
+-
+-    RemainingLength = VariableHeader + Payload 의 합이며, 값에 따라 1~4바이트로 인코딩된다.
++    """Compute MQTT 3.1.1 PUBLISH packet size in bytes.
++
++    Args:
++        topic: PUBLISH topic name (UTF-8, no wildcards).
++        payload_len: Payload byte length.
++        qos: QoS level (0, 1, or 2).
++        dup: DUP flag (invalid for QoS 0).
++        retain: RETAIN flag.
++
++    Returns:
++        Total encoded bytes (fixed header + variable header + payload).
++
++    Raises:
++        TypeError: If inputs are not the expected types.
++        ValueError: If topic/QoS/DUP constraints are violated.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Validates topic length and wildcard usage per MQTT 3.1.1.
++        - Includes packet identifier only when QoS > 0.
++
++    Failure Modes:
++        - Validation errors propagate to the caller.
+     """
+     # --- 입력 검증 ---
+     topic_len = _validate_publish_topic(topic)
+diff --git a/common/schema.py b/common/schema.py
+index 4cee0e5..d077d6a 100644
+--- a/common/schema.py
++++ b/common/schema.py
+@@ -5,6 +5,13 @@
+ # - 과제/동결안의 스키마/토픽/프로파일/정의와 정확히 일치. (헤더 포함 Rate 산정과 정합)
+ # - 직렬화는 표준 라이브러리 기반이며, 설치된 경우 msgspec로 가속한다.  [과제 제안서 준수]
+ 
++"""Shared MQTT message schemas and validation utilities.
++
++Defines Event/PolicyDecision payloads, validates fields at construction time,
++and provides JSON serialization plus MQTT size estimation helpers. These
++schemas are a compatibility boundary with the collector/analyzer pipeline.
++"""
++
+ from __future__ import annotations
+ 
+ import math
+@@ -35,15 +42,75 @@ UINT64_MAX: int = (1 << 64) - 1
+ # -------------------- Enums (문자열 값 고정) --------------------
+ 
+ class SensorType(str, Enum):
++    """Supported sensor identifiers for event topics and payloads.
++
++    Args:
++        None.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Enum values must remain stable for topic/schema compatibility.
++
++    Failure Modes:
++        - None.
++    """
+     MIC_RMS = "mic_rms"
+     TEMP = "temp"
+ 
+ class PolicyMode(str, Enum):
++    """Policy mode identifiers embedded in EventMsg.
++
++    Args:
++        None.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Enum values must remain stable for downstream analysis.
++
++    Failure Modes:
++        - None.
++    """
+     PERIODIC = "periodic"
+     FIXED_TAU = "fixed_tau"
+     ADAPTIVE = "adaptive"
+ 
+ class LinkProfile(str, Enum):
++    """Network profile identifiers used in experiments.
++
++    Args:
++        None.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Enum values must remain stable for config/profile matching.
++
++    Failure Modes:
++        - None.
++    """
+     SLOW_10KBPS = "slow_10kbps"
+     DELAY_LOSS = "delay_loss"
+     CELLULAR_VAR = "cellular_var"
+@@ -92,13 +159,40 @@ def _enum_from(value: str | Enum, enum_cls: Any, name: str) -> Enum:
+ 
+ @dataclass(slots=True, frozen=True)
+ class EventMsg:
+-    """
+-    업링크 이벤트 메시지(엣지→브로커).
+-    필드명/타입은 스키마 동결안과 동일:
+-      ts(int64 ns epoch), seq(u64), device_id(str), sensor("mic_rms"|"temp"),
+-      val(float), pred(float), res(float), tau(float), kbits(int),
+-      aoi_ms(Optional[int]), profile(str), policy("periodic"|"fixed_tau"|"adaptive")
+-    JSON 직렬화 시 None 필드는 생략(바이트 절약).
++    """Event message emitted by the edge (uplink).
++
++    Args:
++        ts: Epoch timestamp in nanoseconds.
++        seq: Monotonic per-device sequence number.
++        device_id: Device identifier (must not include '/').
++        sensor: Sensor type identifier.
++        val: Quantized sensor value.
++        pred: Predictor output for the same sample.
++        res: Residual error (val - pred).
++        tau: Sampling or decision interval in seconds.
++        kbits: Quantization bit width (1..16).
++        profile: Link profile identifier.
++        policy: Policy mode identifier.
++        aoi_ms: Optional AoI in milliseconds for diagnostics.
++        event_reason: Optional emission reason tag.
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If numeric ranges are violated (e.g., kbits out of range).
++        TypeError: If fields cannot be coerced into the required types.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Fields must match the frozen schema for downstream compatibility.
++        - `device_id` must not contain '/' to preserve topic structure.
++        - JSON serialization omits optional None fields to reduce payload size.
++
++    Failure Modes:
++        - Validation raises ValueError/TypeError on invalid values.
+     """
+     ts: int
+     seq: int
+@@ -166,6 +260,26 @@ class EventMsg:
+ 
+     # ---- 직렬화/역직렬화 ----
+     def to_dict(self) -> dict[str, Any]:
++        """Serialize the message to a JSON-ready dict.
++
++        Args:
++            None.
++
++        Returns:
++            Dict with enum values rendered as strings.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Optional fields are omitted when None.
++
++        Failure Modes:
++            - None.
++        """
+         d: dict[str, Any] = {
+             "ts": self.ts,
+             "seq": self.seq,
+@@ -186,11 +300,53 @@ class EventMsg:
+         return d
+ 
+     def to_json_bytes(self) -> bytes:
++        """Serialize the message to compact JSON bytes.
++
++        Args:
++            None.
++
++        Returns:
++            UTF-8 encoded JSON without extra whitespace.
++
++        Raises:
++            ValueError: If serialization fails in the JSON backend.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Uses the compact JSON backend to minimize payload length.
++
++        Failure Modes:
++            - JSON backend errors propagate as ValueError.
++        """
+         # 공백 없는 JSON (Rate 산정시 payload_len 최소화)
+         return _json_dumps(self.to_dict())
+ 
+     @classmethod
+     def from_dict(cls, d: dict[str, Any]) -> EventMsg:
++        """Construct an EventMsg from a dict payload.
++
++        Args:
++            d: Parsed JSON mapping.
++
++        Returns:
++            EventMsg instance with validated fields.
++
++        Raises:
++            KeyError: If required fields are missing.
++            ValueError: If field values are out of allowed ranges.
++            TypeError: If field types are incompatible.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Required keys must be present in the mapping.
++
++        Failure Modes:
++            - Raises on malformed or incomplete payloads.
++        """
+         # 필수 필드 확인
+         required = (
+             "ts",
+@@ -230,6 +386,26 @@ class EventMsg:
+ 
+     @classmethod
+     def from_json_bytes(cls, b: bytes) -> EventMsg:
++        """Parse JSON bytes into an EventMsg instance.
++
++        Args:
++            b: UTF-8 encoded JSON bytes.
++
++        Returns:
++            Validated EventMsg instance.
++
++        Raises:
++            ValueError: If JSON parsing fails or payload is not an object.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Assumes the payload follows EventMsg JSON schema.
++
++        Failure Modes:
++            - JSON decoding failures surface as ValueError.
++        """
+         try:
+             d = _json_loads(b)
+         except Exception as e:
+@@ -240,11 +416,50 @@ class EventMsg:
+ 
+     # ---- 토픽/크기 ----
+     def mqtt_topic(self) -> str:
++        """Return the MQTT topic for this event.
++
++        Args:
++            None.
++
++        Returns:
++            Topic string formatted as `edge/{device_id}/{sensor}/event`.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - `device_id` must be slash-free to preserve topic hierarchy.
++
++        Failure Modes:
++            - None.
++        """
+         # edge/{device_id}/{sensor}/event
+         return f"edge/{self.device_id}/{self.sensor.value}/event"
+ 
+     def estimated_mqtt_size(self, qos: int = 1) -> int:
+-        """헤더 포함 MQTT v3.1.1 PUBLISH 총 바이트 수(브로커 수신 기준)."""
++        """Estimate MQTT v3.1.1 publish size including headers.
++
++        Args:
++            qos: MQTT QoS level used to compute header sizing.
++
++        Returns:
++            Total bytes for a PUBLISH packet at the given QoS.
++
++        Raises:
++            RuntimeError: If the MQTT size calculator is unavailable.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Uses `mqtt_v311_publish_size` for protocol-accurate sizing.
++
++        Failure Modes:
++            - Raises if the helper is missing in minimal environments.
++        """
+         if mqtt_v311_publish_size is None:
+             raise RuntimeError("mqtt_v311_publish_size unavailable")
+         payload_len = len(self.to_json_bytes())
+@@ -254,13 +469,53 @@ class EventMsg:
+ 
+ @dataclass(slots=True, frozen=True)
+ class PolicyDecisionMsg:
+-    """
+-    정책 결정 메시지(엣지→브로커).
+-    필드:
+-      ts(int64 ns), device_id(str),
+-      state_aoi(float), state_res(float), state_res_var(float),
+-      state_loss(float in [0,1]), state_q_len(int>=0),
+-      tau(float), kbits(int[1..16]), reward(float)
++    """Policy decision message emitted by the edge.
++
++    Args:
++        ts: Epoch timestamp in nanoseconds.
++        device_id: Device identifier (must not include '/').
++        state_aoi: AoI estimate in milliseconds.
++        state_res: Residual error estimate.
++        state_res_var: Residual variance estimate (>= 0).
++        state_loss: Loss estimate in [0, 1].
++        state_q_len: Outbox queue length (>= 0).
++        tau: Selected sampling interval in seconds.
++        kbits: Selected quantization bit width (1..16).
++        reward: Scalar reward used by the policy.
++        arm_id: Optional arm index for diagnostics.
++        safe_arm_forced: Optional flag indicating a safety override.
++        forced_reason: Optional reason string for a safety override.
++        ucb_exploitation: Optional UCB exploitation term.
++        ucb_exploration: Optional UCB exploration term.
++        ucb_score: Optional total UCB score.
++        ucb_alpha: Optional UCB alpha (must be > 0 if present).
++        reward_aoi: Optional AoI component of the reward.
++        reward_mae: Optional MAE component of the reward.
++        reward_rate: Optional rate component of the reward.
++        rate_limit_skips: Optional count of rate-limit skips.
++        t_predict_ms: Optional predictor timing in milliseconds.
++        t_decide_ms: Optional decision timing in milliseconds.
++        t_observe_ms: Optional observe timing in milliseconds.
++        t_step_ms: Optional total step timing in milliseconds.
++        cpu_step_ms: Optional CPU time for the step in milliseconds.
++        maxrss_kb: Optional max RSS during the step in KB.
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If numeric ranges are violated.
++        TypeError: If fields cannot be coerced into required types.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - `device_id` must not contain '/' to preserve topic structure.
++        - Optional diagnostics are omitted from JSON when None.
++
++    Failure Modes:
++        - Validation raises ValueError/TypeError on invalid values.
+     """
+     ts: int
+     device_id: str
+@@ -427,6 +682,26 @@ class PolicyDecisionMsg:
+ 
+     # 직렬화/역직렬화
+     def to_dict(self) -> dict[str, Any]:
++        """Serialize the decision to a JSON-ready dict.
++
++        Args:
++            None.
++
++        Returns:
++            Dict with optional diagnostics omitted when None.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Optional diagnostics are excluded when unset to reduce payload size.
++
++        Failure Modes:
++            - None.
++        """
+         d: dict[str, Any] = {
+             "ts": self.ts,
+             "device_id": self.device_id,
+@@ -476,10 +751,51 @@ class PolicyDecisionMsg:
+         return d
+ 
+     def to_json_bytes(self) -> bytes:
++        """Serialize the decision to compact JSON bytes.
++
++        Args:
++            None.
++
++        Returns:
++            UTF-8 encoded JSON without extra whitespace.
++
++        Raises:
++            ValueError: If serialization fails in the JSON backend.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Uses compact JSON to minimize payload length.
++
++        Failure Modes:
++            - JSON backend errors propagate as ValueError.
++        """
+         return _json_dumps(self.to_dict())
+ 
+     @classmethod
+     def from_dict(cls, d: dict[str, Any]) -> PolicyDecisionMsg:
++        """Construct a PolicyDecisionMsg from a dict payload.
++
++        Args:
++            d: Parsed JSON mapping.
++
++        Returns:
++            PolicyDecisionMsg instance with validated fields.
++
++        Raises:
++            ValueError: If required keys are missing or values are out of range.
++            TypeError: If field types are incompatible.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Required keys must be present in the mapping.
++
++        Failure Modes:
++            - Raises on malformed or incomplete payloads.
++        """
+         required = ("ts", "device_id", "state_aoi", "state_res", "state_res_var",
+                     "state_loss", "state_q_len", "tau", "kbits", "reward")
+         missing = [k for k in required if k not in d]
+@@ -575,6 +891,26 @@ class PolicyDecisionMsg:
+ 
+     @classmethod
+     def from_json_bytes(cls, b: bytes) -> PolicyDecisionMsg:
++        """Parse JSON bytes into a PolicyDecisionMsg instance.
++
++        Args:
++            b: UTF-8 encoded JSON bytes.
++
++        Returns:
++            Validated PolicyDecisionMsg instance.
++
++        Raises:
++            ValueError: If JSON parsing fails or payload is not an object.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Assumes the payload follows PolicyDecisionMsg JSON schema.
++
++        Failure Modes:
++            - JSON decoding failures surface as ValueError.
++        """
+         try:
+             d = _json_loads(b)
+         except Exception as e:
+@@ -585,10 +921,50 @@ class PolicyDecisionMsg:
+ 
+     # 토픽/크기
+     def mqtt_topic(self) -> str:
++        """Return the MQTT topic for this policy decision.
++
++        Args:
++            None.
++
++        Returns:
++            Topic string formatted as `policy/{device_id}/decision`.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - `device_id` must be slash-free to preserve topic hierarchy.
++
++        Failure Modes:
++            - None.
++        """
+         # policy/{device_id}/decision
+         return f"policy/{self.device_id}/decision"
+ 
+     def estimated_mqtt_size(self, qos: int = 1) -> int:
++        """Estimate MQTT v3.1.1 publish size including headers.
++
++        Args:
++            qos: MQTT QoS level used to compute header sizing.
++
++        Returns:
++            Total bytes for a PUBLISH packet at the given QoS.
++
++        Raises:
++            RuntimeError: If the MQTT size calculator is unavailable.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Uses `mqtt_v311_publish_size` for protocol-accurate sizing.
++
++        Failure Modes:
++            - Raises if the helper is missing in minimal environments.
++        """
+         if mqtt_v311_publish_size is None:
+             raise RuntimeError("mqtt_v311_publish_size unavailable")
+         payload_len = len(self.to_json_bytes())
+diff --git a/common/timeutil.py b/common/timeutil.py
+index dd583ab..4c10c8a 100644
+--- a/common/timeutil.py
++++ b/common/timeutil.py
+@@ -8,17 +8,50 @@ ISO_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
+ 
+ 
+ def now_iso() -> str:
++    """Return current UTC time formatted as ISO-8601.
++
++    Args:
++        None.
++
++    Returns:
++        Timestamp string in ISO-8601 format with UTC suffix.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - Reads system clock.
++
++    Contract:
++        - Uses UTC timezone for formatting.
++
++    Failure Modes:
++        - None.
++    """
+     return datetime.now(timezone.utc).strftime(ISO_FMT)
+ 
+ 
+ def iso_to_epoch(ts: str) -> float:
+-    """
+-    Parse an ISO-8601 timestamp into epoch seconds.
++    """Parse an ISO-8601 timestamp into epoch seconds.
++
++    Args:
++        ts: ISO-8601 timestamp string.
++
++    Returns:
++        Seconds since Unix epoch (UTC).
++
++    Raises:
++        ValueError: If the timestamp cannot be parsed.
+ 
+-    Accepts:
+-    - "YYYY-MM-DDTHH:MM:SSZ"
+-    - "YYYY-MM-DDTHH:MM:SS.sssZ"
+-    - Python's `datetime.fromisoformat` variants (e.g., "+00:00")
++    Side Effects:
++        - None.
++
++    Contract:
++        - Accepts "YYYY-MM-DDTHH:MM:SSZ" and "YYYY-MM-DDTHH:MM:SS.sssZ".
++        - Accepts datetime.fromisoformat variants (e.g., "+00:00").
++
++    Failure Modes:
++        - Invalid formats raise ValueError.
+     """
+     s = str(ts).strip()
+     try:
+@@ -40,5 +73,25 @@ def iso_to_epoch(ts: str) -> float:
+ 
+ 
+ def aoi_ms(now_epoch: float, gen_epoch: float) -> float:
+-    return max(0.0, (float(now_epoch) - float(gen_epoch)) * 1000.0)
++    """Compute AoI in milliseconds from two epoch timestamps.
++
++    Args:
++        now_epoch: Current time in epoch seconds.
++        gen_epoch: Generation time in epoch seconds.
++
++    Returns:
++        Non-negative AoI in milliseconds.
+ 
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Negative deltas are clamped to zero.
++
++    Failure Modes:
++        - Non-finite inputs yield NaN results via float arithmetic.
++    """
++    return max(0.0, (float(now_epoch) - float(gen_epoch)) * 1000.0)
+diff --git a/edge/edge_daemon.py b/edge/edge_daemon.py
+index 19d37db..5ff2372 100644
+--- a/edge/edge_daemon.py
++++ b/edge/edge_daemon.py
+@@ -7,6 +7,14 @@
+ # - 유실 0: Outbox 내구성 + 퍼블리셔 재연결/ACK 기반 삭제로 보장.
+ # - 문서/토픽/스키마: 동결안 및 공통 모듈과 1:1 정합.
+ 
++"""Edge daemon orchestrating sensors, policy, and MQTT uplink.
++
++Runs sensor loops in background threads, applies prediction/policy decisions,
++and publishes events through a durable outbox. It touches hardware (sensors,
++RTC, UI) and network I/O; correctness relies on orderly start/stop and on the
++outbox for delivery guarantees.
++"""
++
+ from __future__ import annotations
+ 
+ import argparse
+@@ -42,6 +50,37 @@ logger = logging.getLogger(__name__)
+ 
+ @dataclass(slots=True)
+ class MicCfg:
++    """Runtime configuration for mic sampling and EWMA trigger parameters.
++
++    Args:
++        enable: Enable mic sampling when True.
++        backend: Audio backend name ("auto", "sounddevice", "arecord").
++        arecord_device: Optional ALSA device override for arecord.
++        sounddevice_device: Optional device name/id for sounddevice.
++        sample_rate: Sampling rate in Hz.
++        frame_ms: Frame size in milliseconds.
++        alpha: EWMA alpha parameter.
++        tau: Residual threshold in dB for event emission.
++        kbits: Quantization bit width (1..16).
++        heartbeat_s: Optional heartbeat interval in seconds.
++        min_emit_ms: Optional minimum emit interval to rate-limit.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Values are passed directly into MicRMS and EWMAConfig.
++        - `kbits` must remain within schema limits [1, 16].
++
++    Failure Modes:
++        - Invalid values surface when initializing sensors or predictor.
++    """
+     enable: bool = True
+     backend: str = "auto"              # auto|sounddevice|arecord
+     arecord_device: str | None = None
+@@ -57,6 +96,36 @@ class MicCfg:
+ 
+ @dataclass(slots=True)
+ class TempCfg:
++    """Runtime configuration for temperature sampling and EWMA trigger parameters.
++
++    Args:
++        enable: Enable temperature sampling when True.
++        backend: Temperature backend ("auto", "w1", "sysfs", "mock").
++        sample_hz: Sampling frequency in Hz.
++        alpha: EWMA alpha parameter.
++        tau: Residual threshold in Celsius for event emission.
++        kbits: Quantization bit width (1..16).
++        heartbeat_s: Optional heartbeat interval in seconds.
++        min_emit_ms: Optional minimum emit interval to rate-limit.
++        w1_path: Optional path to DS18B20 w1 device file.
++        sysfs_path: Optional sysfs thermal path override.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Values are passed directly into TempSensor and EWMAConfig.
++        - `kbits` must remain within schema limits [1, 16].
++
++    Failure Modes:
++        - Invalid values surface when initializing sensors or predictor.
++    """
+     enable: bool = True
+     backend: str = "auto"              # auto|w1|sysfs|mock
+     sample_hz: float = 1.0
+@@ -71,6 +140,31 @@ class TempCfg:
+ 
+ @dataclass(slots=True)
+ class RTCCfg:
++    """RTC synchronization configuration for DS3231.
++
++    Args:
++        enable: Enable RTC synchronization when True.
++        bus: I2C bus number for DS3231.
++        address: I2C address for DS3231.
++        drift_guard_s: Allowed drift before resync in seconds.
++        resync_interval_s: Periodic resync interval in seconds.
++        push_system_to_rtc: Whether to push system time to RTC when drifting.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Requires DS3231 hardware when enabled.
++
++    Failure Modes:
++        - Hardware access errors surface when RTC guardian starts.
++    """
+     enable: bool = False
+     bus: int = 1
+     address: int = 0x68
+@@ -81,6 +175,31 @@ class RTCCfg:
+ 
+ @dataclass(slots=True)
+ class UICfg:
++    """UI configuration for LCD/OLED/console status display.
++
++    Args:
++        enable: Enable status UI updates when True.
++        kind: Display backend ("auto", "lcd1602", "ssd1306", "console").
++        bus: I2C bus number for hardware displays.
++        address: Optional I2C address override.
++        refresh_s: Refresh interval in seconds.
++        rate_window_s: Window size in seconds for rate smoothing.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - UI runs in its own thread when enabled.
++
++    Failure Modes:
++        - Hardware initialization failures are logged and the UI is disabled.
++    """
+     enable: bool = False
+     kind: str = "auto"         # auto|lcd1602|ssd1306|console
+     bus: int = 1
+@@ -91,6 +210,30 @@ class UICfg:
+ 
+ @dataclass(slots=True)
+ class ButtonsCfg:
++    """GPIO button configuration for mode/profile/marker controls.
++
++    Args:
++        enable: Enable GPIO buttons when True.
++        mode_pin: GPIO pin for mode button.
++        profile_pin: GPIO pin for profile button.
++        marker_pin: GPIO pin for marker button.
++        debounce_ms: Debounce interval in milliseconds.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - GPIO pins must be valid for the target board.
++
++    Failure Modes:
++        - GPIO init errors are logged and buttons are disabled.
++    """
+     enable: bool = True
+     mode_pin: int = 17
+     profile_pin: int = 27
+@@ -100,6 +243,30 @@ class ButtonsCfg:
+ 
+ @dataclass(slots=True)
+ class LinkCfg:
++    """Link-shaping configuration for tc/netem integration.
++
++    Args:
++        iface: Network interface to shape.
++        both: Apply shaping to ingress via ifb when True.
++        apply_on_button: Apply profile changes on button presses.
++        apply_on_start: Apply current profile once at startup.
++        profiles_config: Optional YAML path to override built-in profiles.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - tc/netem operations require CAP_NET_ADMIN or root.
++
++    Failure Modes:
++        - Permission errors are logged when shaping is enabled without privileges.
++    """
+     iface: str = "eth0"
+     both: bool = False            # ingress 포함 여부
+     apply_on_button: bool = False # 버튼으로 프로파일 변경 시 tc 적용 여부 (root 필요)
+@@ -109,10 +276,70 @@ class LinkCfg:
+ 
+ @dataclass(slots=True)
+ class DecisionCfg:
++    """Publishing policy decision configuration.
++
++    Args:
++        publish: Policy decision publish mode ("always", "event", "never").
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Mode names must match policy runtime expectations.
++
++    Failure Modes:
++        - Invalid modes are handled by policy runtime validation.
++    """
+     publish: str = "always"  # always|event|never
+ 
+ 
+ class EdgeDaemon:
++    """Main edge process coordinating sensors, policy, and MQTT publishing.
++
++    Args:
++        device_id: Unique device identifier for topics and logs.
++        profile: LinkProfile used for policy context and UI.
++        outbox_path: Path to the outbox SQLite database.
++        mode: Policy mode (periodic/fixed/adaptive).
++        arms_cfg: Optional LinUCB arms configuration mapping.
++        broker: MQTT broker host.
++        port: MQTT broker port.
++        client_id: MQTT client identifier.
++        keepalive: MQTT keepalive in seconds.
++        seed: Optional RNG seed for deterministic runs.
++        mic: Optional mic sensor configuration.
++        temp: Optional temperature sensor configuration.
++        rtc: Optional RTC synchronization configuration.
++        ui: Optional UI configuration.
++        buttons: Optional GPIO button configuration.
++        link: Optional link shaping configuration.
++        decision: Optional policy decision publish configuration.
++
++    Returns:
++        None.
++
++    Raises:
++        OSError: If run directories or outbox path cannot be created.
++
++    Contract:
++        - Requires at least one enabled sensor (mic or temp).
++        - Uses Outbox for durability; a message is removed only after PUBACK.
++
++    Side Effects:
++        - Spawns background threads for sensors, UI, and button handling.
++        - Reads hardware sensors and writes an SQLite outbox.
++        - Connects to MQTT broker and may apply tc/netem shaping if enabled.
++
++    Failure Modes:
++        - Sensor init or UI init failures are logged and the component is skipped.
++        - MQTT outages are tolerated; outbox buffers until reconnect.
++    """
+     def __init__(
+         self,
+         *,
+@@ -189,6 +416,27 @@ class EdgeDaemon:
+     # ---------- 라이프사이클 ----------
+ 
+     def start(self):
++        """Start worker threads and block until stop is requested.
++
++        Args:
++            None.
++
++        Returns:
++            None.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - Starts MQTT publisher and sensor/UI/button threads.
++            - May apply tc profiles when configured.
++
++        Contract:
++            - Blocks the calling thread until `stop` is invoked or a signal is received.
++
++        Failure Modes:
++            - Component init failures are logged and the daemon continues when possible.
++        """
+         self._install_signals()
+         self._maybe_start_rtc()
+         if self.link_cfg.apply_on_start:
+@@ -222,6 +470,26 @@ class EdgeDaemon:
+             self.stop()
+ 
+     def stop(self):
++        """Stop background threads and release resources.
++
++        Args:
++            None.
++
++        Returns:
++            None.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - Stops MQTT publisher, closes outbox, and releases hardware handles.
++
++        Contract:
++            - Idempotent; repeated calls are no-ops after the first stop.
++
++        Failure Modes:
++            - Cleanup errors are logged and suppressed.
++        """
+         if self._stop.is_set():
+             return
+         self._stop.set()
+@@ -788,6 +1056,26 @@ def _opt_path(val: str | None) -> str | None:
+ 
+ 
+ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
++    """Parse CLI arguments and resolve config-driven defaults.
++
++    Args:
++        argv: Optional CLI argument list; defaults to sys.argv.
++
++    Returns:
++        Parsed argparse namespace with resolved defaults.
++
++    Raises:
++        SystemExit: If required arguments or config files are invalid.
++
++    Side Effects:
++        - Reads device YAML when `--device-config` is supplied.
++
++    Contract:
++        - Ensures `device_id` is resolved from CLI or device config.
++
++    Failure Modes:
++        - Invalid YAML or schema issues terminate the process via argparse error.
++    """
+     # device-config를 먼저 파싱해, 나머지 옵션의 default를 동적으로 구성한다.
+     pre = argparse.ArgumentParser(add_help=False)
+     pre.add_argument("--device-config", default=None, help="device YAML path (e.g., configs/device.yaml)")
+@@ -1018,6 +1306,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+ 
+ 
+ def main(argv: list[str] | None = None):
++    """CLI entry point for the edge daemon.
++
++    Args:
++        argv: Optional argument list for testing; defaults to sys.argv.
++
++    Returns:
++        None.
++
++    Raises:
++        SystemExit: If argument parsing or runtime initialization fails.
++
++    Side Effects:
++        - Starts sensors, policy runtime, and MQTT publishing.
++
++    Contract:
++        - Requires a device_id from CLI or device config.
++
++    Failure Modes:
++        - Propagates SystemExit on fatal configuration errors.
++    """
+     args = parse_args(argv)
+     setup_logging_from_args(args)
+ 
+diff --git a/edge/policy/linucb.py b/edge/policy/linucb.py
+index e72f04e..cca16af 100644
+--- a/edge/policy/linucb.py
++++ b/edge/policy/linucb.py
+@@ -6,6 +6,12 @@
+ # - 안전가드: AoI_max/MAE_max 위반 시 세이프 팔로 강제 전환(탐색 무시)
+ # - 결정 로그: PolicyDecisionMsg (reward는 의도적으로 0.0 → 실제 보상은 observe_outcome에서 학습)
+ 
++"""LinUCB policy for selecting (tau, kbits) arms under link constraints.
++
++Implements a contextual bandit with ridge regression and UCB exploration.
++Safety guards can override arm choice to enforce AoI/MAE limits.
++"""
++
+ from __future__ import annotations
+ 
+ import logging
+@@ -30,12 +36,73 @@ __all__ = [
+ 
+ @dataclass(slots=True, frozen=True)
+ class Arm:
++    """Immutable arm definition for (tau, kbits) selection.
++
++    Args:
++        tau: Sampling threshold or interval for the arm.
++        kbits: Quantization bit width (1..16).
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Used as a value object; no validation beyond type coercion.
++
++    Failure Modes:
++        - Invalid values surface when the policy validates arms.
++    """
+     tau: float
+     kbits: int
+ 
+ 
+ @dataclass(slots=True)
+ class LinUCBConfig:
++    """Configuration for LinUCB policy behavior and constraints.
++
++    Args:
++        device_id: Device identifier for logging.
++        sensor: Sensor type for arm defaults.
++        profile: Link profile identifier.
++        seed: Optional RNG seed for deterministic choices.
++        arms: Optional explicit arm list; defaults to sensor-specific grid.
++        alpha_ucb: UCB exploration strength (alpha).
++        lambda_ridge: Ridge regularization coefficient.
++        w_aoi: AoI weight in reward.
++        w_mae: MAE weight in reward.
++        w_rate: Rate weight in reward.
++        aoi_scale_ms: AoI normalization scale in ms.
++        mae_scale: MAE normalization scale.
++        rate_scale_bps: Rate normalization scale in bps.
++        res_scale: Residual normalization scale.
++        resvar_scale: Residual variance normalization scale.
++        aoi_max_ms: AoI safety threshold in ms.
++        mae_max: MAE safety threshold.
++        safety_force_emit_on_aoi: Whether to force emit when AoI exceeds limit.
++        warmup_per_arm: Minimum pulls per arm before UCB selection.
++        safe_arm: Optional explicit safe arm override.
++        diagnostics_enabled: Emit diagnostic scalars when True.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Values are consumed by LinUCBPolicy without additional validation.
++
++    Failure Modes:
++        - Invalid values surface during policy initialization.
++    """
+     device_id: str
+     sensor: SensorType
+     profile: LinkProfile
+@@ -77,6 +144,31 @@ class LinUCBConfig:
+ 
+ @dataclass(slots=True, frozen=True)
+ class PolicyState:
++    """Context features used by LinUCB to choose an arm.
++
++    Args:
++        ts_ns: Timestamp for the state in nanoseconds.
++        aoi_ms: AoI estimate in milliseconds.
++        res: Residual error estimate.
++        res_var: Residual variance estimate.
++        loss: Loss estimate in [0, 1].
++        q_len: Queue length estimate (>= 0).
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Values are normalized inside the policy before scoring.
++
++    Failure Modes:
++        - Non-finite values are sanitized during decision making.
++    """
+     ts_ns: int
+     aoi_ms: float
+     res: float
+@@ -102,12 +194,27 @@ def _default_arms(sensor: SensorType) -> list[Arm]:
+ 
+ 
+ class LinUCBPolicy:
+-    """
+-    LinUCB 컨텍스트 밴딧 정책.
+-    - 팔별(τ,k)로 A(=λI + Σ x xᵀ), b(=Σ r x) 유지
+-    - 추정 θ̂ = A⁻¹ b, 선택 점수 p = θ̂ᵀx + α·√(xᵀA⁻¹x)
+-    - 안전가드: 상태가 임계 초과면 항상 세이프 팔
+-    - 학습 시점: observe_outcome()에서 직전 결정의 (x, arm)에 보상 r을 적용
++    """Contextual bandit policy using LinUCB.
++
++    Args:
++        cfg: LinUCBConfig with arm grid, scaling, and safety limits.
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If the arm grid is empty or the safe arm is missing.
++
++    Contract:
++        - Maintains per-arm ridge regression state (A, b) and counts.
++        - `decide` must be followed by `observe_outcome` to update the chosen arm.
++        - Safety guardrails can override exploration.
++
++    Side Effects:
++        - Updates in-memory model parameters and internal counters.
++
++    Failure Modes:
++        - Invalid states are sanitized and logged; selection continues.
+     """
+ 
+     def __init__(self, cfg: LinUCBConfig):
+@@ -161,9 +268,26 @@ class LinUCBPolicy:
+     # ---------------- 공개 API ----------------
+ 
+     def decide(self, state: PolicyState) -> tuple[tuple[float, int], PolicyDecisionMsg]:
+-        """
+-        현재 상태에 대한 (τ,k) 결정을 수행하고 PolicyDecisionMsg를 반환한다.
+-        - reward 필드는 0.0으로 기록(실제 보상은 observe_outcome에서 적용)
++        """Choose an arm for the current state and emit a decision message.
++
++        Args:
++            state: Current policy context (AoI/residual/loss/queue length).
++
++        Returns:
++            ((tau, kbits), PolicyDecisionMsg) for logging and actuation.
++
++        Raises:
++            ValueError: If configuration yields no valid arms.
++
++        Side Effects:
++            - Updates internal buffers for the subsequent `observe_outcome`.
++
++        Contract:
++            - `reward` in the decision message is a placeholder (0.0).
++            - Sanitizes non-finite state values rather than aborting.
++
++        Failure Modes:
++            - If safe arm is missing from the grid, initialization fails early.
+         """
+         invalid_state = False
+         aoi_ms = float(state.aoi_ms)
+@@ -301,9 +425,27 @@ class LinUCBPolicy:
+         return (arm.tau, arm.kbits), msg
+ 
+     def observe_outcome(self, aoi_ms: float, mae: float, rate_bps: float) -> float:
+-        """
+-        직전 decide()에 대한 결과(실측 지표)를 받아 LinUCB 파라미터를 업데이트한다.
+-        반환값: 사용된 보상 r.
++        """Apply reward for the most recent decision and update model state.
++
++        Args:
++            aoi_ms: Observed AoI in milliseconds.
++            mae: Observed event MAE estimate.
++            rate_bps: Observed rate in bits per second.
++
++        Returns:
++            The computed reward value (negative weighted sum).
++
++        Raises:
++            None.
++
++        Side Effects:
++            - Updates A/b matrices and internal counts for the chosen arm.
++
++        Contract:
++            - Should be called once per `decide` to keep learning consistent.
++
++        Failure Modes:
++            - Non-finite inputs cause the update to be skipped and return 0.0.
+         """
+         if self._last_x is None or self._last_arm_idx is None:
+             # 아직 결정이 없거나 중복 호출
+@@ -354,11 +496,48 @@ class LinUCBPolicy:
+         return float(r)
+ 
+     def arm_count(self) -> int:
++        """Return the number of configured arms.
++
++        Args:
++            None.
++
++        Returns:
++            Count of arms in the current grid.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Reflects the current arm list stored on the policy.
++
++        Failure Modes:
++            - None.
++        """
+         return len(self.arms)
+ 
+     def dump_model(self) -> list[dict]:
+-        """
+-        팔별 요약(시도 횟수, θ̂, A 대각)을 반환(디버그용).
++        """Return per-arm diagnostic summaries for debugging.
++
++        Args:
++            None.
++
++        Returns:
++            List of dicts with arm parameters, counts, and model summaries.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Uses the current in-memory model state.
++
++        Failure Modes:
++            - Linear algebra failures yield zero-valued parameter estimates.
+         """
+         out = []
+         for i, a in enumerate(self.arms):
+@@ -416,7 +595,29 @@ class LinUCBPolicy:
+ 
+ 
+ class LinUCB:
+-    """Backwards-compatible LinUCB variant for the lightweight unit tests."""
++    """Backwards-compatible LinUCB variant for the lightweight unit tests.
++
++    Args:
++        arms: Arm list as (tau, kbits) tuples or Arm objects.
++        d: Context feature dimension.
++        alpha: UCB exploration strength.
++        lambda_ridge: Ridge regularization coefficient.
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If d/alpha are invalid or arms are empty.
++
++    Side Effects:
++        - Updates in-memory model parameters when `update` is called.
++
++    Contract:
++        - Context vectors must have shape (d,).
++
++    Failure Modes:
++        - Invalid contexts raise ValueError.
++    """
+ 
+     def __init__(
+         self,
+diff --git a/edge/policy/runtime.py b/edge/policy/runtime.py
+index 60d8579..fbbded1 100644
+--- a/edge/policy/runtime.py
++++ b/edge/policy/runtime.py
+@@ -3,6 +3,13 @@
+ # - 센서 샘플마다 컨텍스트 계산 → (τ, kbits) 결정 → 이벤트 생성 → 보상 학습
+ # - 목적: edge_daemon 루프를 단순화하고 LinUCB 학습을 실제 파이프라인에 연결
+ 
++"""Policy runtime for per-sample decisions and reward attribution.
++
++Bridges prediction, policy selection, and event emission for a single sensor
++stream. This module is latency-sensitive and must keep per-sample work bounded
++to avoid delaying the sensor loop.
++"""
++
+ from __future__ import annotations
+ 
+ import math
+@@ -31,12 +38,58 @@ __all__ = ["LinkFeedback", "StepResult", "SensorPolicyRuntime", "load_linucb_con
+ 
+ @dataclass(slots=True)
+ class LinkFeedback:
++    """Link feedback inputs for policy context (ack latency and loss estimate).
++
++    Args:
++        ack_delay_ms: Optional ACK delay estimate in milliseconds.
++        loss_rate: Optional loss rate estimate in [0, 1].
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Values are treated as best-effort observations.
++
++    Failure Modes:
++        - Missing values are treated as unavailable (None).
++    """
+     ack_delay_ms: float | None = None
+     loss_rate: float | None = None
+ 
+ 
+ @dataclass(slots=True)
+ class StepResult:
++    """Outputs from a single policy step, including optional event/decision.
++
++    Args:
++        event: Optional EventMsg to enqueue.
++        decision: Optional PolicyDecisionMsg (adaptive mode).
++        reward: Optional reward value used for learning.
++        aoi_ms: AoI estimate in milliseconds.
++        mae_est: MAE estimate for the predictor.
++        rate_bps: Estimated transmit rate in bytes per second.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - `decision` and `reward` are None outside adaptive mode.
++
++    Failure Modes:
++        - Values may be NaN when inputs are insufficient.
++    """
+     event: EventMsg | None
+     decision: PolicyDecisionMsg | None
+     reward: float | None
+@@ -46,11 +99,33 @@ class StepResult:
+ 
+ 
+ class SensorPolicyRuntime:
+-    """
+-    센서 1개에 대한 정책 실행기.
+-    - Periodic: 모든 샘플 전송
+-    - Fixed τ: EWMA+임계값 SoD
+-    - Adaptive: LinUCB로 (τ, kbits) 선택 → 보상으로 즉시 학습
++    """Policy runtime for a single sensor stream.
++
++    Args:
++        device_id: Device identifier for EventMsg/PolicyDecisionMsg.
++        sensor: Sensor type associated with this runtime.
++        profile: Link profile for policy context.
++        mode: Policy mode (periodic/fixed/adaptive).
++        ewma_cfg: EWMA predictor configuration.
++        linucb_cfg: LinUCB configuration when in adaptive mode.
++        nominal_period_s: Optional nominal sampling period for AoI fallback.
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If adaptive mode is requested without linucb_cfg.
++
++    Contract:
++        - Periodic emits every valid sample.
++        - Fixed_tau emits on EWMA residual threshold.
++        - Adaptive chooses (tau, kbits) via LinUCB and learns from reward.
++
++    Side Effects:
++        - Updates predictor state and LinUCB model in-memory.
++
++    Failure Modes:
++        - Invalid samples are skipped but still advance predictor state.
+     """
+ 
+     def __init__(
+@@ -87,9 +162,29 @@ class SensorPolicyRuntime:
+         outbox_pending: int,
+         link_feedback: LinkFeedback | None = None,
+     ) -> StepResult:
+-        """
+-        샘플 1개 처리 → (EventMsg?, PolicyDecisionMsg?, reward?)
+-        - adaptive 모드가 아닌 경우 decision/reward는 None
++        """Process one sample and return event/decision outputs.
++
++        Args:
++            sample: Sensor sample object from mic/temp sources.
++            outbox_pending: Current outbox queue length for congestion context.
++            link_feedback: Optional ACK/loss feedback for policy context.
++
++        Returns:
++            StepResult with event and/or decision (adaptive only).
++
++        Raises:
++            ValueError: If adaptive mode is enabled without a LinUCB config.
++
++        Side Effects:
++            - Updates predictor state and LinUCB model parameters.
++            - Emits EventMsg when policy conditions are satisfied.
++
++        Contract:
++            - Decision/reward are None in non-adaptive modes.
++            - Uses ACK delay as an AoI proxy when provided.
++
++        Failure Modes:
++            - Invalid sensor samples are ignored for emission but still update state.
+         """
+         event: EventMsg | None = None
+         decision: PolicyDecisionMsg | None = None
+@@ -319,9 +414,33 @@ def load_linucb_config(
+     res_scale: float | None = None,
+     resvar_scale: float | None = None,
+ ) -> LinUCBConfig:
+-    """
+-    YAML/JSON dict → LinUCBConfig 변환.
+-    - cfg_dict는 configs/policy.yaml 스키마를 기대.
++    """Build LinUCBConfig from a YAML/JSON mapping.
++
++    Args:
++        cfg_dict: Policy config mapping (configs/policy*.yaml schema).
++        device_id: Device identifier for logging/telemetry.
++        sensor: Sensor type to select arms/scales.
++        profile: Link profile label.
++        seed: Optional RNG seed for reproducibility.
++        mae_scale: Optional MAE scale override derived from arms.
++        res_scale: Optional residual scale override derived from arms.
++        resvar_scale: Optional residual variance scale override derived from arms.
++
++    Returns:
++        LinUCBConfig populated with parsed arms/reward/safety/scales.
++
++    Raises:
++        KeyError: If arms entries are missing required keys.
++        ValueError: If numeric fields cannot be converted.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Expects `arms` entries to provide tau/kbits.
++
++    Failure Modes:
++        - Bad YAML values surface as conversion errors to caller.
+     """
+     arms_raw = cfg_dict.get("arms") or []
+     arms = [Arm(tau=float(a["tau"]), kbits=int(a["kbits"])) for a in arms_raw]
+diff --git a/edge/predict/ar1_rls.py b/edge/predict/ar1_rls.py
+index dffc48e..8620e60 100644
+--- a/edge/predict/ar1_rls.py
++++ b/edge/predict/ar1_rls.py
+@@ -23,6 +23,28 @@ from dataclasses import dataclass
+ 
+ @dataclass(slots=True)
+ class AR1RLS:
++    """Scalar AR(1) RLS estimator.
++
++    Args:
++        a: Initial AR(1) coefficient.
++        lam: Forgetting factor in (0, 1].
++        p: Initial covariance value (> 0).
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If lam is out of range or p is non-positive.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Updates are bounded to keep coefficients finite.
++
++    Failure Modes:
++        - Invalid values reset to defaults during update.
++    """
+     a: float = 1.0
+     lam: float = 0.99
+     p: float = 1_000.0
+@@ -39,9 +61,50 @@ class AR1RLS:
+             raise ValueError("a must be finite")
+ 
+     def predict(self, x_prev: float) -> float:
++        """Predict the next value using the current AR(1) coefficient.
++
++        Args:
++            x_prev: Previous sample value.
++
++        Returns:
++            Predicted next value.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Uses the current coefficient without updating state.
++
++        Failure Modes:
++            - Non-finite inputs propagate through float conversion.
++        """
+         return float(self.a) * float(x_prev)
+ 
+     def update(self, x: float, x_prev: float) -> float:
++        """Update the AR(1) coefficient with a new sample.
++
++        Args:
++            x: Current sample value.
++            x_prev: Previous sample value.
++
++        Returns:
++            Updated coefficient estimate.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - Updates internal coefficient and covariance.
++
++        Contract:
++            - Returns the previous coefficient on invalid inputs.
++
++        Failure Modes:
++            - Non-finite inputs skip the update and return the prior coefficient.
++        """
+         y = float(x)
+         phi = float(x_prev)
+         if not (math.isfinite(y) and math.isfinite(phi)):
+@@ -62,4 +125,3 @@ class AR1RLS:
+             self.p = 1_000.0
+ 
+         return float(self.a)
+-
+diff --git a/edge/predict/ewma.py b/edge/predict/ewma.py
+index 26db15b..f2a2e5f 100644
+--- a/edge/predict/ewma.py
++++ b/edge/predict/ewma.py
+@@ -7,6 +7,13 @@
+ # - 첫 샘플 부트스트랩/하트비트/최소 재전송 간격 등 실전 운용 세부 포함.
+ # - 스키마/토픽/프로파일/지표 정의는 동결안·과제 제안서와 일치.  # noqa
+ 
++"""EWMA predictor and event trigger for edge sampling.
++
++Computes residuals against a one-step EWMA predictor and emits events when
++threshold/heartbeat conditions are met. This module is performance-sensitive
++and must keep per-sample work low to avoid sensor backpressure.
++"""
++
+ from __future__ import annotations
+ 
+ import math
+@@ -27,15 +34,35 @@ __all__ = ["EWMAConfig", "EWMAPredictor"]
+ 
+ @dataclass(slots=True, frozen=True)
+ class EWMAConfig:
+-    """
+-    EWMA 고정 τ 구성.
+-    - alpha: 0<α≤1  (예: mic 0.2, temp 0.5 권장)
+-    - tau: 전송 임계값 (단위: 센서 단위. mic=dB, temp=°C)
+-    - kbits: 1..16  (전송 양자화 레벨)
+-    - heartbeat_s: 하트비트 최소 주기(초). None 또는 0이면 비활성.
+-    - min_emit_interval_ms: 이벤트 최소 간격(ms) 가드(폭주 방지).
+-    - vmin/vmax: 센서 범위 재정의(기본은 quantize 모듈의 권고값).
+-    - bootstrap_emit: 첫 샘플 시 1회 전송(재현성/초기화).
++    """Configuration for EWMA predictor and trigger thresholds.
++
++    Args:
++        device_id: Device identifier included in emitted events.
++        sensor: Sensor type (mic_rms or temp).
++        alpha: EWMA smoothing factor in (0, 1].
++        tau: Residual threshold that triggers an event.
++        kbits: Quantization bit width (1..16).
++        profile: Link profile label for event metadata.
++        heartbeat_s: Minimum emit interval for keep-alives; None disables.
++        min_emit_interval_ms: Rate-limit for event emission (ms).
++        vmin/vmax: Optional sensor range overrides for quantizer.
++        bootstrap_emit: Emit once on first valid sample to establish baseline.
++        diagnostics_enabled: Enable extra diagnostics fields in events.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Values are validated when EWMAPredictor is instantiated.
++
++    Failure Modes:
++        - Invalid values raise when building the predictor.
+     """
+     device_id: str
+     sensor: SensorType
+@@ -52,10 +79,26 @@ class EWMAConfig:
+ 
+ 
+ class EWMAPredictor:
+-    """
+-    EWMA(one-step ahead) 예측 및 임계값 트리거/하트비트 관리.
+-    - 내부 상태: last_pred, last_emit_ns
+-    - 트리거: |x_raw - last_pred| > τ  (업데이트는 전송 여부와 무관하게 매 샘플 수행)
++    """EWMA predictor with threshold/heartbeat triggering.
++
++    Args:
++        cfg: EWMAConfig with thresholds, quantization, and metadata.
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If configuration values are out of bounds.
++
++    Contract:
++        - Maintains last prediction and last emit time across samples.
++        - Emits when residual exceeds tau, on heartbeat, or when forced.
++
++    Side Effects:
++        - Updates internal EWMA state and emission counters.
++
++    Failure Modes:
++        - Invalid samples are ignored for emission but still update EWMA state.
+     """
+     def __init__(self, cfg: EWMAConfig):
+         if not (0.0 < cfg.alpha <= 1.0):
+@@ -76,9 +119,25 @@ class EWMAPredictor:
+     # ---------------- 공용 API ----------------
+ 
+     def preview(self, sample: Any) -> tuple[int, int, float, bool, float, float]:
+-        """
+-        샘플을 **상태 업데이트 없이** 미리 계산한다.
+-        반환: (ts_ns, seq, x_raw, valid, last_pred, resid)
++        """Compute residuals without mutating predictor state.
++
++        Args:
++            sample: Sensor sample object.
++
++        Returns:
++            (ts_ns, seq, x_raw, valid, last_pred, resid) tuple.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Does not update EWMA state; safe to call multiple times per sample.
++
++        Failure Modes:
++            - Non-finite inputs are surfaced as invalid via `valid` flag.
+         """
+         ts_ns, seq, x_raw, value_valid = self._extract_value(sample)
+         last_pred = x_raw if self._last_pred is None else self._last_pred
+@@ -97,10 +156,33 @@ class EWMAPredictor:
+         force_emit: bool = False,
+         force_reason: str | None = None,
+     ) -> EventMsg | None:
+-        """
+-        센서 샘플 하나를 입력 받아, 조건을 만족하면 EventMsg를 생성.
+-        - mic_rms.Sample: (ts_ns, seq, dbfs, clip_ratio)
+-        - temp.Sample   : (ts_ns, seq, celsius, valid)
++        """Update predictor state and emit EventMsg when thresholds fire.
++
++        Args:
++            sample: Sensor sample object.
++            override_tau: Optional override for threshold tau.
++            override_kbits: Optional override for quantization bits.
++            policy_mode: Policy mode to record in event metadata.
++            override_heartbeat_s: Optional heartbeat override.
++            override_min_emit_ms: Optional rate-limit override.
++            force_emit: Force an emission regardless of thresholds.
++            force_reason: Optional reason string for diagnostics.
++
++        Returns:
++            EventMsg if emission occurs, otherwise None.
++
++        Raises:
++            ValueError: If configuration values are out of bounds.
++
++        Side Effects:
++            - Updates EWMA state and emission counters.
++
++        Contract:
++            - Emits only when threshold/heartbeat/force conditions are met.
++            - Rate limiting can suppress threshold-driven emissions.
++
++        Failure Modes:
++            - Invalid samples short-circuit emission and update EWMA with None.
+         """
+         ts_ns, seq, x_raw, value_valid = self._extract_value(sample)
+         if not value_valid:
+@@ -189,9 +271,25 @@ class EWMAPredictor:
+         return evt
+ 
+     def consume_rate_limit_skips(self) -> int:
+-        """
+-        Return and reset the number of rate-limited "would-have-emitted" events since last consume.
+-        Logged only on policy decision to keep overhead negligible.
++        """Return and reset the number of suppressed emissions.
++
++        Args:
++            None.
++
++        Returns:
++            Count of rate-limited emissions since last call (0 if diagnostics disabled).
++
++        Raises:
++            None.
++
++        Side Effects:
++            - Resets the internal skip counter.
++
++        Contract:
++            - Only increments when diagnostics are enabled.
++
++        Failure Modes:
++            - None.
+         """
+         if not bool(self.cfg.diagnostics_enabled):
+             return 0
+@@ -202,9 +300,29 @@ class EWMAPredictor:
+     def run(
+         self, sample_iter: Iterator[Any], duration_s: float | None = None
+     ) -> Iterator[EventMsg]:
+-        """
+-        샘플 이터레이터를 소비하며 EventMsg를 yield.
+-        duration_s가 주어지면 그 시간 경과 후 종료(샘플 ts 기준이 아니라 벽시계 기준).
++        """Iterate samples and yield emitted events.
++
++        Args:
++            sample_iter: Source iterator of sensor samples.
++            duration_s: Optional wall-clock limit in seconds.
++
++        Returns:
++            None.
++
++        Yields:
++            EventMsg instances for each emission.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - Updates EWMA state for each sample.
++
++        Contract:
++            - Duration is based on wall-clock time, not sample timestamps.
++
++        Failure Modes:
++            - Iterator errors propagate to caller.
+         """
+         end_ns = None if duration_s is None else (time.time_ns() + int(duration_s * 1e9))
+         for s in sample_iter:
+@@ -215,15 +333,36 @@ class EWMAPredictor:
+                 yield evt
+ 
+     def close(self) -> None:
+-        """상태 정리(현재는 유지할 리소스 없음)."""
++        """Release predictor resources (no-op for now).
++
++        Args:
++            None.
++
++        Returns:
++            None.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Safe to call multiple times.
++
++        Failure Modes:
++            - None.
++        """
+         return
+ 
+     @property
+     def last_emit_ns(self) -> int | None:
++        """Timestamp of the most recent emission in ns, or None if none emitted."""
+         return self._last_emit_ns
+ 
+     @property
+     def last_pred(self) -> float | None:
++        """Most recent EWMA prediction value, or None if uninitialized."""
+         return self._last_pred
+ 
+     # ---------------- 내부 유틸 ----------------
+diff --git a/edge/uploader/mqtt_publisher.py b/edge/uploader/mqtt_publisher.py
+index 3dd2ffd..a370159 100644
+--- a/edge/uploader/mqtt_publisher.py
++++ b/edge/uploader/mqtt_publisher.py
+@@ -7,6 +7,12 @@
+ # - 보안 옵션(TLS/username/password)은 선택 지원.
+ # - 본 모듈은 "퍼블리시"만 책임, 메시지 생성/스키마/크기 산정은 상위 모듈 담당.  # noqa
+ 
++"""MQTT publisher backed by the durable outbox.
++
++Publishes queued messages with QoS1, tracks PUBACKs, and requeues on failure.
++Designed to tolerate broker outages while keeping ordering via outbox FIFO.
++"""
++
+ from __future__ import annotations
+ 
+ import argparse
+@@ -28,11 +34,40 @@ logger = logging.getLogger(__name__)
+ 
+ 
+ class MQTTPublisher:
+-    """
+-    Durable MQTT publisher with QoS1 and offline-first behavior.
+-    - Outbox로부터 배치(claim_batch) 단위로 메시지를 인출하여 publish.
+-    - paho on_publish(mid) → outbox.ack(msg_id) 매핑 관리.
+-    - 연결 끊김/실패 시 outbox.nack() 또는 reset_inflight()로 재시도 대기열 복귀.
++    """Durable MQTT publisher with QoS1 and offline-first behavior.
++
++    Args:
++        outbox: Outbox instance used for durable queueing.
++        broker: MQTT broker host.
++        port: MQTT broker port.
++        client_id: MQTT client identifier.
++        keepalive: MQTT keepalive in seconds.
++        username: Optional broker username.
++        password: Optional broker password.
++        tls: Enable TLS when True.
++        cafile: Optional CA file for TLS validation.
++        certfile: Optional client certificate for TLS.
++        keyfile: Optional client key for TLS.
++        max_inflight: Maximum number of inflight publishes.
++        claim_batch: Maximum number of items to claim per cycle.
++        requeue_period_s: Interval to requeue stuck items in seconds.
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If max_inflight or claim_batch are invalid.
++
++    Contract:
++        - Messages are claimed from Outbox and published in FIFO order.
++        - A message is removed only after PUBACK.
++
++    Side Effects:
++        - Network I/O to MQTT broker.
++        - Mutates outbox state via ack/nack/requeue.
++
++    Failure Modes:
++        - Publish failures requeue messages; broker outages are tolerated.
+     """
+ 
+     def __init__(
+@@ -106,7 +141,26 @@ class MQTTPublisher:
+         self._map_lock = threading.Lock()
+ 
+     def is_connected(self) -> bool:
+-        """MQTT 연결 상태 플래그(상태 표시/UI용)."""
++        """Return the last known MQTT connection state.
++
++        Args:
++            None.
++
++        Returns:
++            True if the client is connected, False otherwise.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Value is best-effort and may lag transient disconnects.
++
++        Failure Modes:
++            - State may be stale during reconnect storms.
++        """
+         return bool(self._connected)
+ 
+     # ------------- MQTT 콜백 -------------
+@@ -155,6 +209,26 @@ class MQTTPublisher:
+     # ------------- 라이프사이클 -------------
+ 
+     def start(self):
++        """Start MQTT networking and background publish loops.
++
++        Args:
++            None.
++
++        Returns:
++            None.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - Initiates broker connection and starts worker threads.
++
++        Contract:
++            - Safe to call once; subsequent calls require a new instance.
++
++        Failure Modes:
++            - Connection errors are handled by paho-mqtt retry logic.
++        """
+         # MQTT I/O 루프 시작
+         #
+         # connect_async는 **네트워크 I/O를 즉시 수행하지 않고** 접속 파라미터만 설정한다.
+@@ -176,6 +250,26 @@ class MQTTPublisher:
+         logger.info("publisher_started broker=%s port=%s", self.broker, int(self.port))
+ 
+     def stop(self):
++        """Stop background loops and disconnect from broker.
++
++        Args:
++            None.
++
++        Returns:
++            None.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - Stops MQTT loop and joins worker threads.
++
++        Contract:
++            - Idempotent; repeated calls are no-ops after first stop.
++
++        Failure Modes:
++            - Shutdown errors are logged and suppressed.
++        """
+         if self._stop.is_set():
+             return
+         self._stop.set()
+@@ -297,6 +391,26 @@ def _install_signal_handlers(p: MQTTPublisher):
+ 
+ 
+ def main():
++    """CLI entry point for publishing from an existing outbox.
++
++    Args:
++        None.
++
++    Returns:
++        None.
++
++    Raises:
++        SystemExit: If argument parsing fails or runtime exits with error.
++
++    Side Effects:
++        - Starts MQTT publisher loops that drain the outbox.
++
++    Contract:
++        - Requires an existing outbox path to be provided.
++
++    Failure Modes:
++        - Propagates SystemExit on fatal configuration errors.
++    """
+     ap = argparse.ArgumentParser(description="Outbox-backed MQTT QoS1 publisher")
+     add_logging_cli_args(ap)
+     ap.add_argument("--outbox", required=True, help="SQLite path (e.g., artifacts/<run>/outbox.sqlite)")
+diff --git a/edge/uploader/outbox.py b/edge/uploader/outbox.py
+index e232f92..419180d 100644
+--- a/edge/uploader/outbox.py
++++ b/edge/uploader/outbox.py
+@@ -9,6 +9,13 @@
+ #
+ # 스키마/토픽/지표/DoD는 과제 동결안과 일치합니다. (유실 0, QoS1 중복 제거는 collector에서 검증)  # noqa
+ 
++"""Durable SQLite-backed outbox for QoS1 publishing.
++
++Provides enqueue/claim/ack/nack semantics with backoff and timeout handling to
++survive disconnects. The queue is thread-safe within a process and relies on
++SQLite WAL for durability.
++"""
++
+ from __future__ import annotations
+ 
+ import logging
+@@ -26,7 +33,33 @@ __all__ = ["Outbox", "OutboxItem", "DeliveryStats"]
+ 
+ @dataclass(slots=True)
+ class OutboxItem:
+-    """퍼블리셔가 송신에 사용할 레코드(인메모리 표현)."""
++    """In-memory representation of a queued MQTT publish.
++
++    Args:
++        id: SQLite row id for the message.
++        topic: MQTT topic string.
++        payload: Message payload bytes.
++        qos: MQTT QoS level.
++        retain: MQTT retain flag.
++        attempts: Number of publish attempts so far.
++        created_ns: Enqueue timestamp in nanoseconds.
++        last_attempt_ns: Timestamp of the last attempt in nanoseconds.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Mirrors the `messages` table row state.
++
++    Failure Modes:
++        - None.
++    """
+     id: int
+     topic: str
+     payload: bytes
+@@ -39,6 +72,31 @@ class OutboxItem:
+ 
+ @dataclass(slots=True)
+ class DeliveryStats:
++    """Snapshot of delivery/ack latency and loss EWMAs.
++
++    Args:
++        ack_latency_ms: Last observed ACK latency in milliseconds.
++        ack_latency_ewma_ms: EWMA of ACK latency in milliseconds.
++        loss_ewma: EWMA of loss indicators.
++        acked: Count of acknowledged messages.
++        nacked: Count of negatively acknowledged messages.
++        timeouts: Count of ACK timeouts.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Values reflect in-memory counters since process start.
++
++    Failure Modes:
++        - None.
++    """
+     ack_latency_ms: float | None
+     ack_latency_ewma_ms: float | None
+     loss_ewma: float
+@@ -48,11 +106,33 @@ class DeliveryStats:
+ 
+ 
+ class Outbox:
+-    """
+-    Durable FIFO outbox (SQLite WAL).
+-    상태(state): 0=queued, 1=inflight
+-    - queued: claim 대상 (available_at_ns <= now)
+-    - inflight: 브로커로 송신 시도 중(ACK 대기)
++    """Durable FIFO outbox backed by SQLite WAL.
++
++    Args:
++        db_path: Path to the SQLite database file.
++        ack_timeout_s: ACK timeout window in seconds.
++        backoff_base_s: Base backoff delay in seconds.
++        backoff_cap_s: Maximum backoff delay in seconds.
++        ack_latency_alpha: EWMA alpha for ACK latency.
++        loss_ewma_alpha: EWMA alpha for loss estimation.
++
++    Returns:
++        None.
++
++    Raises:
++        ValueError: If db_path is empty.
++        OSError: If the database directory cannot be created.
++        sqlite3.Error: If the database cannot be opened or initialized.
++
++    Contract:
++        - Status 0=queued, 1=inflight; only queued rows are claimable.
++        - A message is removed only after ACK (`ack`), never on publish attempt.
++
++    Side Effects:
++        - Writes to SQLite on every enqueue/ack/nack.
++
++    Failure Modes:
++        - DB errors propagate to caller; caller should treat failures as non-delivery.
+     """
+ 
+     def __init__(self,
+@@ -96,11 +176,49 @@ class Outbox:
+     # ---- Compatibility helpers (legacy API expected by GitHub unit tests) ----
+ 
+     def setup(self) -> None:
+-        """Ensure the database schema exists (idempotent)."""
++        """Ensure the database schema exists (idempotent).
++
++        Args:
++            None.
++
++        Returns:
++            None.
++
++        Raises:
++            sqlite3.Error: If schema creation fails.
++
++        Side Effects:
++            - Creates tables/indexes in the SQLite file.
++
++        Contract:
++            - Safe to call multiple times.
++
++        Failure Modes:
++            - DB errors propagate to caller.
++        """
+         self._bootstrap_db()
+ 
+     def pending(self) -> int:
+-        """Return the number of queued or inflight messages."""
++        """Return the number of queued or inflight messages.
++
++        Args:
++            None.
++
++        Returns:
++            Count of rows with status in (queued, inflight).
++
++        Raises:
++            sqlite3.Error: If the count query fails.
++
++        Side Effects:
++            - Reads from the SQLite database.
++
++        Contract:
++            - Counts only statuses 0 and 1.
++
++        Failure Modes:
++            - DB errors propagate to caller.
++        """
+         with self._lock:
+             cur = self._conn.cursor()
+             cur.execute("SELECT COUNT(*) FROM messages WHERE status IN (0, 1)")
+@@ -109,7 +227,26 @@ class Outbox:
+         return int(count)
+ 
+     def mark_done(self, msg_id: int) -> bool:
+-        """Alias for :meth:`ack` maintained for backwards compatibility."""
++        """Alias for `ack`, kept for backward compatibility.
++
++        Args:
++            msg_id: Outbox row id to acknowledge.
++
++        Returns:
++            True if a row was removed, False otherwise.
++
++        Raises:
++            sqlite3.Error: If the delete fails.
++
++        Side Effects:
++            - Deletes the row and updates ACK/loss statistics.
++
++        Contract:
++            - Equivalent to calling `ack(msg_id)`.
++
++        Failure Modes:
++            - DB errors propagate to caller; message may be retried.
++        """
+         return self.ack(int(msg_id))
+ 
+     # ---------------- 내부: DB 구성 ----------------
+@@ -142,10 +279,30 @@ class Outbox:
+ 
+     def enqueue(self, topic: str, payload: bytes | str, qos: int = 1,
+                 retain: bool = False, created_ns: int | None = None) -> int:
+-        """
+-        새 메시지를 **queued** 상태로 저장하고 id를 반환.
+-        - payload는 bytes 또는 str(UTF-8) 허용
+-        - QoS는 {0,1,2} 허용(기본 1; 프로젝트 표준). retain은 bool.
++        """Persist a new queued message and return its row id.
++
++        Args:
++            topic: MQTT topic name (non-empty).
++            payload: Payload bytes or UTF-8 string.
++            qos: MQTT QoS level (0/1/2).
++            retain: MQTT retain flag.
++            created_ns: Optional creation timestamp override.
++
++        Returns:
++            New row id for the queued message.
++
++        Raises:
++            ValueError: If topic is empty or QoS is invalid.
++            sqlite3.Error: If the insert fails.
++
++        Side Effects:
++            - Writes a new row to SQLite with WAL durability.
++
++        Contract:
++            - Inserts in queued state (status=0).
++
++        Failure Modes:
++            - DB errors propagate to caller; caller should treat as not enqueued.
+         """
+         if not isinstance(topic, str) or not topic:
+             raise ValueError("topic must be non-empty str")
+@@ -173,9 +330,26 @@ class Outbox:
+         return mid
+ 
+     def claim_next(self, limit: int = 1) -> List[OutboxItem]:
+-        """
+-        현재 시각 기준 **ready(queued & available_at <= now)**인 메시지들을
+-        id 오름차순으로 최대 `limit`개까지 **inflight**로 전이(마킹)하고 반환.
++        """Claim ready messages and mark them inflight.
++
++        Args:
++            limit: Maximum number of rows to claim.
++
++        Returns:
++            List of OutboxItem instances marked inflight.
++
++        Raises:
++            sqlite3.Error: If selection or update fails.
++
++        Side Effects:
++            - Requeues timed-out inflight rows with backoff.
++            - Marks claimed rows as inflight and increments attempts.
++
++        Contract:
++            - Returns items ordered by ascending id (FIFO).
++
++        Failure Modes:
++            - DB errors propagate to caller; caller should retry later.
+         """
+         if limit <= 0:
+             return []
+@@ -238,7 +412,26 @@ class Outbox:
+         return items
+ 
+     def ack(self, msg_id: int) -> bool:
+-        """????? PUBACK(?? ?? ??)? ?? ??? ??."""
++        """Acknowledge delivery and remove a message from the outbox.
++
++        Args:
++            msg_id: Outbox row id to acknowledge.
++
++        Returns:
++            True if a row was deleted, False if not found.
++
++        Raises:
++            sqlite3.Error: If the delete fails.
++
++        Side Effects:
++            - Deletes the row and updates ACK latency/loss statistics.
++
++        Contract:
++            - Idempotent for already-acked ids (returns False).
++
++        Failure Modes:
++            - DB errors propagate to caller; message may be retried.
++        """
+         with self._lock:
+             cur = self._conn.cursor()
+             cur.execute("BEGIN IMMEDIATE")
+@@ -270,9 +463,26 @@ class Outbox:
+         return deleted > 0
+ 
+     def nack(self, msg_id: int) -> None:
+-        """
+-        송신 실패/거절 시 호출. 메시지를 **queued**로 되돌리고 지수백오프를 적용한다.
+-        (브로커 연결 끊김 등 즉시 재시도 의미가 있을 때는 reset_inflight() 사용)
++        """Requeue a message with backoff after a publish failure.
++
++        Args:
++            msg_id: Outbox row id to requeue.
++
++        Returns:
++            None.
++
++        Raises:
++            sqlite3.Error: If the update fails.
++
++        Side Effects:
++            - Moves the row back to queued with exponential backoff.
++            - Updates loss EWMA counters.
++
++        Contract:
++            - Intended for publish failures; use `reset_inflight` on reconnect.
++
++        Failure Modes:
++            - DB errors propagate to caller; message remains inflight or queued.
+         """
+         now_ns = time.time_ns()
+         with self._lock:
+@@ -293,7 +503,26 @@ class Outbox:
+             self._update_loss_ewma(1.0)
+ 
+     def requeue_stuck(self) -> int:
+-        """ACK 타임아웃을 초과한 inflight 전부를 재큐잉. 반환: 재큐잉 수."""
++        """Requeue inflight messages that exceeded ACK timeout.
++
++        Args:
++            None.
++
++        Returns:
++            Number of messages requeued.
++
++        Raises:
++            sqlite3.Error: If the update fails.
++
++        Side Effects:
++            - Updates queue state and applies backoff.
++
++        Contract:
++            - Uses ACK timeout as the only stuck criterion.
++
++        Failure Modes:
++            - DB errors propagate to caller.
++        """
+         now_ns = time.time_ns()
+         with self._lock:
+             cur = self._conn.cursor()
+@@ -319,9 +548,25 @@ class Outbox:
+         return count
+ 
+     def reset_inflight(self) -> int:
+-        """
+-        **브로커 재연결 직후** 호출: inflight를 즉시 재시도 가능하도록 queued로 되돌린다.
+-        (ACK를 더는 기대할 수 없으므로, available_at=now로 즉시 재시도)
++        """Reset inflight messages to queued after reconnect.
++
++        Args:
++            None.
++
++        Returns:
++            Number of rows moved back to queued.
++
++        Raises:
++            sqlite3.Error: If the update fails.
++
++        Side Effects:
++            - Moves all inflight rows to queued with immediate availability.
++
++        Contract:
++            - Intended for use right after broker reconnect.
++
++        Failure Modes:
++            - DB errors propagate to caller.
+         """
+         now_ns = time.time_ns()
+         with self._lock:
+@@ -335,6 +580,26 @@ class Outbox:
+         return int(affected)
+ 
+     def stats(self) -> dict:
++        """Return queue size counters for monitoring.
++
++        Args:
++            None.
++
++        Returns:
++            Dict with queued/inflight/total counts and next_id.
++
++        Raises:
++            sqlite3.Error: If the query fails.
++
++        Side Effects:
++            - Reads from the SQLite database.
++
++        Contract:
++            - Counts reflect current DB state (not including in-memory buffers).
++
++        Failure Modes:
++            - DB errors propagate to caller.
++        """
+         with self._lock:
+             cur = self._conn.cursor()
+             q = cur.execute("""
+@@ -351,6 +616,26 @@ class Outbox:
+         return {k: (int(v) if v is not None else 0) for k, v in dict(row).items()}
+ 
+     def delivery_stats(self) -> DeliveryStats:
++        """Return delivery/ack statistics used by adaptive policies.
++
++        Args:
++            None.
++
++        Returns:
++            DeliveryStats snapshot of ACK latency and loss EWMAs.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - None.
++
++        Contract:
++            - Counters are process-local since startup.
++
++        Failure Modes:
++            - None.
++        """
+         with self._lock:
+             return DeliveryStats(
+                 ack_latency_ms=self._ack_latency_ms_last,
+@@ -376,6 +661,26 @@ class Outbox:
+         self._loss_samples += 1
+ 
+     def close(self) -> None:
++        """Close the underlying SQLite connection.
++
++        Args:
++            None.
++
++        Returns:
++            None.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - Closes the database handle; further calls will fail.
++
++        Contract:
++            - Safe to call multiple times.
++
++        Failure Modes:
++            - Close errors are suppressed to avoid masking shutdown.
++        """
+         with self._lock:
+             try:
+                 self._conn.close()
+@@ -384,8 +689,10 @@ class Outbox:
+ 
+     # 컨텍스트 매니저 지원
+     def __enter__(self) -> "Outbox":
++        """Context manager entry; returns self."""
+         return self
+     def __exit__(self, exc_type, exc, tb) -> None:
++        """Context manager exit; closes the database connection."""
+         self.close()
+ 
+ 
+diff --git a/experiments/run_scenarios.py b/experiments/run_scenarios.py
+index 15dde1c..b3898c1 100644
+--- a/experiments/run_scenarios.py
++++ b/experiments/run_scenarios.py
+@@ -6,6 +6,12 @@
+ # - 안정성: SIGINT/SIGTERM 처리, tc 원복 보장, edge/collector 프로세스 정리
+ # - 의존: 표준 라이브러리 + 프로젝트 내부 모듈(link.shaper.tc_profiles.apply_profile/clear)
+ 
++"""Experiment runner for profile×mode scenario matrices.
++
++Applies tc shaping profiles, starts edge/collector subprocesses, and records
++metadata/artifacts per scenario. Requires root/CAP_NET_ADMIN to apply tc.
++"""
++
+ from __future__ import annotations
+ 
+ import argparse
+@@ -37,6 +43,59 @@ except Exception as e:  # pragma: no cover
+ 
+ @dataclass(slots=True)
+ class ExperimentPlan:
++    """Configuration for experiment matrix runs.
++
++    Args:
++        device_id: Device identifier for edge/collector.
++        device_config: Optional device YAML path for defaults.
++        iface: Network interface for tc shaping.
++        both: Apply tc shaping to ingress when True.
++        run_root: Root directory for experiment outputs.
++        link_profiles_config: Optional YAML path for tc profiles.
++        warmup_s: Warmup duration in seconds.
++        run_s: Active run duration in seconds.
++        cooldown_s: Cooldown duration in seconds.
++        broker: MQTT broker host.
++        port: MQTT broker port.
++        seed: RNG seed for reproducibility.
++        use_mic: Enable microphone sensor.
++        use_temp: Enable temperature sensor.
++        mic_sr: Mic sample rate in Hz.
++        mic_frame_ms: Mic frame size in milliseconds.
++        mic_alpha: Mic EWMA alpha.
++        mic_tau_fixed: Mic fixed tau threshold.
++        mic_kbits: Mic quantization bits.
++        mic_heartbeat_s: Mic heartbeat interval in seconds.
++        temp_hz: Temperature sample rate in Hz.
++        temp_alpha: Temp EWMA alpha.
++        temp_tau_fixed: Temp fixed tau threshold.
++        temp_kbits: Temp quantization bits.
++        temp_heartbeat_s: Temp heartbeat interval in seconds.
++        arms_path: Policy arms YAML path.
++        modes: Policy modes to run.
++        profiles: Link profiles to apply.
++        claim_batch: Outbox claim batch size.
++        max_inflight: Outbox max inflight count.
++        with_collector: Run collector subprocess when True.
++        tc_var_period_s: Optional cellular_var toggle period override.
++        repeats: Scenario repeat count.
++        collector_flush_interval_s: Collector flush interval in seconds.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Values are passed to subprocess CLI arguments verbatim.
++
++    Failure Modes:
++        - Invalid values surface as subprocess or CLI errors.
++    """
+     device_id: str = "rpi5-01"
+     device_config: str | None = "configs/device.yaml"
+     iface: str = "eth0"
+@@ -90,6 +149,29 @@ class ExperimentPlan:
+ 
+ @dataclass(slots=True)
+ class Scenario:
++    """Resolved scenario derived from a plan.
++
++    Args:
++        profile: LinkProfile to apply.
++        mode: PolicyMode to run.
++        name: Scenario name used for output folder.
++        out_dir: Output directory for artifacts.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - out_dir is unique per scenario.
++
++    Failure Modes:
++        - None.
++    """
+     profile: LinkProfile
+     mode: PolicyMode
+     name: str
+@@ -97,6 +179,26 @@ class Scenario:
+ 
+ 
+ class ScenarioRunner:
++    """Runner that executes scenarios sequentially.
++
++    Args:
++        plan: ExperimentPlan with runtime parameters.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - Starts/stops subprocesses and applies tc profiles.
++
++    Contract:
++        - Ensures cleanup on completion or signal.
++
++    Failure Modes:
++        - Subprocess failures are logged and terminate the run.
++    """
+     def __init__(self, plan: ExperimentPlan):
+         self.plan = plan
+         self._stop = False
+@@ -110,6 +212,26 @@ class ScenarioRunner:
+     # --------- 공개 메서드 ---------
+ 
+     def run_all(self, scenarios: Iterable[Scenario]) -> None:
++        """Run all scenarios in order until completion or stop.
++
++        Args:
++            scenarios: Iterable of Scenario objects to execute.
++
++        Returns:
++            None.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - Executes subprocesses and applies tc profiles per scenario.
++
++        Contract:
++            - Stops early when a termination signal is received.
++
++        Failure Modes:
++            - Subprocess errors bubble up through _run_one handling.
++        """
+         for sc in scenarios:
+             if self._stop:
+                 break
+@@ -338,6 +460,26 @@ class ScenarioRunner:
+ # ---------- 헬퍼 ----------
+ 
+ def build_scenarios(plan: ExperimentPlan) -> list[Scenario]:
++    """Build the scenario list and initialize run metadata.
++
++    Args:
++        plan: Experiment plan to expand into scenarios.
++
++    Returns:
++        List of Scenario objects.
++
++    Raises:
++        ValueError: If plan modes or profiles are invalid.
++
++    Side Effects:
++        - Creates the run root directory and writes plan metadata files.
++
++    Contract:
++        - Scenario names are stable across repeats.
++
++    Failure Modes:
++        - File I/O errors propagate during metadata writes.
++    """
+     root = _run_root(plan)
+     scenarios: list[Scenario] = []
+     for prof_s in plan.profiles:
+@@ -453,6 +595,26 @@ def _env_snapshot() -> dict:
+ # ---------- CLI ----------
+ 
+ def parse_args(argv: list[str] | None = None) -> ExperimentPlan:
++    """Parse CLI arguments and build an ExperimentPlan.
++
++    Args:
++        argv: Optional argument list for testing; defaults to sys.argv.
++
++    Returns:
++        ExperimentPlan instance populated from CLI and config defaults.
++
++    Raises:
++        SystemExit: If configs are invalid or required inputs are missing.
++
++    Side Effects:
++        - Reads device/link config files to fill defaults.
++
++    Contract:
++        - Requires at least one sensor to be enabled.
++
++    Failure Modes:
++        - Invalid configs exit the process with error.
++    """
+     pre = argparse.ArgumentParser(add_help=False)
+     pre.add_argument("--device-config", default="configs/device.yaml")
+     pre.add_argument("--link-profiles-config", default="configs/link_profiles.yaml")
+@@ -651,6 +813,26 @@ def _opt_path(value: str | None) -> str | None:
+ 
+ 
+ def main():
++    """CLI entry point for the experiment runner.
++
++    Args:
++        None.
++
++    Returns:
++        None.
++
++    Raises:
++        SystemExit: If argument parsing or scenario execution fails.
++
++    Side Effects:
++        - Executes tc shaping and subprocess runs per scenario.
++
++    Contract:
++        - Runs scenarios sequentially using the provided plan.
++
++    Failure Modes:
++        - Propagates SystemExit on fatal errors.
++    """
+     plan = parse_args()
+     scenarios = build_scenarios(plan)
+     runner = ScenarioRunner(plan)
+diff --git a/link/shaper/tc_profiles.py b/link/shaper/tc_profiles.py
+index 04d3121..d6ecfa0 100644
+--- a/link/shaper/tc_profiles.py
++++ b/link/shaper/tc_profiles.py
+@@ -5,6 +5,12 @@
+ # - 프로파일: slow_10kbps, delay_loss, cellular_var(50↔200kbps 토글), lora_sf10/lora_sf12(LoRa-like)  # noqa
+ # - 안전성: apply는 replace 사용, clear는 존재하지 않아도 오류 없이 진행, SIGINT에서도 원복을 권장.
+ 
++"""Apply predefined tc/netem link shaping profiles.
++
++Provides utilities to apply/clear/query Linux tc shaping profiles with optional
++ingress support via ifb. Requires root or CAP_NET_ADMIN for any tc operations.
++"""
++
+ from __future__ import annotations
+ 
+ import argparse
+@@ -28,6 +34,35 @@ logger = logging.getLogger(__name__)
+ # ---------- 프로파일 정의 (동결안과 동일) ----------
+ @dataclass(frozen=True)
+ class TcProfile:
++    """Definition of a tc/netem shaping profile.
++
++    Args:
++        name: Profile name identifier.
++        rate_kbit: Egress rate in kbit; None enables variable mode.
++        delay_ms: Base delay in milliseconds.
++        jitter_ms: Jitter in milliseconds.
++        loss_pct: Loss percentage (0..100).
++        loss_corr_pct: Loss correlation percentage (0..100).
++        reorder_pct: Reorder percentage (0..100).
++        low_kbit: Low rate for variable mode.
++        high_kbit: High rate for variable mode.
++        var_default_period_s: Toggle period in seconds for variable mode.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Fields mirror LinkProfileConfig.
++
++    Failure Modes:
++        - Invalid values surface when applying profiles.
++    """
+     name: str
+     # egress 기준 속도(kbit); cellular_var는 None (토글 사용)
+     rate_kbit: int | None
+@@ -98,11 +133,27 @@ PROFILES: dict[str, TcProfile] = {
+ }
+ 
+ def load_profiles_config(path: str | os.PathLike) -> dict[str, TcProfile]:
+-    """
+-    configs/link_profiles.yaml 같은 YAML에서 프로파일을 로딩한다.
++    """Load tc profiles from a YAML config file.
++
++    Args:
++        path: Path to link profiles YAML.
++
++    Returns:
++        Mapping of profile name to TcProfile.
+ 
+-    - 이 함수는 "옵션"이며, 파일이 없거나 형식이 맞지 않더라도 PROFILES 상수를 계속 사용 가능하다.
+-    - 스키마는 common.config.LinkProfilesConfig (pydantic)로 검증한다.
++    Raises:
++        FileNotFoundError: If the YAML file does not exist.
++        ValueError: If YAML parsing or validation fails.
++        TypeError: If the YAML root is not a mapping.
++
++    Side Effects:
++        - Reads the YAML file from disk.
++
++    Contract:
++        - Uses LinkProfilesConfig validation.
++
++    Failure Modes:
++        - Validation errors propagate to the caller.
+     """
+     cfg = load_link_profiles_config(Path(path))
+     out: dict[str, TcProfile] = {}
+@@ -278,6 +329,26 @@ class _RateToggle:
+ _toggle_registry: dict[str, _RateToggle] = {}  # iface -> toggle
+ 
+ def get_profiles() -> dict[str, TcProfile]:
++    """Return built-in tc profile definitions.
++
++    Args:
++        None.
++
++    Returns:
++        Copy of the built-in profile mapping.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Returned mapping is a shallow copy.
++
++    Failure Modes:
++        - None.
++    """
+     return dict(PROFILES)
+ 
+ def apply_profile(
+@@ -287,9 +358,32 @@ def apply_profile(
+     var_period_s: int | None = None,
+     profiles: dict[str, TcProfile] | None = None,
+ ) -> None:
+-    """
+-    지정 인터페이스(iface)에 프로파일을 적용한다.
+-    both=True면 ifb0를 사용해 ingress에도 동일 제약을 건다.
++    """Apply a tc/netem profile to an interface.
++
++    Args:
++        iface: Network interface to shape.
++        profile: Profile name to apply.
++        both: Apply to ingress via ifb when True.
++        var_period_s: Optional toggle period for cellular_var profiles.
++        profiles: Optional profile mapping override.
++
++    Returns:
++        None.
++
++    Raises:
++        PermissionError: If CAP_NET_ADMIN/root is missing.
++        ValueError: If the profile name is unknown.
++        OSError: If tc commands fail to execute.
++
++    Side Effects:
++        - Executes tc/ip commands to modify qdisc settings.
++        - Starts or replaces a rate toggle thread for variable profiles.
++
++    Contract:
++        - Egress shaping is always applied; ingress is optional.
++
++    Failure Modes:
++        - Command failures propagate as exceptions.
+     """
+     _require_root()
+     profiles_map = profiles if profiles is not None else PROFILES
+@@ -336,7 +430,29 @@ def apply_profile(
+         _toggle_registry[iface] = toggler
+ 
+ def clear(iface: str, both: bool = False) -> None:
+-    """적용한 제약을 제거하고 시스템 기본 상태로 원복한다."""
++    """Clear tc/netem shaping and restore default state.
++
++    Args:
++        iface: Network interface to clear.
++        both: Clear ingress shaping via ifb when True.
++
++    Returns:
++        None.
++
++    Raises:
++        PermissionError: If CAP_NET_ADMIN/root is missing.
++        OSError: If tc commands fail to execute.
++
++    Side Effects:
++        - Executes tc/ip commands to remove qdisc settings.
++        - Stops any active rate toggle threads.
++
++    Contract:
++        - Ignores missing qdisc/interfaces via best-effort cleanup.
++
++    Failure Modes:
++        - Command failures propagate as exceptions.
++    """
+     _require_root()
+     # 토글 스레드 정지
+     if iface in _toggle_registry:
+@@ -358,7 +474,28 @@ def clear(iface: str, both: bool = False) -> None:
+         _ignore("ip link delete ifb0 type ifb")
+ 
+ def status(iface: str, both: bool = False) -> str:
+-    """현재 qdisc/class 구성을 문자열로 반환."""
++    """Return current tc qdisc/class configuration as text.
++
++    Args:
++        iface: Network interface to query.
++        both: Include ingress (ifb) status when True.
++
++    Returns:
++        Human-readable qdisc/class output.
++
++    Raises:
++        PermissionError: If CAP_NET_ADMIN/root is missing.
++        OSError: If tc commands fail to execute.
++
++    Side Effects:
++        - Executes tc commands to fetch status.
++
++    Contract:
++        - Returns raw command output for debugging.
++
++    Failure Modes:
++        - Command failures propagate as exceptions.
++    """
+     _require_root()
+     out = []
+     q = _run(f"tc qdisc show dev {iface}", check=False)
+@@ -386,6 +523,26 @@ def _install_signal_handlers(iface: str, both: bool):
+ 
+ 
+ def main():
++    """CLI entry point for tc profile application.
++
++    Args:
++        None.
++
++    Returns:
++        None.
++
++    Raises:
++        SystemExit: If CLI arguments are invalid or tc operations fail.
++
++    Side Effects:
++        - Applies/clears/query tc profiles via system commands.
++
++    Contract:
++        - Requires CAP_NET_ADMIN/root for tc operations.
++
++    Failure Modes:
++        - Exits with non-zero status on command failures.
++    """
+     parser = argparse.ArgumentParser(description="tc profile applier (HTB+netem)")
+     add_logging_cli_args(parser)
+     parser.add_argument(
+diff --git a/stack/pi_stack.py b/stack/pi_stack.py
+index b32a59b..a789ad0 100644
+--- a/stack/pi_stack.py
++++ b/stack/pi_stack.py
+@@ -1,3 +1,10 @@
++"""Single-Pi supervisor for broker, collector, and edge services.
++
++Spawns mosquitto (optional), collector, and edge processes with shared run
++directories and log files. The stack is intended for lab runs and will stop
++the whole pipeline if any child exits unexpectedly.
++"""
++
+ from __future__ import annotations
+ 
+ import argparse
+@@ -46,6 +53,43 @@ def _timestamp_id() -> str:
+ 
+ @dataclass(slots=True)
+ class StackConfig:
++    """Configuration for the single-Pi stack supervisor.
++
++    Args:
++        run_dir: Root directory for run artifacts and logs.
++        device_config: Device YAML path for edge daemon.
++        policy_arms: Policy arms YAML path for adaptive mode.
++        broker_host: MQTT broker host.
++        broker_port: MQTT broker port.
++        broker_mode: Broker mode ("auto", "subprocess", "none").
++        mosquitto_bin: Path to mosquitto executable.
++        mosquitto_listen_host: Listen address for mosquitto.
++        mosquitto_verbose: Enable verbose mosquitto logging.
++        collector_flush_interval_s: Collector flush interval in seconds.
++        collector_client_id: Collector MQTT client id.
++        edge_client_id: Edge MQTT client id.
++        edge_keepalive: MQTT keepalive for edge.
++        buttons_enable: Enable GPIO buttons for edge.
++        tc_enable: Enable link shaping integration.
++        tc_iface: Interface for tc shaping.
++        tc_both: Apply tc shaping to ingress when True.
++        tc_profiles_config: YAML path for tc profiles.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - None.
++
++    Contract:
++        - Extra fields are not allowed; this is a dataclass container.
++
++    Failure Modes:
++        - Invalid values surface when building child command lines.
++    """
+     run_dir: str
+     device_config: str
+     policy_arms: str
+@@ -159,12 +203,53 @@ class _Child:
+ 
+ 
+ class PiStack:
++    """Supervisor for running broker, collector, and edge together.
++
++    Args:
++        cfg: StackConfig with run paths and process settings.
++
++    Returns:
++        None.
++
++    Raises:
++        None.
++
++    Side Effects:
++        - Spawns subprocesses and writes log files.
++
++    Contract:
++        - Stops all children when any child exits unexpectedly.
++
++    Failure Modes:
++        - Child exit causes non-zero return from run().
++    """
+     def __init__(self, cfg: StackConfig):
+         self.cfg = cfg
+         self._stop = False
+         self._children: list[_Child] = []
+ 
+     def run(self) -> int:
++        """Run the stack until stopped or a child exits.
++
++        Args:
++            None.
++
++        Returns:
++            Process exit code (0 on clean shutdown, 1 on child failure).
++
++        Raises:
++            ValueError: If broker_mode is invalid.
++
++        Side Effects:
++            - Creates run directories and log files.
++            - Starts broker/collector/edge subprocesses.
++
++        Contract:
++            - Ensures child processes are terminated on exit.
++
++        Failure Modes:
++            - Returns non-zero when a child exits unexpectedly.
++        """
+         self._install_signals()
+ 
+         run_dir = Path(self.cfg.run_dir)
+@@ -247,6 +332,26 @@ class PiStack:
+         return 0
+ 
+     def stop(self) -> None:
++        """Stop the stack and terminate child processes.
++
++        Args:
++            None.
++
++        Returns:
++            None.
++
++        Raises:
++            None.
++
++        Side Effects:
++            - Terminates all child subprocesses.
++
++        Contract:
++            - Idempotent; repeated calls are no-ops after first stop.
++
++        Failure Modes:
++            - Termination errors are suppressed.
++        """
+         if self._stop:
+             return
+         self._stop = True
+@@ -309,6 +414,26 @@ class PiStack:
+ 
+ 
+ def parse_args(argv: list[str] | None = None) -> StackConfig:
++    """Parse CLI arguments for the stack supervisor.
++
++    Args:
++        argv: Optional argument list for testing; defaults to sys.argv.
++
++    Returns:
++        Parsed StackConfig instance.
++
++    Raises:
++        SystemExit: If CLI arguments are invalid.
++
++    Side Effects:
++        - Configures logging based on CLI flags.
++
++    Contract:
++        - Supplies defaults for missing paths.
++
++    Failure Modes:
++        - Argument parsing errors exit the process.
++    """
+     ap = argparse.ArgumentParser(description="Single-Pi stack: broker(mosquitto)+collector+edge")
+     add_logging_cli_args(ap)
+     ap.add_argument("--run-dir", default="artifacts/live", help="shared run dir for edge+collector")
+@@ -375,6 +500,26 @@ def parse_args(argv: list[str] | None = None) -> StackConfig:
+ 
+ 
+ def main(argv: list[str] | None = None) -> None:
++    """CLI entry point for the stack supervisor.
++
++    Args:
++        argv: Optional argument list for testing; defaults to sys.argv.
++
++    Returns:
++        None.
++
++    Raises:
++        SystemExit: When the stack exits with a non-zero code.
++
++    Side Effects:
++        - Starts broker/collector/edge subprocesses.
++
++    Contract:
++        - Exits with the same code as PiStack.run().
++
++    Failure Modes:
++        - Propagates SystemExit on fatal errors.
++    """
+     cfg = parse_args(argv)
+     rc = PiStack(cfg).run()
+     raise SystemExit(rc)

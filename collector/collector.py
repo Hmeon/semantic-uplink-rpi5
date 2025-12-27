@@ -3,6 +3,13 @@
 # 외부 의존: paho-mqtt, pandas, pyarrow
 # 내부 의존: common.mqttutil.mqtt_v311_publish_size (이전 단계에 합의된 함수)
 
+"""MQTT collector that de-duplicates QoS1 messages and persists run artifacts.
+
+Consumes edge events/decisions/markers, buffers them in memory, and flushes to
+`run_dir/logs` as Parquet/CSV with atomic file writes. Concurrency is handled
+via locks because MQTT callbacks and the flush thread run concurrently.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -48,6 +55,32 @@ except Exception:
 
 @dataclass
 class Config:
+    """Runtime parameters for Collector; values map directly to CLI flags.
+
+    Args:
+        run_dir: Root directory for run artifacts.
+        broker: MQTT broker hostname or IP.
+        port: MQTT broker port.
+        flush_interval_s: Interval between periodic flushes in seconds.
+        client_id: MQTT client identifier.
+        max_runtime_s: Optional auto-stop time in seconds (test helper).
+        dedup_cache_max_keys: Maximum dedup cache keys to retain.
+        dedup_cache_ttl_s: TTL in seconds for dedup cache entries.
+        clock_offset_ns: Optional edge->collector clock offset for AoI.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - `run_dir` must be writable by the collector process.
+        - Dedup cache limits may be set to 0 to disable bounds.
+
+    Failure Modes:
+        - Misconfiguration surfaces as I/O or MQTT connection errors at runtime.
+    """
     run_dir: str
     broker: str = "localhost"
     port: int = 1883
@@ -60,9 +93,28 @@ class Config:
 
 
 class Collector:
-    """
-    QoS1 중복 제거(seq 기반), AoI 계산(실시간 로깅용), Parquet 저장.
-    스키마/폴더 규칙은 VALIDATION.md 고정안과 동일.
+    """MQTT subscriber that de-duplicates QoS1 events and persists logs.
+
+    Args:
+        cfg: Collector configuration values.
+
+    Raises:
+        OSError: If required run directories cannot be created.
+
+    Contract:
+        - Expects EventMsg JSON on `edge/{device}/{sensor}/event`, policy decisions on
+          `policy/{device}/decision`, and markers on `marker/{device}`.
+        - De-duplication key is (device_id, sensor, seq); duplicates are dropped across flushes
+          within the TTL/size bounds of the in-memory cache.
+        - `ingest_message` is thread-safe; `flush_once` is safe to call while ingesting.
+
+    Side Effects:
+        - Network I/O via MQTT client.
+        - File I/O under `run_dir` (logs, metrics, figures, configs).
+
+    Failure Modes:
+        - Schema/JSON errors propagate from `ingest_message`; MQTT callbacks catch and log.
+        - Flush failures are logged and do not stop the main loop.
     """
     def __init__(self, cfg: Config):
         self.cfg = cfg
@@ -217,11 +269,33 @@ class Collector:
         retain: bool = False,
         t_recv_ns: int | None = None,
     ) -> None:
-        """
-        MQTT 메시지를 Collector에 주입한다.
+        """Route one MQTT message into the collector buffers.
 
-        - 테스트/리플레이/대체 전송(예: 파일/HTTP)에서 브로커 없이도 동일한 처리 경로를 재사용한다.
-        - 오류는 호출자에게 예외로 전파(런타임 MQTT 콜백에서는 try/except로 감싸 로그만 남김).
+        Args:
+            topic: MQTT topic name.
+            payload: Raw message payload (JSON for events/decisions/markers).
+            qos: MQTT QoS level from the broker.
+            dup: MQTT DUP flag.
+            retain: MQTT RETAIN flag.
+            t_recv_ns: Optional receive timestamp override in ns.
+
+        Returns:
+            None.
+
+        Raises:
+            ValueError: If the payload schema does not match the expected message shape.
+            TypeError: If the payload cannot be decoded into a JSON object.
+
+        Side Effects:
+            - Updates in-memory pending buffers and de-duplication cache.
+            - Updates run metadata counters.
+
+        Contract:
+            - Assumes topics match the edge/policy/marker topic patterns.
+            - Ensures only valid schema rows enter the pending buffers.
+
+        Failure Modes:
+            - Caller is expected to catch exceptions in MQTT callback contexts to avoid crash.
         """
         if t_recv_ns is None:
             t_recv_ns = time.time_ns()
@@ -239,7 +313,27 @@ class Collector:
             return
 
     def flush_once(self) -> None:
-        """현재 pending 버퍼를 1회 flush한다(테스트/운영 트러블슈팅 용)."""
+        """Flush pending buffers to disk once.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            Exception: Propagates write/serialization errors after restoring buffers.
+
+        Side Effects:
+            - Writes Parquet/CSV files under `run_dir/logs`.
+            - Updates `collector_meta.json` atomically.
+
+        Contract:
+            - Pending buffers are restored on failure to avoid data loss.
+
+        Failure Modes:
+            - I/O or serialization failures propagate to the caller.
+        """
         self._flush()
 
     # --------------- 이벤트 처리 --------------- 
@@ -622,6 +716,27 @@ class Collector:
             )
 
     def start(self):
+        """Start the MQTT collector loop and periodic flush thread.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - Opens MQTT connection and starts network loop thread.
+            - Spawns a background flush thread.
+
+        Contract:
+            - Blocks until stopped or `max_runtime_s` elapses.
+
+        Failure Modes:
+            - MQTT connection failures are retried by the client.
+        """
         t0 = time.time()
         self._client = mqtt.Client(
             client_id=self.cfg.client_id, clean_session=True, protocol=mqtt.MQTTv311
@@ -671,6 +786,27 @@ class Collector:
             self.stop()
 
     def stop(self):
+        """Stop the collector and perform a final flush.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - Stops MQTT loop and disconnects from broker.
+            - Writes pending buffers to disk.
+
+        Contract:
+            - Idempotent; repeated calls are no-ops after first stop.
+
+        Failure Modes:
+            - Flush errors are logged and suppressed.
+        """
         if self._stop_event.is_set():
             return
         self._stop_event.set()
@@ -690,6 +826,26 @@ class Collector:
 
 
 def main():
+    """CLI entry point for the collector process.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: If argument parsing or runtime initialization fails.
+
+    Side Effects:
+        - Starts the collector run loop.
+
+    Contract:
+        - Requires `--run-dir` to be provided.
+
+    Failure Modes:
+        - Propagates SystemExit on fatal configuration errors.
+    """
     parser = argparse.ArgumentParser(
         description="Semantic Uplink Collector (QoS1 de-dup, Parquet sink)"
     )

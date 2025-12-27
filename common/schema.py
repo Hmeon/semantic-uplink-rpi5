@@ -5,6 +5,13 @@
 # - 과제/동결안의 스키마/토픽/프로파일/정의와 정확히 일치. (헤더 포함 Rate 산정과 정합)
 # - 직렬화는 표준 라이브러리 기반이며, 설치된 경우 msgspec로 가속한다.  [과제 제안서 준수]
 
+"""Shared MQTT message schemas and validation utilities.
+
+Defines Event/PolicyDecision payloads, validates fields at construction time,
+and provides JSON serialization plus MQTT size estimation helpers. These
+schemas are a compatibility boundary with the collector/analyzer pipeline.
+"""
+
 from __future__ import annotations
 
 import math
@@ -35,15 +42,75 @@ UINT64_MAX: int = (1 << 64) - 1
 # -------------------- Enums (문자열 값 고정) --------------------
 
 class SensorType(str, Enum):
+    """Supported sensor identifiers for event topics and payloads.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Enum values must remain stable for topic/schema compatibility.
+
+    Failure Modes:
+        - None.
+    """
     MIC_RMS = "mic_rms"
     TEMP = "temp"
 
 class PolicyMode(str, Enum):
+    """Policy mode identifiers embedded in EventMsg.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Enum values must remain stable for downstream analysis.
+
+    Failure Modes:
+        - None.
+    """
     PERIODIC = "periodic"
     FIXED_TAU = "fixed_tau"
     ADAPTIVE = "adaptive"
 
 class LinkProfile(str, Enum):
+    """Network profile identifiers used in experiments.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Enum values must remain stable for config/profile matching.
+
+    Failure Modes:
+        - None.
+    """
     SLOW_10KBPS = "slow_10kbps"
     DELAY_LOSS = "delay_loss"
     CELLULAR_VAR = "cellular_var"
@@ -92,13 +159,40 @@ def _enum_from(value: str | Enum, enum_cls: Any, name: str) -> Enum:
 
 @dataclass(slots=True, frozen=True)
 class EventMsg:
-    """
-    업링크 이벤트 메시지(엣지→브로커).
-    필드명/타입은 스키마 동결안과 동일:
-      ts(int64 ns epoch), seq(u64), device_id(str), sensor("mic_rms"|"temp"),
-      val(float), pred(float), res(float), tau(float), kbits(int),
-      aoi_ms(Optional[int]), profile(str), policy("periodic"|"fixed_tau"|"adaptive")
-    JSON 직렬화 시 None 필드는 생략(바이트 절약).
+    """Event message emitted by the edge (uplink).
+
+    Args:
+        ts: Epoch timestamp in nanoseconds.
+        seq: Monotonic per-device sequence number.
+        device_id: Device identifier (must not include '/').
+        sensor: Sensor type identifier.
+        val: Quantized sensor value.
+        pred: Predictor output for the same sample.
+        res: Residual error (val - pred).
+        tau: Sampling or decision interval in seconds.
+        kbits: Quantization bit width (1..16).
+        profile: Link profile identifier.
+        policy: Policy mode identifier.
+        aoi_ms: Optional AoI in milliseconds for diagnostics.
+        event_reason: Optional emission reason tag.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If numeric ranges are violated (e.g., kbits out of range).
+        TypeError: If fields cannot be coerced into the required types.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Fields must match the frozen schema for downstream compatibility.
+        - `device_id` must not contain '/' to preserve topic structure.
+        - JSON serialization omits optional None fields to reduce payload size.
+
+    Failure Modes:
+        - Validation raises ValueError/TypeError on invalid values.
     """
     ts: int
     seq: int
@@ -166,6 +260,26 @@ class EventMsg:
 
     # ---- 직렬화/역직렬화 ----
     def to_dict(self) -> dict[str, Any]:
+        """Serialize the message to a JSON-ready dict.
+
+        Args:
+            None.
+
+        Returns:
+            Dict with enum values rendered as strings.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Optional fields are omitted when None.
+
+        Failure Modes:
+            - None.
+        """
         d: dict[str, Any] = {
             "ts": self.ts,
             "seq": self.seq,
@@ -186,11 +300,53 @@ class EventMsg:
         return d
 
     def to_json_bytes(self) -> bytes:
+        """Serialize the message to compact JSON bytes.
+
+        Args:
+            None.
+
+        Returns:
+            UTF-8 encoded JSON without extra whitespace.
+
+        Raises:
+            ValueError: If serialization fails in the JSON backend.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Uses the compact JSON backend to minimize payload length.
+
+        Failure Modes:
+            - JSON backend errors propagate as ValueError.
+        """
         # 공백 없는 JSON (Rate 산정시 payload_len 최소화)
         return _json_dumps(self.to_dict())
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> EventMsg:
+        """Construct an EventMsg from a dict payload.
+
+        Args:
+            d: Parsed JSON mapping.
+
+        Returns:
+            EventMsg instance with validated fields.
+
+        Raises:
+            KeyError: If required fields are missing.
+            ValueError: If field values are out of allowed ranges.
+            TypeError: If field types are incompatible.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Required keys must be present in the mapping.
+
+        Failure Modes:
+            - Raises on malformed or incomplete payloads.
+        """
         # 필수 필드 확인
         required = (
             "ts",
@@ -230,6 +386,26 @@ class EventMsg:
 
     @classmethod
     def from_json_bytes(cls, b: bytes) -> EventMsg:
+        """Parse JSON bytes into an EventMsg instance.
+
+        Args:
+            b: UTF-8 encoded JSON bytes.
+
+        Returns:
+            Validated EventMsg instance.
+
+        Raises:
+            ValueError: If JSON parsing fails or payload is not an object.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Assumes the payload follows EventMsg JSON schema.
+
+        Failure Modes:
+            - JSON decoding failures surface as ValueError.
+        """
         try:
             d = _json_loads(b)
         except Exception as e:
@@ -240,11 +416,50 @@ class EventMsg:
 
     # ---- 토픽/크기 ----
     def mqtt_topic(self) -> str:
+        """Return the MQTT topic for this event.
+
+        Args:
+            None.
+
+        Returns:
+            Topic string formatted as `edge/{device_id}/{sensor}/event`.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - `device_id` must be slash-free to preserve topic hierarchy.
+
+        Failure Modes:
+            - None.
+        """
         # edge/{device_id}/{sensor}/event
         return f"edge/{self.device_id}/{self.sensor.value}/event"
 
     def estimated_mqtt_size(self, qos: int = 1) -> int:
-        """헤더 포함 MQTT v3.1.1 PUBLISH 총 바이트 수(브로커 수신 기준)."""
+        """Estimate MQTT v3.1.1 publish size including headers.
+
+        Args:
+            qos: MQTT QoS level used to compute header sizing.
+
+        Returns:
+            Total bytes for a PUBLISH packet at the given QoS.
+
+        Raises:
+            RuntimeError: If the MQTT size calculator is unavailable.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Uses `mqtt_v311_publish_size` for protocol-accurate sizing.
+
+        Failure Modes:
+            - Raises if the helper is missing in minimal environments.
+        """
         if mqtt_v311_publish_size is None:
             raise RuntimeError("mqtt_v311_publish_size unavailable")
         payload_len = len(self.to_json_bytes())
@@ -254,13 +469,53 @@ class EventMsg:
 
 @dataclass(slots=True, frozen=True)
 class PolicyDecisionMsg:
-    """
-    정책 결정 메시지(엣지→브로커).
-    필드:
-      ts(int64 ns), device_id(str),
-      state_aoi(float), state_res(float), state_res_var(float),
-      state_loss(float in [0,1]), state_q_len(int>=0),
-      tau(float), kbits(int[1..16]), reward(float)
+    """Policy decision message emitted by the edge.
+
+    Args:
+        ts: Epoch timestamp in nanoseconds.
+        device_id: Device identifier (must not include '/').
+        state_aoi: AoI estimate in milliseconds.
+        state_res: Residual error estimate.
+        state_res_var: Residual variance estimate (>= 0).
+        state_loss: Loss estimate in [0, 1].
+        state_q_len: Outbox queue length (>= 0).
+        tau: Selected sampling interval in seconds.
+        kbits: Selected quantization bit width (1..16).
+        reward: Scalar reward used by the policy.
+        arm_id: Optional arm index for diagnostics.
+        safe_arm_forced: Optional flag indicating a safety override.
+        forced_reason: Optional reason string for a safety override.
+        ucb_exploitation: Optional UCB exploitation term.
+        ucb_exploration: Optional UCB exploration term.
+        ucb_score: Optional total UCB score.
+        ucb_alpha: Optional UCB alpha (must be > 0 if present).
+        reward_aoi: Optional AoI component of the reward.
+        reward_mae: Optional MAE component of the reward.
+        reward_rate: Optional rate component of the reward.
+        rate_limit_skips: Optional count of rate-limit skips.
+        t_predict_ms: Optional predictor timing in milliseconds.
+        t_decide_ms: Optional decision timing in milliseconds.
+        t_observe_ms: Optional observe timing in milliseconds.
+        t_step_ms: Optional total step timing in milliseconds.
+        cpu_step_ms: Optional CPU time for the step in milliseconds.
+        maxrss_kb: Optional max RSS during the step in KB.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If numeric ranges are violated.
+        TypeError: If fields cannot be coerced into required types.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - `device_id` must not contain '/' to preserve topic structure.
+        - Optional diagnostics are omitted from JSON when None.
+
+    Failure Modes:
+        - Validation raises ValueError/TypeError on invalid values.
     """
     ts: int
     device_id: str
@@ -427,6 +682,26 @@ class PolicyDecisionMsg:
 
     # 직렬화/역직렬화
     def to_dict(self) -> dict[str, Any]:
+        """Serialize the decision to a JSON-ready dict.
+
+        Args:
+            None.
+
+        Returns:
+            Dict with optional diagnostics omitted when None.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Optional diagnostics are excluded when unset to reduce payload size.
+
+        Failure Modes:
+            - None.
+        """
         d: dict[str, Any] = {
             "ts": self.ts,
             "device_id": self.device_id,
@@ -476,10 +751,51 @@ class PolicyDecisionMsg:
         return d
 
     def to_json_bytes(self) -> bytes:
+        """Serialize the decision to compact JSON bytes.
+
+        Args:
+            None.
+
+        Returns:
+            UTF-8 encoded JSON without extra whitespace.
+
+        Raises:
+            ValueError: If serialization fails in the JSON backend.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Uses compact JSON to minimize payload length.
+
+        Failure Modes:
+            - JSON backend errors propagate as ValueError.
+        """
         return _json_dumps(self.to_dict())
 
     @classmethod
     def from_dict(cls, d: dict[str, Any]) -> PolicyDecisionMsg:
+        """Construct a PolicyDecisionMsg from a dict payload.
+
+        Args:
+            d: Parsed JSON mapping.
+
+        Returns:
+            PolicyDecisionMsg instance with validated fields.
+
+        Raises:
+            ValueError: If required keys are missing or values are out of range.
+            TypeError: If field types are incompatible.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Required keys must be present in the mapping.
+
+        Failure Modes:
+            - Raises on malformed or incomplete payloads.
+        """
         required = ("ts", "device_id", "state_aoi", "state_res", "state_res_var",
                     "state_loss", "state_q_len", "tau", "kbits", "reward")
         missing = [k for k in required if k not in d]
@@ -575,6 +891,26 @@ class PolicyDecisionMsg:
 
     @classmethod
     def from_json_bytes(cls, b: bytes) -> PolicyDecisionMsg:
+        """Parse JSON bytes into a PolicyDecisionMsg instance.
+
+        Args:
+            b: UTF-8 encoded JSON bytes.
+
+        Returns:
+            Validated PolicyDecisionMsg instance.
+
+        Raises:
+            ValueError: If JSON parsing fails or payload is not an object.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Assumes the payload follows PolicyDecisionMsg JSON schema.
+
+        Failure Modes:
+            - JSON decoding failures surface as ValueError.
+        """
         try:
             d = _json_loads(b)
         except Exception as e:
@@ -585,10 +921,50 @@ class PolicyDecisionMsg:
 
     # 토픽/크기
     def mqtt_topic(self) -> str:
+        """Return the MQTT topic for this policy decision.
+
+        Args:
+            None.
+
+        Returns:
+            Topic string formatted as `policy/{device_id}/decision`.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - `device_id` must be slash-free to preserve topic hierarchy.
+
+        Failure Modes:
+            - None.
+        """
         # policy/{device_id}/decision
         return f"policy/{self.device_id}/decision"
 
     def estimated_mqtt_size(self, qos: int = 1) -> int:
+        """Estimate MQTT v3.1.1 publish size including headers.
+
+        Args:
+            qos: MQTT QoS level used to compute header sizing.
+
+        Returns:
+            Total bytes for a PUBLISH packet at the given QoS.
+
+        Raises:
+            RuntimeError: If the MQTT size calculator is unavailable.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Uses `mqtt_v311_publish_size` for protocol-accurate sizing.
+
+        Failure Modes:
+            - Raises if the helper is missing in minimal environments.
+        """
         if mqtt_v311_publish_size is None:
             raise RuntimeError("mqtt_v311_publish_size unavailable")
         payload_len = len(self.to_json_bytes())

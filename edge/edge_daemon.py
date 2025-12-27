@@ -7,6 +7,14 @@
 # - 유실 0: Outbox 내구성 + 퍼블리셔 재연결/ACK 기반 삭제로 보장.
 # - 문서/토픽/스키마: 동결안 및 공통 모듈과 1:1 정합.
 
+"""Edge daemon orchestrating sensors, policy, and MQTT uplink.
+
+Runs sensor loops in background threads, applies prediction/policy decisions,
+and publishes events through a durable outbox. It touches hardware (sensors,
+RTC, UI) and network I/O; correctness relies on orderly start/stop and on the
+outbox for delivery guarantees.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -42,6 +50,37 @@ logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class MicCfg:
+    """Runtime configuration for mic sampling and EWMA trigger parameters.
+
+    Args:
+        enable: Enable mic sampling when True.
+        backend: Audio backend name ("auto", "sounddevice", "arecord").
+        arecord_device: Optional ALSA device override for arecord.
+        sounddevice_device: Optional device name/id for sounddevice.
+        sample_rate: Sampling rate in Hz.
+        frame_ms: Frame size in milliseconds.
+        alpha: EWMA alpha parameter.
+        tau: Residual threshold in dB for event emission.
+        kbits: Quantization bit width (1..16).
+        heartbeat_s: Optional heartbeat interval in seconds.
+        min_emit_ms: Optional minimum emit interval to rate-limit.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Values are passed directly into MicRMS and EWMAConfig.
+        - `kbits` must remain within schema limits [1, 16].
+
+    Failure Modes:
+        - Invalid values surface when initializing sensors or predictor.
+    """
     enable: bool = True
     backend: str = "auto"              # auto|sounddevice|arecord
     arecord_device: str | None = None
@@ -57,6 +96,36 @@ class MicCfg:
 
 @dataclass(slots=True)
 class TempCfg:
+    """Runtime configuration for temperature sampling and EWMA trigger parameters.
+
+    Args:
+        enable: Enable temperature sampling when True.
+        backend: Temperature backend ("auto", "w1", "sysfs", "mock").
+        sample_hz: Sampling frequency in Hz.
+        alpha: EWMA alpha parameter.
+        tau: Residual threshold in Celsius for event emission.
+        kbits: Quantization bit width (1..16).
+        heartbeat_s: Optional heartbeat interval in seconds.
+        min_emit_ms: Optional minimum emit interval to rate-limit.
+        w1_path: Optional path to DS18B20 w1 device file.
+        sysfs_path: Optional sysfs thermal path override.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Values are passed directly into TempSensor and EWMAConfig.
+        - `kbits` must remain within schema limits [1, 16].
+
+    Failure Modes:
+        - Invalid values surface when initializing sensors or predictor.
+    """
     enable: bool = True
     backend: str = "auto"              # auto|w1|sysfs|mock
     sample_hz: float = 1.0
@@ -71,6 +140,31 @@ class TempCfg:
 
 @dataclass(slots=True)
 class RTCCfg:
+    """RTC synchronization configuration for DS3231.
+
+    Args:
+        enable: Enable RTC synchronization when True.
+        bus: I2C bus number for DS3231.
+        address: I2C address for DS3231.
+        drift_guard_s: Allowed drift before resync in seconds.
+        resync_interval_s: Periodic resync interval in seconds.
+        push_system_to_rtc: Whether to push system time to RTC when drifting.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Requires DS3231 hardware when enabled.
+
+    Failure Modes:
+        - Hardware access errors surface when RTC guardian starts.
+    """
     enable: bool = False
     bus: int = 1
     address: int = 0x68
@@ -81,6 +175,31 @@ class RTCCfg:
 
 @dataclass(slots=True)
 class UICfg:
+    """UI configuration for LCD/OLED/console status display.
+
+    Args:
+        enable: Enable status UI updates when True.
+        kind: Display backend ("auto", "lcd1602", "ssd1306", "console").
+        bus: I2C bus number for hardware displays.
+        address: Optional I2C address override.
+        refresh_s: Refresh interval in seconds.
+        rate_window_s: Window size in seconds for rate smoothing.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - UI runs in its own thread when enabled.
+
+    Failure Modes:
+        - Hardware initialization failures are logged and the UI is disabled.
+    """
     enable: bool = False
     kind: str = "auto"         # auto|lcd1602|ssd1306|console
     bus: int = 1
@@ -91,6 +210,30 @@ class UICfg:
 
 @dataclass(slots=True)
 class ButtonsCfg:
+    """GPIO button configuration for mode/profile/marker controls.
+
+    Args:
+        enable: Enable GPIO buttons when True.
+        mode_pin: GPIO pin for mode button.
+        profile_pin: GPIO pin for profile button.
+        marker_pin: GPIO pin for marker button.
+        debounce_ms: Debounce interval in milliseconds.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - GPIO pins must be valid for the target board.
+
+    Failure Modes:
+        - GPIO init errors are logged and buttons are disabled.
+    """
     enable: bool = True
     mode_pin: int = 17
     profile_pin: int = 27
@@ -100,6 +243,30 @@ class ButtonsCfg:
 
 @dataclass(slots=True)
 class LinkCfg:
+    """Link-shaping configuration for tc/netem integration.
+
+    Args:
+        iface: Network interface to shape.
+        both: Apply shaping to ingress via ifb when True.
+        apply_on_button: Apply profile changes on button presses.
+        apply_on_start: Apply current profile once at startup.
+        profiles_config: Optional YAML path to override built-in profiles.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - tc/netem operations require CAP_NET_ADMIN or root.
+
+    Failure Modes:
+        - Permission errors are logged when shaping is enabled without privileges.
+    """
     iface: str = "eth0"
     both: bool = False            # ingress 포함 여부
     apply_on_button: bool = False # 버튼으로 프로파일 변경 시 tc 적용 여부 (root 필요)
@@ -109,10 +276,70 @@ class LinkCfg:
 
 @dataclass(slots=True)
 class DecisionCfg:
+    """Publishing policy decision configuration.
+
+    Args:
+        publish: Policy decision publish mode ("always", "event", "never").
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Mode names must match policy runtime expectations.
+
+    Failure Modes:
+        - Invalid modes are handled by policy runtime validation.
+    """
     publish: str = "always"  # always|event|never
 
 
 class EdgeDaemon:
+    """Main edge process coordinating sensors, policy, and MQTT publishing.
+
+    Args:
+        device_id: Unique device identifier for topics and logs.
+        profile: LinkProfile used for policy context and UI.
+        outbox_path: Path to the outbox SQLite database.
+        mode: Policy mode (periodic/fixed/adaptive).
+        arms_cfg: Optional LinUCB arms configuration mapping.
+        broker: MQTT broker host.
+        port: MQTT broker port.
+        client_id: MQTT client identifier.
+        keepalive: MQTT keepalive in seconds.
+        seed: Optional RNG seed for deterministic runs.
+        mic: Optional mic sensor configuration.
+        temp: Optional temperature sensor configuration.
+        rtc: Optional RTC synchronization configuration.
+        ui: Optional UI configuration.
+        buttons: Optional GPIO button configuration.
+        link: Optional link shaping configuration.
+        decision: Optional policy decision publish configuration.
+
+    Returns:
+        None.
+
+    Raises:
+        OSError: If run directories or outbox path cannot be created.
+
+    Contract:
+        - Requires at least one enabled sensor (mic or temp).
+        - Uses Outbox for durability; a message is removed only after PUBACK.
+
+    Side Effects:
+        - Spawns background threads for sensors, UI, and button handling.
+        - Reads hardware sensors and writes an SQLite outbox.
+        - Connects to MQTT broker and may apply tc/netem shaping if enabled.
+
+    Failure Modes:
+        - Sensor init or UI init failures are logged and the component is skipped.
+        - MQTT outages are tolerated; outbox buffers until reconnect.
+    """
     def __init__(
         self,
         *,
@@ -189,6 +416,27 @@ class EdgeDaemon:
     # ---------- 라이프사이클 ----------
 
     def start(self):
+        """Start worker threads and block until stop is requested.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - Starts MQTT publisher and sensor/UI/button threads.
+            - May apply tc profiles when configured.
+
+        Contract:
+            - Blocks the calling thread until `stop` is invoked or a signal is received.
+
+        Failure Modes:
+            - Component init failures are logged and the daemon continues when possible.
+        """
         self._install_signals()
         self._maybe_start_rtc()
         if self.link_cfg.apply_on_start:
@@ -222,6 +470,26 @@ class EdgeDaemon:
             self.stop()
 
     def stop(self):
+        """Stop background threads and release resources.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - Stops MQTT publisher, closes outbox, and releases hardware handles.
+
+        Contract:
+            - Idempotent; repeated calls are no-ops after the first stop.
+
+        Failure Modes:
+            - Cleanup errors are logged and suppressed.
+        """
         if self._stop.is_set():
             return
         self._stop.set()
@@ -788,6 +1056,26 @@ def _opt_path(val: str | None) -> str | None:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments and resolve config-driven defaults.
+
+    Args:
+        argv: Optional CLI argument list; defaults to sys.argv.
+
+    Returns:
+        Parsed argparse namespace with resolved defaults.
+
+    Raises:
+        SystemExit: If required arguments or config files are invalid.
+
+    Side Effects:
+        - Reads device YAML when `--device-config` is supplied.
+
+    Contract:
+        - Ensures `device_id` is resolved from CLI or device config.
+
+    Failure Modes:
+        - Invalid YAML or schema issues terminate the process via argparse error.
+    """
     # device-config를 먼저 파싱해, 나머지 옵션의 default를 동적으로 구성한다.
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--device-config", default=None, help="device YAML path (e.g., configs/device.yaml)")
@@ -1018,6 +1306,26 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 
 def main(argv: list[str] | None = None):
+    """CLI entry point for the edge daemon.
+
+    Args:
+        argv: Optional argument list for testing; defaults to sys.argv.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: If argument parsing or runtime initialization fails.
+
+    Side Effects:
+        - Starts sensors, policy runtime, and MQTT publishing.
+
+    Contract:
+        - Requires a device_id from CLI or device config.
+
+    Failure Modes:
+        - Propagates SystemExit on fatal configuration errors.
+    """
     args = parse_args(argv)
     setup_logging_from_args(args)
 

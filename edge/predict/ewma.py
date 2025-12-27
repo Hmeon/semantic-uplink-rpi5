@@ -7,6 +7,13 @@
 # - 첫 샘플 부트스트랩/하트비트/최소 재전송 간격 등 실전 운용 세부 포함.
 # - 스키마/토픽/프로파일/지표 정의는 동결안·과제 제안서와 일치.  # noqa
 
+"""EWMA predictor and event trigger for edge sampling.
+
+Computes residuals against a one-step EWMA predictor and emits events when
+threshold/heartbeat conditions are met. This module is performance-sensitive
+and must keep per-sample work low to avoid sensor backpressure.
+"""
+
 from __future__ import annotations
 
 import math
@@ -27,15 +34,35 @@ __all__ = ["EWMAConfig", "EWMAPredictor"]
 
 @dataclass(slots=True, frozen=True)
 class EWMAConfig:
-    """
-    EWMA 고정 τ 구성.
-    - alpha: 0<α≤1  (예: mic 0.2, temp 0.5 권장)
-    - tau: 전송 임계값 (단위: 센서 단위. mic=dB, temp=°C)
-    - kbits: 1..16  (전송 양자화 레벨)
-    - heartbeat_s: 하트비트 최소 주기(초). None 또는 0이면 비활성.
-    - min_emit_interval_ms: 이벤트 최소 간격(ms) 가드(폭주 방지).
-    - vmin/vmax: 센서 범위 재정의(기본은 quantize 모듈의 권고값).
-    - bootstrap_emit: 첫 샘플 시 1회 전송(재현성/초기화).
+    """Configuration for EWMA predictor and trigger thresholds.
+
+    Args:
+        device_id: Device identifier included in emitted events.
+        sensor: Sensor type (mic_rms or temp).
+        alpha: EWMA smoothing factor in (0, 1].
+        tau: Residual threshold that triggers an event.
+        kbits: Quantization bit width (1..16).
+        profile: Link profile label for event metadata.
+        heartbeat_s: Minimum emit interval for keep-alives; None disables.
+        min_emit_interval_ms: Rate-limit for event emission (ms).
+        vmin/vmax: Optional sensor range overrides for quantizer.
+        bootstrap_emit: Emit once on first valid sample to establish baseline.
+        diagnostics_enabled: Enable extra diagnostics fields in events.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Values are validated when EWMAPredictor is instantiated.
+
+    Failure Modes:
+        - Invalid values raise when building the predictor.
     """
     device_id: str
     sensor: SensorType
@@ -52,10 +79,26 @@ class EWMAConfig:
 
 
 class EWMAPredictor:
-    """
-    EWMA(one-step ahead) 예측 및 임계값 트리거/하트비트 관리.
-    - 내부 상태: last_pred, last_emit_ns
-    - 트리거: |x_raw - last_pred| > τ  (업데이트는 전송 여부와 무관하게 매 샘플 수행)
+    """EWMA predictor with threshold/heartbeat triggering.
+
+    Args:
+        cfg: EWMAConfig with thresholds, quantization, and metadata.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If configuration values are out of bounds.
+
+    Contract:
+        - Maintains last prediction and last emit time across samples.
+        - Emits when residual exceeds tau, on heartbeat, or when forced.
+
+    Side Effects:
+        - Updates internal EWMA state and emission counters.
+
+    Failure Modes:
+        - Invalid samples are ignored for emission but still update EWMA state.
     """
     def __init__(self, cfg: EWMAConfig):
         if not (0.0 < cfg.alpha <= 1.0):
@@ -76,9 +119,25 @@ class EWMAPredictor:
     # ---------------- 공용 API ----------------
 
     def preview(self, sample: Any) -> tuple[int, int, float, bool, float, float]:
-        """
-        샘플을 **상태 업데이트 없이** 미리 계산한다.
-        반환: (ts_ns, seq, x_raw, valid, last_pred, resid)
+        """Compute residuals without mutating predictor state.
+
+        Args:
+            sample: Sensor sample object.
+
+        Returns:
+            (ts_ns, seq, x_raw, valid, last_pred, resid) tuple.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Does not update EWMA state; safe to call multiple times per sample.
+
+        Failure Modes:
+            - Non-finite inputs are surfaced as invalid via `valid` flag.
         """
         ts_ns, seq, x_raw, value_valid = self._extract_value(sample)
         last_pred = x_raw if self._last_pred is None else self._last_pred
@@ -97,10 +156,33 @@ class EWMAPredictor:
         force_emit: bool = False,
         force_reason: str | None = None,
     ) -> EventMsg | None:
-        """
-        센서 샘플 하나를 입력 받아, 조건을 만족하면 EventMsg를 생성.
-        - mic_rms.Sample: (ts_ns, seq, dbfs, clip_ratio)
-        - temp.Sample   : (ts_ns, seq, celsius, valid)
+        """Update predictor state and emit EventMsg when thresholds fire.
+
+        Args:
+            sample: Sensor sample object.
+            override_tau: Optional override for threshold tau.
+            override_kbits: Optional override for quantization bits.
+            policy_mode: Policy mode to record in event metadata.
+            override_heartbeat_s: Optional heartbeat override.
+            override_min_emit_ms: Optional rate-limit override.
+            force_emit: Force an emission regardless of thresholds.
+            force_reason: Optional reason string for diagnostics.
+
+        Returns:
+            EventMsg if emission occurs, otherwise None.
+
+        Raises:
+            ValueError: If configuration values are out of bounds.
+
+        Side Effects:
+            - Updates EWMA state and emission counters.
+
+        Contract:
+            - Emits only when threshold/heartbeat/force conditions are met.
+            - Rate limiting can suppress threshold-driven emissions.
+
+        Failure Modes:
+            - Invalid samples short-circuit emission and update EWMA with None.
         """
         ts_ns, seq, x_raw, value_valid = self._extract_value(sample)
         if not value_valid:
@@ -189,9 +271,25 @@ class EWMAPredictor:
         return evt
 
     def consume_rate_limit_skips(self) -> int:
-        """
-        Return and reset the number of rate-limited "would-have-emitted" events since last consume.
-        Logged only on policy decision to keep overhead negligible.
+        """Return and reset the number of suppressed emissions.
+
+        Args:
+            None.
+
+        Returns:
+            Count of rate-limited emissions since last call (0 if diagnostics disabled).
+
+        Raises:
+            None.
+
+        Side Effects:
+            - Resets the internal skip counter.
+
+        Contract:
+            - Only increments when diagnostics are enabled.
+
+        Failure Modes:
+            - None.
         """
         if not bool(self.cfg.diagnostics_enabled):
             return 0
@@ -202,9 +300,29 @@ class EWMAPredictor:
     def run(
         self, sample_iter: Iterator[Any], duration_s: float | None = None
     ) -> Iterator[EventMsg]:
-        """
-        샘플 이터레이터를 소비하며 EventMsg를 yield.
-        duration_s가 주어지면 그 시간 경과 후 종료(샘플 ts 기준이 아니라 벽시계 기준).
+        """Iterate samples and yield emitted events.
+
+        Args:
+            sample_iter: Source iterator of sensor samples.
+            duration_s: Optional wall-clock limit in seconds.
+
+        Returns:
+            None.
+
+        Yields:
+            EventMsg instances for each emission.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - Updates EWMA state for each sample.
+
+        Contract:
+            - Duration is based on wall-clock time, not sample timestamps.
+
+        Failure Modes:
+            - Iterator errors propagate to caller.
         """
         end_ns = None if duration_s is None else (time.time_ns() + int(duration_s * 1e9))
         for s in sample_iter:
@@ -215,15 +333,36 @@ class EWMAPredictor:
                 yield evt
 
     def close(self) -> None:
-        """상태 정리(현재는 유지할 리소스 없음)."""
+        """Release predictor resources (no-op for now).
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Safe to call multiple times.
+
+        Failure Modes:
+            - None.
+        """
         return
 
     @property
     def last_emit_ns(self) -> int | None:
+        """Timestamp of the most recent emission in ns, or None if none emitted."""
         return self._last_emit_ns
 
     @property
     def last_pred(self) -> float | None:
+        """Most recent EWMA prediction value, or None if uninitialized."""
         return self._last_pred
 
     # ---------------- 내부 유틸 ----------------

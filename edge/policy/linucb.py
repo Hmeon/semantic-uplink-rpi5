@@ -6,6 +6,12 @@
 # - 안전가드: AoI_max/MAE_max 위반 시 세이프 팔로 강제 전환(탐색 무시)
 # - 결정 로그: PolicyDecisionMsg (reward는 의도적으로 0.0 → 실제 보상은 observe_outcome에서 학습)
 
+"""LinUCB policy for selecting (tau, kbits) arms under link constraints.
+
+Implements a contextual bandit with ridge regression and UCB exploration.
+Safety guards can override arm choice to enforce AoI/MAE limits.
+"""
+
 from __future__ import annotations
 
 import logging
@@ -30,12 +36,73 @@ __all__ = [
 
 @dataclass(slots=True, frozen=True)
 class Arm:
+    """Immutable arm definition for (tau, kbits) selection.
+
+    Args:
+        tau: Sampling threshold or interval for the arm.
+        kbits: Quantization bit width (1..16).
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Used as a value object; no validation beyond type coercion.
+
+    Failure Modes:
+        - Invalid values surface when the policy validates arms.
+    """
     tau: float
     kbits: int
 
 
 @dataclass(slots=True)
 class LinUCBConfig:
+    """Configuration for LinUCB policy behavior and constraints.
+
+    Args:
+        device_id: Device identifier for logging.
+        sensor: Sensor type for arm defaults.
+        profile: Link profile identifier.
+        seed: Optional RNG seed for deterministic choices.
+        arms: Optional explicit arm list; defaults to sensor-specific grid.
+        alpha_ucb: UCB exploration strength (alpha).
+        lambda_ridge: Ridge regularization coefficient.
+        w_aoi: AoI weight in reward.
+        w_mae: MAE weight in reward.
+        w_rate: Rate weight in reward.
+        aoi_scale_ms: AoI normalization scale in ms.
+        mae_scale: MAE normalization scale.
+        rate_scale_bps: Rate normalization scale in bps.
+        res_scale: Residual normalization scale.
+        resvar_scale: Residual variance normalization scale.
+        aoi_max_ms: AoI safety threshold in ms.
+        mae_max: MAE safety threshold.
+        safety_force_emit_on_aoi: Whether to force emit when AoI exceeds limit.
+        warmup_per_arm: Minimum pulls per arm before UCB selection.
+        safe_arm: Optional explicit safe arm override.
+        diagnostics_enabled: Emit diagnostic scalars when True.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Values are consumed by LinUCBPolicy without additional validation.
+
+    Failure Modes:
+        - Invalid values surface during policy initialization.
+    """
     device_id: str
     sensor: SensorType
     profile: LinkProfile
@@ -77,6 +144,31 @@ class LinUCBConfig:
 
 @dataclass(slots=True, frozen=True)
 class PolicyState:
+    """Context features used by LinUCB to choose an arm.
+
+    Args:
+        ts_ns: Timestamp for the state in nanoseconds.
+        aoi_ms: AoI estimate in milliseconds.
+        res: Residual error estimate.
+        res_var: Residual variance estimate.
+        loss: Loss estimate in [0, 1].
+        q_len: Queue length estimate (>= 0).
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Values are normalized inside the policy before scoring.
+
+    Failure Modes:
+        - Non-finite values are sanitized during decision making.
+    """
     ts_ns: int
     aoi_ms: float
     res: float
@@ -102,12 +194,27 @@ def _default_arms(sensor: SensorType) -> list[Arm]:
 
 
 class LinUCBPolicy:
-    """
-    LinUCB 컨텍스트 밴딧 정책.
-    - 팔별(τ,k)로 A(=λI + Σ x xᵀ), b(=Σ r x) 유지
-    - 추정 θ̂ = A⁻¹ b, 선택 점수 p = θ̂ᵀx + α·√(xᵀA⁻¹x)
-    - 안전가드: 상태가 임계 초과면 항상 세이프 팔
-    - 학습 시점: observe_outcome()에서 직전 결정의 (x, arm)에 보상 r을 적용
+    """Contextual bandit policy using LinUCB.
+
+    Args:
+        cfg: LinUCBConfig with arm grid, scaling, and safety limits.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If the arm grid is empty or the safe arm is missing.
+
+    Contract:
+        - Maintains per-arm ridge regression state (A, b) and counts.
+        - `decide` must be followed by `observe_outcome` to update the chosen arm.
+        - Safety guardrails can override exploration.
+
+    Side Effects:
+        - Updates in-memory model parameters and internal counters.
+
+    Failure Modes:
+        - Invalid states are sanitized and logged; selection continues.
     """
 
     def __init__(self, cfg: LinUCBConfig):
@@ -161,9 +268,26 @@ class LinUCBPolicy:
     # ---------------- 공개 API ----------------
 
     def decide(self, state: PolicyState) -> tuple[tuple[float, int], PolicyDecisionMsg]:
-        """
-        현재 상태에 대한 (τ,k) 결정을 수행하고 PolicyDecisionMsg를 반환한다.
-        - reward 필드는 0.0으로 기록(실제 보상은 observe_outcome에서 적용)
+        """Choose an arm for the current state and emit a decision message.
+
+        Args:
+            state: Current policy context (AoI/residual/loss/queue length).
+
+        Returns:
+            ((tau, kbits), PolicyDecisionMsg) for logging and actuation.
+
+        Raises:
+            ValueError: If configuration yields no valid arms.
+
+        Side Effects:
+            - Updates internal buffers for the subsequent `observe_outcome`.
+
+        Contract:
+            - `reward` in the decision message is a placeholder (0.0).
+            - Sanitizes non-finite state values rather than aborting.
+
+        Failure Modes:
+            - If safe arm is missing from the grid, initialization fails early.
         """
         invalid_state = False
         aoi_ms = float(state.aoi_ms)
@@ -301,9 +425,27 @@ class LinUCBPolicy:
         return (arm.tau, arm.kbits), msg
 
     def observe_outcome(self, aoi_ms: float, mae: float, rate_bps: float) -> float:
-        """
-        직전 decide()에 대한 결과(실측 지표)를 받아 LinUCB 파라미터를 업데이트한다.
-        반환값: 사용된 보상 r.
+        """Apply reward for the most recent decision and update model state.
+
+        Args:
+            aoi_ms: Observed AoI in milliseconds.
+            mae: Observed event MAE estimate.
+            rate_bps: Observed rate in bits per second.
+
+        Returns:
+            The computed reward value (negative weighted sum).
+
+        Raises:
+            None.
+
+        Side Effects:
+            - Updates A/b matrices and internal counts for the chosen arm.
+
+        Contract:
+            - Should be called once per `decide` to keep learning consistent.
+
+        Failure Modes:
+            - Non-finite inputs cause the update to be skipped and return 0.0.
         """
         if self._last_x is None or self._last_arm_idx is None:
             # 아직 결정이 없거나 중복 호출
@@ -354,11 +496,48 @@ class LinUCBPolicy:
         return float(r)
 
     def arm_count(self) -> int:
+        """Return the number of configured arms.
+
+        Args:
+            None.
+
+        Returns:
+            Count of arms in the current grid.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Reflects the current arm list stored on the policy.
+
+        Failure Modes:
+            - None.
+        """
         return len(self.arms)
 
     def dump_model(self) -> list[dict]:
-        """
-        팔별 요약(시도 횟수, θ̂, A 대각)을 반환(디버그용).
+        """Return per-arm diagnostic summaries for debugging.
+
+        Args:
+            None.
+
+        Returns:
+            List of dicts with arm parameters, counts, and model summaries.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Uses the current in-memory model state.
+
+        Failure Modes:
+            - Linear algebra failures yield zero-valued parameter estimates.
         """
         out = []
         for i, a in enumerate(self.arms):
@@ -416,7 +595,29 @@ class LinUCBPolicy:
 
 
 class LinUCB:
-    """Backwards-compatible LinUCB variant for the lightweight unit tests."""
+    """Backwards-compatible LinUCB variant for the lightweight unit tests.
+
+    Args:
+        arms: Arm list as (tau, kbits) tuples or Arm objects.
+        d: Context feature dimension.
+        alpha: UCB exploration strength.
+        lambda_ridge: Ridge regularization coefficient.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If d/alpha are invalid or arms are empty.
+
+    Side Effects:
+        - Updates in-memory model parameters when `update` is called.
+
+    Contract:
+        - Context vectors must have shape (d,).
+
+    Failure Modes:
+        - Invalid contexts raise ValueError.
+    """
 
     def __init__(
         self,

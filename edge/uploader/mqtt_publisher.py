@@ -7,6 +7,12 @@
 # - 보안 옵션(TLS/username/password)은 선택 지원.
 # - 본 모듈은 "퍼블리시"만 책임, 메시지 생성/스키마/크기 산정은 상위 모듈 담당.  # noqa
 
+"""MQTT publisher backed by the durable outbox.
+
+Publishes queued messages with QoS1, tracks PUBACKs, and requeues on failure.
+Designed to tolerate broker outages while keeping ordering via outbox FIFO.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -28,11 +34,40 @@ logger = logging.getLogger(__name__)
 
 
 class MQTTPublisher:
-    """
-    Durable MQTT publisher with QoS1 and offline-first behavior.
-    - Outbox로부터 배치(claim_batch) 단위로 메시지를 인출하여 publish.
-    - paho on_publish(mid) → outbox.ack(msg_id) 매핑 관리.
-    - 연결 끊김/실패 시 outbox.nack() 또는 reset_inflight()로 재시도 대기열 복귀.
+    """Durable MQTT publisher with QoS1 and offline-first behavior.
+
+    Args:
+        outbox: Outbox instance used for durable queueing.
+        broker: MQTT broker host.
+        port: MQTT broker port.
+        client_id: MQTT client identifier.
+        keepalive: MQTT keepalive in seconds.
+        username: Optional broker username.
+        password: Optional broker password.
+        tls: Enable TLS when True.
+        cafile: Optional CA file for TLS validation.
+        certfile: Optional client certificate for TLS.
+        keyfile: Optional client key for TLS.
+        max_inflight: Maximum number of inflight publishes.
+        claim_batch: Maximum number of items to claim per cycle.
+        requeue_period_s: Interval to requeue stuck items in seconds.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If max_inflight or claim_batch are invalid.
+
+    Contract:
+        - Messages are claimed from Outbox and published in FIFO order.
+        - A message is removed only after PUBACK.
+
+    Side Effects:
+        - Network I/O to MQTT broker.
+        - Mutates outbox state via ack/nack/requeue.
+
+    Failure Modes:
+        - Publish failures requeue messages; broker outages are tolerated.
     """
 
     def __init__(
@@ -106,7 +141,26 @@ class MQTTPublisher:
         self._map_lock = threading.Lock()
 
     def is_connected(self) -> bool:
-        """MQTT 연결 상태 플래그(상태 표시/UI용)."""
+        """Return the last known MQTT connection state.
+
+        Args:
+            None.
+
+        Returns:
+            True if the client is connected, False otherwise.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - None.
+
+        Contract:
+            - Value is best-effort and may lag transient disconnects.
+
+        Failure Modes:
+            - State may be stale during reconnect storms.
+        """
         return bool(self._connected)
 
     # ------------- MQTT 콜백 -------------
@@ -155,6 +209,26 @@ class MQTTPublisher:
     # ------------- 라이프사이클 -------------
 
     def start(self):
+        """Start MQTT networking and background publish loops.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - Initiates broker connection and starts worker threads.
+
+        Contract:
+            - Safe to call once; subsequent calls require a new instance.
+
+        Failure Modes:
+            - Connection errors are handled by paho-mqtt retry logic.
+        """
         # MQTT I/O 루프 시작
         #
         # connect_async는 **네트워크 I/O를 즉시 수행하지 않고** 접속 파라미터만 설정한다.
@@ -176,6 +250,26 @@ class MQTTPublisher:
         logger.info("publisher_started broker=%s port=%s", self.broker, int(self.port))
 
     def stop(self):
+        """Stop background loops and disconnect from broker.
+
+        Args:
+            None.
+
+        Returns:
+            None.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - Stops MQTT loop and joins worker threads.
+
+        Contract:
+            - Idempotent; repeated calls are no-ops after first stop.
+
+        Failure Modes:
+            - Shutdown errors are logged and suppressed.
+        """
         if self._stop.is_set():
             return
         self._stop.set()
@@ -297,6 +391,26 @@ def _install_signal_handlers(p: MQTTPublisher):
 
 
 def main():
+    """CLI entry point for publishing from an existing outbox.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: If argument parsing fails or runtime exits with error.
+
+    Side Effects:
+        - Starts MQTT publisher loops that drain the outbox.
+
+    Contract:
+        - Requires an existing outbox path to be provided.
+
+    Failure Modes:
+        - Propagates SystemExit on fatal configuration errors.
+    """
     ap = argparse.ArgumentParser(description="Outbox-backed MQTT QoS1 publisher")
     add_logging_cli_args(ap)
     ap.add_argument("--outbox", required=True, help="SQLite path (e.g., artifacts/<run>/outbox.sqlite)")

@@ -13,11 +13,26 @@ if msgspec is not None:
 
 
 def dumps(obj: Any) -> bytes:
-    """
-    Serialize an object to compact UTF-8 JSON bytes.
+    """Serialize an object to compact UTF-8 JSON bytes.
 
-    - Prefers msgspec (fast) when installed.
-    - Fallback uses stdlib json with no whitespace.
+    Args:
+        obj: JSON-serializable object.
+
+    Returns:
+        UTF-8 encoded JSON bytes with no extra whitespace.
+
+    Raises:
+        TypeError: If the object cannot be serialized by the backend.
+        ValueError: If the backend rejects the payload.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Prefers msgspec when installed, otherwise uses stdlib json.
+
+    Failure Modes:
+        - Serialization errors propagate to the caller.
     """
     if msgspec is not None:
         return _ENCODER.encode(obj)
@@ -28,11 +43,26 @@ def dumps(obj: Any) -> bytes:
 
 
 def loads(data: bytes) -> Any:
-    """
-    Parse UTF-8 JSON bytes into Python objects.
+    """Parse UTF-8 JSON bytes into Python objects.
 
-    - Prefers msgspec (fast) when installed.
-    - Fallback decodes as UTF-8 and uses stdlib json.
+    Args:
+        data: UTF-8 encoded JSON bytes.
+
+    Returns:
+        Parsed Python object (dict/list/str/etc).
+
+    Raises:
+        ValueError: If the JSON payload is invalid.
+        TypeError: If the input is not bytes-like.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Prefers msgspec when installed, otherwise uses stdlib json.
+
+    Failure Modes:
+        - Decode errors propagate to the caller.
     """
     if msgspec is not None:
         return _DECODER.decode(data)
@@ -40,4 +70,3 @@ def loads(data: bytes) -> Any:
     import json
 
     return json.loads(data.decode("utf-8"))
-

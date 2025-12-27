@@ -3,6 +3,13 @@
 # - 센서 샘플마다 컨텍스트 계산 → (τ, kbits) 결정 → 이벤트 생성 → 보상 학습
 # - 목적: edge_daemon 루프를 단순화하고 LinUCB 학습을 실제 파이프라인에 연결
 
+"""Policy runtime for per-sample decisions and reward attribution.
+
+Bridges prediction, policy selection, and event emission for a single sensor
+stream. This module is latency-sensitive and must keep per-sample work bounded
+to avoid delaying the sensor loop.
+"""
+
 from __future__ import annotations
 
 import math
@@ -31,12 +38,58 @@ __all__ = ["LinkFeedback", "StepResult", "SensorPolicyRuntime", "load_linucb_con
 
 @dataclass(slots=True)
 class LinkFeedback:
+    """Link feedback inputs for policy context (ack latency and loss estimate).
+
+    Args:
+        ack_delay_ms: Optional ACK delay estimate in milliseconds.
+        loss_rate: Optional loss rate estimate in [0, 1].
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Values are treated as best-effort observations.
+
+    Failure Modes:
+        - Missing values are treated as unavailable (None).
+    """
     ack_delay_ms: float | None = None
     loss_rate: float | None = None
 
 
 @dataclass(slots=True)
 class StepResult:
+    """Outputs from a single policy step, including optional event/decision.
+
+    Args:
+        event: Optional EventMsg to enqueue.
+        decision: Optional PolicyDecisionMsg (adaptive mode).
+        reward: Optional reward value used for learning.
+        aoi_ms: AoI estimate in milliseconds.
+        mae_est: MAE estimate for the predictor.
+        rate_bps: Estimated transmit rate in bytes per second.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - `decision` and `reward` are None outside adaptive mode.
+
+    Failure Modes:
+        - Values may be NaN when inputs are insufficient.
+    """
     event: EventMsg | None
     decision: PolicyDecisionMsg | None
     reward: float | None
@@ -46,11 +99,33 @@ class StepResult:
 
 
 class SensorPolicyRuntime:
-    """
-    센서 1개에 대한 정책 실행기.
-    - Periodic: 모든 샘플 전송
-    - Fixed τ: EWMA+임계값 SoD
-    - Adaptive: LinUCB로 (τ, kbits) 선택 → 보상으로 즉시 학습
+    """Policy runtime for a single sensor stream.
+
+    Args:
+        device_id: Device identifier for EventMsg/PolicyDecisionMsg.
+        sensor: Sensor type associated with this runtime.
+        profile: Link profile for policy context.
+        mode: Policy mode (periodic/fixed/adaptive).
+        ewma_cfg: EWMA predictor configuration.
+        linucb_cfg: LinUCB configuration when in adaptive mode.
+        nominal_period_s: Optional nominal sampling period for AoI fallback.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If adaptive mode is requested without linucb_cfg.
+
+    Contract:
+        - Periodic emits every valid sample.
+        - Fixed_tau emits on EWMA residual threshold.
+        - Adaptive chooses (tau, kbits) via LinUCB and learns from reward.
+
+    Side Effects:
+        - Updates predictor state and LinUCB model in-memory.
+
+    Failure Modes:
+        - Invalid samples are skipped but still advance predictor state.
     """
 
     def __init__(
@@ -87,9 +162,29 @@ class SensorPolicyRuntime:
         outbox_pending: int,
         link_feedback: LinkFeedback | None = None,
     ) -> StepResult:
-        """
-        샘플 1개 처리 → (EventMsg?, PolicyDecisionMsg?, reward?)
-        - adaptive 모드가 아닌 경우 decision/reward는 None
+        """Process one sample and return event/decision outputs.
+
+        Args:
+            sample: Sensor sample object from mic/temp sources.
+            outbox_pending: Current outbox queue length for congestion context.
+            link_feedback: Optional ACK/loss feedback for policy context.
+
+        Returns:
+            StepResult with event and/or decision (adaptive only).
+
+        Raises:
+            ValueError: If adaptive mode is enabled without a LinUCB config.
+
+        Side Effects:
+            - Updates predictor state and LinUCB model parameters.
+            - Emits EventMsg when policy conditions are satisfied.
+
+        Contract:
+            - Decision/reward are None in non-adaptive modes.
+            - Uses ACK delay as an AoI proxy when provided.
+
+        Failure Modes:
+            - Invalid sensor samples are ignored for emission but still update state.
         """
         event: EventMsg | None = None
         decision: PolicyDecisionMsg | None = None
@@ -319,9 +414,33 @@ def load_linucb_config(
     res_scale: float | None = None,
     resvar_scale: float | None = None,
 ) -> LinUCBConfig:
-    """
-    YAML/JSON dict → LinUCBConfig 변환.
-    - cfg_dict는 configs/policy.yaml 스키마를 기대.
+    """Build LinUCBConfig from a YAML/JSON mapping.
+
+    Args:
+        cfg_dict: Policy config mapping (configs/policy*.yaml schema).
+        device_id: Device identifier for logging/telemetry.
+        sensor: Sensor type to select arms/scales.
+        profile: Link profile label.
+        seed: Optional RNG seed for reproducibility.
+        mae_scale: Optional MAE scale override derived from arms.
+        res_scale: Optional residual scale override derived from arms.
+        resvar_scale: Optional residual variance scale override derived from arms.
+
+    Returns:
+        LinUCBConfig populated with parsed arms/reward/safety/scales.
+
+    Raises:
+        KeyError: If arms entries are missing required keys.
+        ValueError: If numeric fields cannot be converted.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Expects `arms` entries to provide tau/kbits.
+
+    Failure Modes:
+        - Bad YAML values surface as conversion errors to caller.
     """
     arms_raw = cfg_dict.get("arms") or []
     arms = [Arm(tau=float(a["tau"]), kbits=int(a["kbits"])) for a in arms_raw]

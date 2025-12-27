@@ -6,6 +6,12 @@
 # - 안정성: SIGINT/SIGTERM 처리, tc 원복 보장, edge/collector 프로세스 정리
 # - 의존: 표준 라이브러리 + 프로젝트 내부 모듈(link.shaper.tc_profiles.apply_profile/clear)
 
+"""Experiment runner for profile×mode scenario matrices.
+
+Applies tc shaping profiles, starts edge/collector subprocesses, and records
+metadata/artifacts per scenario. Requires root/CAP_NET_ADMIN to apply tc.
+"""
+
 from __future__ import annotations
 
 import argparse
@@ -37,6 +43,59 @@ except Exception as e:  # pragma: no cover
 
 @dataclass(slots=True)
 class ExperimentPlan:
+    """Configuration for experiment matrix runs.
+
+    Args:
+        device_id: Device identifier for edge/collector.
+        device_config: Optional device YAML path for defaults.
+        iface: Network interface for tc shaping.
+        both: Apply tc shaping to ingress when True.
+        run_root: Root directory for experiment outputs.
+        link_profiles_config: Optional YAML path for tc profiles.
+        warmup_s: Warmup duration in seconds.
+        run_s: Active run duration in seconds.
+        cooldown_s: Cooldown duration in seconds.
+        broker: MQTT broker host.
+        port: MQTT broker port.
+        seed: RNG seed for reproducibility.
+        use_mic: Enable microphone sensor.
+        use_temp: Enable temperature sensor.
+        mic_sr: Mic sample rate in Hz.
+        mic_frame_ms: Mic frame size in milliseconds.
+        mic_alpha: Mic EWMA alpha.
+        mic_tau_fixed: Mic fixed tau threshold.
+        mic_kbits: Mic quantization bits.
+        mic_heartbeat_s: Mic heartbeat interval in seconds.
+        temp_hz: Temperature sample rate in Hz.
+        temp_alpha: Temp EWMA alpha.
+        temp_tau_fixed: Temp fixed tau threshold.
+        temp_kbits: Temp quantization bits.
+        temp_heartbeat_s: Temp heartbeat interval in seconds.
+        arms_path: Policy arms YAML path.
+        modes: Policy modes to run.
+        profiles: Link profiles to apply.
+        claim_batch: Outbox claim batch size.
+        max_inflight: Outbox max inflight count.
+        with_collector: Run collector subprocess when True.
+        tc_var_period_s: Optional cellular_var toggle period override.
+        repeats: Scenario repeat count.
+        collector_flush_interval_s: Collector flush interval in seconds.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Values are passed to subprocess CLI arguments verbatim.
+
+    Failure Modes:
+        - Invalid values surface as subprocess or CLI errors.
+    """
     device_id: str = "rpi5-01"
     device_config: str | None = "configs/device.yaml"
     iface: str = "eth0"
@@ -90,6 +149,29 @@ class ExperimentPlan:
 
 @dataclass(slots=True)
 class Scenario:
+    """Resolved scenario derived from a plan.
+
+    Args:
+        profile: LinkProfile to apply.
+        mode: PolicyMode to run.
+        name: Scenario name used for output folder.
+        out_dir: Output directory for artifacts.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - out_dir is unique per scenario.
+
+    Failure Modes:
+        - None.
+    """
     profile: LinkProfile
     mode: PolicyMode
     name: str
@@ -97,6 +179,26 @@ class Scenario:
 
 
 class ScenarioRunner:
+    """Runner that executes scenarios sequentially.
+
+    Args:
+        plan: ExperimentPlan with runtime parameters.
+
+    Returns:
+        None.
+
+    Raises:
+        None.
+
+    Side Effects:
+        - Starts/stops subprocesses and applies tc profiles.
+
+    Contract:
+        - Ensures cleanup on completion or signal.
+
+    Failure Modes:
+        - Subprocess failures are logged and terminate the run.
+    """
     def __init__(self, plan: ExperimentPlan):
         self.plan = plan
         self._stop = False
@@ -110,6 +212,26 @@ class ScenarioRunner:
     # --------- 공개 메서드 ---------
 
     def run_all(self, scenarios: Iterable[Scenario]) -> None:
+        """Run all scenarios in order until completion or stop.
+
+        Args:
+            scenarios: Iterable of Scenario objects to execute.
+
+        Returns:
+            None.
+
+        Raises:
+            None.
+
+        Side Effects:
+            - Executes subprocesses and applies tc profiles per scenario.
+
+        Contract:
+            - Stops early when a termination signal is received.
+
+        Failure Modes:
+            - Subprocess errors bubble up through _run_one handling.
+        """
         for sc in scenarios:
             if self._stop:
                 break
@@ -338,6 +460,26 @@ class ScenarioRunner:
 # ---------- 헬퍼 ----------
 
 def build_scenarios(plan: ExperimentPlan) -> list[Scenario]:
+    """Build the scenario list and initialize run metadata.
+
+    Args:
+        plan: Experiment plan to expand into scenarios.
+
+    Returns:
+        List of Scenario objects.
+
+    Raises:
+        ValueError: If plan modes or profiles are invalid.
+
+    Side Effects:
+        - Creates the run root directory and writes plan metadata files.
+
+    Contract:
+        - Scenario names are stable across repeats.
+
+    Failure Modes:
+        - File I/O errors propagate during metadata writes.
+    """
     root = _run_root(plan)
     scenarios: list[Scenario] = []
     for prof_s in plan.profiles:
@@ -453,6 +595,26 @@ def _env_snapshot() -> dict:
 # ---------- CLI ----------
 
 def parse_args(argv: list[str] | None = None) -> ExperimentPlan:
+    """Parse CLI arguments and build an ExperimentPlan.
+
+    Args:
+        argv: Optional argument list for testing; defaults to sys.argv.
+
+    Returns:
+        ExperimentPlan instance populated from CLI and config defaults.
+
+    Raises:
+        SystemExit: If configs are invalid or required inputs are missing.
+
+    Side Effects:
+        - Reads device/link config files to fill defaults.
+
+    Contract:
+        - Requires at least one sensor to be enabled.
+
+    Failure Modes:
+        - Invalid configs exit the process with error.
+    """
     pre = argparse.ArgumentParser(add_help=False)
     pre.add_argument("--device-config", default="configs/device.yaml")
     pre.add_argument("--link-profiles-config", default="configs/link_profiles.yaml")
@@ -651,6 +813,26 @@ def _opt_path(value: str | None) -> str | None:
 
 
 def main():
+    """CLI entry point for the experiment runner.
+
+    Args:
+        None.
+
+    Returns:
+        None.
+
+    Raises:
+        SystemExit: If argument parsing or scenario execution fails.
+
+    Side Effects:
+        - Executes tc shaping and subprocess runs per scenario.
+
+    Contract:
+        - Runs scenarios sequentially using the provided plan.
+
+    Failure Modes:
+        - Propagates SystemExit on fatal errors.
+    """
     plan = parse_args()
     scenarios = build_scenarios(plan)
     runner = ScenarioRunner(plan)
