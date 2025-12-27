@@ -197,7 +197,7 @@ def test_end_to_end_mqtt_collector_analyze(tmp_path: Path) -> None:
         )
         lines: Queue[str] = Queue()
         _spawn_reader(proc, lines)
-        _wait_for_substring(lines, "subscribed topics.", timeout_s=15.0)
+        _wait_for_substring(lines, "subscribed topics", timeout_s=15.0)
 
         device_id = "dev1"
         profile = LinkProfile.SLOW_10KBPS
