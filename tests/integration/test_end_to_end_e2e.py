@@ -234,7 +234,7 @@ def test_end_to_end_mqtt_collector_analyze(tmp_path: Path) -> None:
         _publish_events(host, port, events_unique)
 
         # Ensure duplicates are sent after at least one flush (tests cross-flush de-dup).
-        _wait_for_substring(lines, "[collector] flush:", timeout_s=15.0)
+        _wait_for_substring(lines, "flush events+=", timeout_s=15.0)
         dup_events = [
             _ev(2, PolicyMode.PERIODIC, tau=-1e-9),
             _ev(7, PolicyMode.FIXED_TAU, tau=0.2),
