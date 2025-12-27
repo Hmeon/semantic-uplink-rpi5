@@ -37,6 +37,14 @@ def _docker(*args: str, timeout_s: float = 30.0) -> str:
     return out.strip()
 
 
+def _extract_container_id(output: str) -> str:
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    for line in reversed(lines):
+        if len(line) >= 12 and all(c in "0123456789abcdef" for c in line.lower()):
+            return line
+    raise RuntimeError(f"failed to extract container id from docker output: {output!r}")
+
+
 def _wait_for_tcp(host: str, port: int, *, timeout_s: float = 10.0) -> None:
     deadline = time.time() + timeout_s
     last_err: Exception | None = None
@@ -87,7 +95,7 @@ def _mosquitto_broker(tmp_path: Path) -> Iterator[tuple[str, int]]:
     )
 
     try:
-        container_id = _docker(
+        container_out = _docker(
             "run",
             "-d",
             "--rm",
@@ -98,6 +106,7 @@ def _mosquitto_broker(tmp_path: Path) -> Iterator[tuple[str, int]]:
             "eclipse-mosquitto:2.0.18",
             timeout_s=60.0,
         )
+        container_id = _extract_container_id(container_out)
     except subprocess.CalledProcessError as exc:
         pytest.skip(f"docker unavailable/unhealthy: {exc.output}")
 

@@ -5,8 +5,8 @@
   and updated AIoT policy weights/safety.
 - Final 3h comparison generated: `results/final_compare_3h_slow_10kbps`
   (inputs: `artifacts/slow10_*_3h_B/logs`).
-- Outcome: rate target met, AoI target not met, MAE target met; adaptive best
-  trade-off vs fixed_tau.
+- Outcome: rate target met, MAE target met (<=10% vs fixed_tau), AoI target met
+  (>=15% vs fixed_tau), adaptive best trade-off vs fixed_tau.
 
 ## 2025-12-22
 - Added 3-policy automated sequence runner (`scripts/run_3h_sequence.sh`) with NTP freeze support.

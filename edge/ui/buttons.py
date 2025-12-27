@@ -5,14 +5,23 @@
 from __future__ import annotations
 
 import logging
+import os
+import sys
 from dataclasses import dataclass
 from typing import Callable, Optional
 
-try:
-    from gpiozero import Button
-    from gpiozero.exc import BadPinFactory, PinFactoryFallback
-except ImportError:
-    Button = None
+def _load_gpiozero():
+    if os.environ.get("PYTEST_CURRENT_TEST") and "gpiozero" not in sys.modules:
+        return None, None, None
+    try:
+        from gpiozero import Button
+        from gpiozero.exc import BadPinFactory, PinFactoryFallback
+        return Button, BadPinFactory, PinFactoryFallback
+    except ImportError:
+        return None, None, None
+
+
+Button, BadPinFactory, PinFactoryFallback = _load_gpiozero()
 
 __all__ = ["ButtonsConfig", "Buttons", "ButtonsInitError"]
 
