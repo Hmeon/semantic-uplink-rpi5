@@ -286,7 +286,9 @@ def test_end_to_end_mqtt_collector_analyze(tmp_path: Path) -> None:
 
     summary_path = out_dir / "metrics_summary.csv"
     cmp_path = out_dir / "metrics_vs_periodic.csv"
-    figs_dir = out_dir / "figures"
+    figs_dir = out_dir / "figs"
+    if not figs_dir.exists():
+        figs_dir = out_dir / "figures"
     assert summary_path.exists()
     assert cmp_path.exists()
     assert figs_dir.exists()
