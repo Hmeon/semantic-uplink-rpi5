@@ -1,6 +1,6 @@
 <div align="center">
   <h1>Semantic Uplink (RPi5)</h1>
-  <p>AIoT semantic uplink on Raspberry Pi 5: EWMA event triggers + LinUCB policy over MQTT with tc/netem link profiles.</p>
+  <p>Raspberry Pi 5 기반 AIoT 시맨틱 업링크: EWMA 이벤트 트리거 + MQTT 상의 LinUCB 정책, 그리고 tc/netem 링크 프로파일.</p>
   <p>
     <a href="https://github.com/Hmeon/semantic-uplink-rpi5/actions/workflows/ci.yaml"><img alt="CI" src="https://github.com/Hmeon/semantic-uplink-rpi5/actions/workflows/ci.yaml/badge.svg"></a>
     <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-blue">
@@ -9,66 +9,66 @@
     <a href="pyproject.toml"><img alt="Status PoC" src="https://img.shields.io/badge/Status-PoC-2F855A"></a>
   </p>
   <p>
-    <a href="#docs">Docs</a> &middot; <a href="#quickstart">Quickstart</a> &middot; <a href="#hardware">Hardware</a> &middot; <a href="#experiments">Experiments</a> &middot; <a href="#contributing">Contributing</a> &middot; <a href="#license">License</a>
+    <a href="#docs">문서</a> &middot; <a href="#quickstart">빠른 시작</a> &middot; <a href="#system-overview">시스템 개요</a> &middot; <a href="#hardware">하드웨어</a> &middot; <a href="#experiments">실험/평가</a> &middot; <a href="#contributing">기여</a> &middot; <a href="#license">라이선스</a>
   </p>
 </div>
 
 > [!NOTE]
-> Project status: PoC (explicit in `pyproject.toml`; PoC ranges are referenced in `common/quantize.py` and `common/schema.py`).
+> 프로젝트 상태는 PoC다. 근거는 `pyproject.toml`에 명시되어 있으며, PoC 범위/가정은 `common/quantize.py`, `common/schema.py`에도 반영되어 있다.
 
-## What It Is / Why It Matters
-Semantic Uplink is an edge-to-collector pipeline that sends only meaningful sensor changes over constrained links. It uses an EWMA predictor to compute residuals, quantizes values to reduce payload size, and (in adaptive mode) uses a LinUCB contextual bandit to choose `(tau, kbits)` based on link/queue feedback.
+## 무엇이며, 왜 중요한가
+Semantic Uplink는 제한된 링크 환경에서 **의미 있는 변화만** 전송하도록 구성한 edge-to-collector 파이프라인이다. EWMA 예측기로 잔차(residual)를 계산하고, 전송 시에는 값(또는 잔차)을 양자화(quantize)해 페이로드를 줄인다. 적응형 모드에서는 LinUCB 컨텍스추얼 밴딧으로 링크/큐 피드백을 바탕으로 `(tau, kbits)`를 선택한다.
 
-- Problem: constrained links force a trade-off between update freshness (AoI), accuracy (MAE), and uplink rate.
-- Approach: event-triggered transmission with per-event quantization and adaptive policy selection.
-- Reproducible here: edge -> MQTT -> collector -> analysis pipeline plus tc/netem link profiles and experiment runners.
+- 문제: 제한된 링크에서는 정보 신선도(AoI), 정확도(MAE), 업링크 전송량(rate) 사이의 트레이드오프가 강제된다.
+- 접근: 이벤트 기반 전송(event-trigger) + 이벤트별 양자화 + (옵션) 적응형 정책 선택.
+- 재현 범위: edge → MQTT → collector → 분석 파이프라인, 그리고 tc/netem 링크 프로파일 및 실험 러너까지 포함한다.
 
-## Table of Contents
-- [Docs](#docs)
-- [Quickstart](#quickstart)
-- [System Overview](#system-overview)
-- [Hardware](#hardware)
-- [Software](#software)
-- [Configuration](#configuration)
-- [Running & Development](#running--development)
-- [Experiments & Evaluation](#experiments--evaluation)
-- [Troubleshooting](#troubleshooting)
-- [Contributing](#contributing)
-- [License & Citation](#license--citation)
-- [Appendix](#appendix)
+## 목차
+- [문서](#docs)
+- [빠른 시작](#quickstart)
+- [시스템 개요](#system-overview)
+- [하드웨어](#hardware)
+- [소프트웨어](#software)
+- [설정](#configuration)
+- [실행 및 개발](#running--development)
+- [실험 및 평가](#experiments--evaluation)
+- [트러블슈팅](#troubleshooting)
+- [기여](#contributing)
+- [라이선스 및 인용](#license--citation)
+- [부록](#appendix)
 
 <a id="docs"></a>
-## Docs
-| Document | Description |
+## 문서
+| 문서 | 설명 |
 | --- | --- |
-| `docs/hardware.md` | Wiring diagram and pin map. |
-| `docs/final/_entrypoints.md` | Verified CLI entrypoints and scripts. |
-| `docs/final/FINAL_EVALUATION.md` | Final 3-hour comparison, dataset paths, and exact CLI options. |
-| `docs/final/OPERATIONAL_READINESS.md` | RPi5 install/run notes and operational guidance. |
-| `docs/metrics/FIGURE_NAMING.md` | Plot naming conventions for analysis outputs. |
-| `docs/metrics/LABEL_STYLE.md` | Plot label style guidelines. |
+| `docs/hardware.md` | 배선도(wiring) 및 핀 맵(pin map). |
+| `docs/final/_entrypoints.md` | 검증된 CLI 엔트리포인트 및 스크립트 목록. |
+| `docs/final/FINAL_EVALUATION.md` | 최종 3시간 비교 실험, 데이터셋 경로, 정확한 CLI 옵션. |
+| `docs/final/OPERATIONAL_READINESS.md` | RPi5 설치/실행 메모 및 운영 관점 가이드. |
+| `docs/metrics/FIGURE_NAMING.md` | 분석 산출물(플롯) 파일명 규칙. |
+| `docs/metrics/LABEL_STYLE.md` | 플롯 라벨 스타일 가이드. |
 
 <a id="quickstart"></a>
-## Quickstart
+## 빠른 시작
 
-### Local dev (mock temp + console UI)
+### 로컬 개발(모의 온도 + 콘솔 UI)
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
 
-Terminal A (broker):
+터미널 A (브로커):
 ```bash
 mosquitto -c infra/mosquitto/mosquitto.conf
 ```
 
-Terminal B (collector):
+터미널 B (컬렉터):
 ```bash
 python -m collector.collector --run-dir artifacts/run1 --broker localhost --port 1883
 ```
 
-Terminal C (edge, mock temp):
+터미널 C (엣지, 모의 온도):
 ```bash
 python -m edge.edge_daemon \
   --device-id dev1 \
@@ -79,9 +79,9 @@ python -m edge.edge_daemon \
 ```
 
 > [!NOTE]
-> The broker command requires `mosquitto` in PATH (`infra/mosquitto/mosquitto.conf` is a local config).
+> 브로커 실행은 `mosquitto` 바이너리가 PATH에 있어야 한다. 설정 파일은 레포의 `infra/mosquitto/mosquitto.conf`를 사용한다.
 
-### RPi5 stack (hardware)
+### RPi5 스택(실하드웨어)
 ```bash
 python -m venv .venv
 source .venv/bin/activate
@@ -90,46 +90,46 @@ bash scripts/run_stack.sh
 ```
 
 > [!NOTE]
-> `scripts/run_stack.sh` uses tc/netem by default (`TC_ENABLE=1`); set `TC_ENABLE=0` if you do not want shaping or lack `CAP_NET_ADMIN`.
+> `scripts/run_stack.sh`는 기본적으로 tc/netem을 활성화한다(`TC_ENABLE=1`). 트래픽 셰이핑이 필요 없거나 `CAP_NET_ADMIN` 권한이 없다면 `TC_ENABLE=0`으로 비활성화한다.
 
 <a id="system-overview"></a>
-## System Overview
+## 시스템 개요
 
-### Architecture
+### 아키텍처
 ```mermaid
 flowchart LR
-  subgraph Edge["RPi5 edge node"]
-    Mic["Mic RMS (USB)"]
-    Temp["Temp sensor (DS18B20 / sysfs)"]
-    Pred["EWMA predictor + residual"]
-    Policy["Policy runtime\nperiodic | fixed_tau | adaptive (LinUCB)"]
-    Quant["Uniform quantizer (kbits)"]
-    Outbox["SQLite outbox"]
-    Pub["MQTT publisher (QoS1)"]
+  subgraph Edge["RPi5 엣지 노드"]
+    Mic["마이크 RMS (USB)"]
+    Temp["온도 센서 (DS18B20 / sysfs)"]
+    Pred["EWMA 예측기 + 잔차(residual)"]
+    Policy["정책 런타임\nperiodic | fixed_tau | adaptive (LinUCB)"]
+    Quant["균일 양자화기(kbits)"]
+    Outbox["SQLite 아웃박스"]
+    Pub["MQTT 퍼블리셔(QoS1)"]
     UI["UI (lcd1602/ssd1306/console)"]
-    Buttons["GPIO buttons"]
+    Buttons["GPIO 버튼"]
     RTC["RTC (DS3231)"]
     Mic --> Pred
     Temp --> Pred
     Pred --> Policy --> Quant --> Outbox --> Pub
   end
-  Shaper["tc/netem link profiles"]:::opt
-  Broker["Mosquitto broker"]
-  Collector["Collector\n(dedup + Parquet/CSV)"]
-  Analyzer["Analyzer\n(AoI/Rate/MAE + plots)"]
+  Shaper["tc/netem 링크 프로파일"]:::opt
+  Broker["Mosquitto 브로커"]
+  Collector["컬렉터\n(중복 제거 + Parquet/CSV)"]
+  Analyzer["분석기\n(AoI/Rate/MAE + 플롯)"]
 
   Pub --> Shaper --> Broker --> Collector --> Analyzer
-  Outbox -.ack/loss.-> Policy
-  Policy -.status.-> UI
-  Buttons -.mode/profile/marker.-> Policy
-  RTC -.time sync.-> Pred
+  Outbox -.ACK/손실.-> Policy
+  Policy -.상태.-> UI
+  Buttons -.모드/프로파일/마커.-> Policy
+  RTC -.시간 동기.-> Pred
 
   classDef opt fill:#f9f9f9,stroke:#888,stroke-dasharray: 4 4;
 ```
 
-![Architecture diagram (Korean labels)](docs/figma/architecture_ko.png)
+![아키텍처 다이어그램(한글 라벨)](docs/figma/architecture_ko.png)
 
-### Dataflow
+### 데이터플로우
 ```mermaid
 sequenceDiagram
   participant Sensor as Sensor (mic_rms/temp)
@@ -145,120 +145,120 @@ sequenceDiagram
   Outbox->>Broker: publish QoS1
   Broker->>Collector: edge/{device}/{sensor}/event
   Collector->>Collector: de-dup + write logs
-  Note over Edge,Collector: adaptive mode also publishes policy/{device}/decision
+  Note over Edge,Collector: adaptive 모드는 policy/{device}/decision도 발행한다
 ```
 
-![Pipeline diagram (Korean labels)](docs/figma/pipeline_ko.png)
+![파이프라인 다이어그램(한글 라벨)](docs/figma/pipeline_ko.png)
 
-![End-to-end sequence diagram (Korean labels)](docs/figma/sequence_ko.png)
+![E2E 시퀀스 다이어그램(한글 라벨)](docs/figma/sequence_ko.png)
 
-### Adaptive policy (LinUCB)
-- Action space: `(tau, kbits)` arms from `configs/policy*.yaml` (required for adaptive mode).
-- Context vector: `[1, aoi_norm, |res|_norm, resvar_norm, loss, qlen_norm]` where AoI includes ACK delay and `qlen_norm = q_len / 50` (`edge/policy/linucb.py`, `edge/policy/runtime.py`).
-- Reward: `r = -(w_aoi * aoi/aoi_scale + w_mae * mae/mae_scale + w_rate * rate/rate_scale)` (`edge/policy/linucb.py`).
-- Update rule: per-arm ridge regression with `A <- A + x x^T`, `b <- b + r x`; selection uses `score = theta^T x + alpha_ucb * sqrt(x^T A^-1 x)` (`edge/policy/linucb.py`).
-- Safety/exploration: AoI or MAE violations force a safe arm; defaults are `alpha_ucb=0.75`, `lambda_ridge=1.0`, `warmup_per_arm=1` (`edge/policy/linucb.py`).
+### 적응형 정책(LinUCB)
+- 행동 공간(action space): `configs/policy*.yaml`에서 `(tau, kbits)` arm을 정의한다(적응형 모드에 필요).
+- 컨텍스트 벡터(context vector): `[1, aoi_norm, |res|_norm, resvar_norm, loss, qlen_norm]`. AoI에는 ACK 지연이 포함되며, `qlen_norm = q_len / 50`이다(`edge/policy/linucb.py`, `edge/policy/runtime.py`).
+- 보상(reward): `r = -(w_aoi * aoi/aoi_scale + w_mae * mae/mae_scale + w_rate * rate/rate_scale)` (`edge/policy/linucb.py`).
+- 업데이트(update): arm별 ridge regression을 사용한다. `A <- A + x x^T`, `b <- b + r x`. 선택은 `score = theta^T x + alpha_ucb * sqrt(x^T A^-1 x)`로 계산한다(`edge/policy/linucb.py`).
+- 안전/탐색: AoI 또는 MAE 위반 시 안전 arm으로 강제 전환한다. 기본값은 `alpha_ucb=0.75`, `lambda_ridge=1.0`, `warmup_per_arm=1`이다(`edge/policy/linucb.py`).
 
-![LinUCB state diagram (Korean labels)](docs/figma/linucb_state_ko.png)
+![LinUCB 상태 다이어그램(한글 라벨)](docs/figma/linucb_state_ko.png)
 
-### Quantization
-- Uniform mid-tread quantizer with `kbits` in [1, 16] (`common/quantize.py`).
-- Default ranges: mic_rms [-80, 0] dBFS, temp [0, 50] C (`common/quantize.py`).
+### 양자화(Quantization)
+- 균일(mid-tread) 양자화기를 사용하며, `kbits` 범위는 [1, 16]이다(`common/quantize.py`).
+- 기본 구간(range): mic_rms [-80, 0] dBFS, temp [0, 50] °C (`common/quantize.py`).
 
-### Directory map
-| Path | Contents |
+### 디렉터리 맵
+| 경로 | 내용 |
 | --- | --- |
-| `common/` | Shared schemas, metrics, JSON helpers, config validation. |
-| `edge/` | Sensors, prediction, policy runtime, uploader, UI, RTC. |
-| `collector/` | MQTT subscriber, de-dup, Parquet/CSV sink, analysis tools. |
-| `link/` | tc/netem link shaping profiles and helpers. |
-| `stack/` | Single-Pi supervisor for broker + collector + edge. |
-| `experiments/` | Scenario runner for profile x mode matrices. |
-| `configs/` | Device, policy, and link profile YAMLs. |
-| `scripts/` | Run scripts, systemd install, benchmarks. |
-| `infra/` | Mosquitto config and systemd env example. |
-| `docs/` | Hardware notes, final reports, and plot conventions. |
-| `tests/` | Unit and integration tests. |
+| `common/` | 공통 스키마, 메트릭, JSON 헬퍼, 설정 검증. |
+| `edge/` | 센서, 예측, 정책 런타임, 업로더, UI, RTC. |
+| `collector/` | MQTT 구독, 중복 제거, Parquet/CSV 저장, 분석 도구. |
+| `link/` | tc/netem 링크 셰이핑 프로파일 및 헬퍼. |
+| `stack/` | 단일 Pi에서 broker + collector + edge를 관리하는 스택. |
+| `experiments/` | 프로파일 × 모드 매트릭스 실행기. |
+| `configs/` | 디바이스/정책/링크 프로파일 YAML. |
+| `scripts/` | 실행 스크립트, systemd 설치, 벤치마크. |
+| `infra/` | Mosquitto 설정 및 systemd 환경 예시. |
+| `docs/` | 하드웨어 노트, 최종 보고서, 플롯 규칙. |
+| `tests/` | 유닛/통합 테스트. |
 
 <a id="hardware"></a>
-## Hardware
+## 하드웨어
 
-### Bill of materials
-| Part | Qty | Notes | Repo reference |
+### 부품 목록(Bill of Materials)
+| 부품 | 수량 | 비고 | 레포 참조 |
 | --- | --- | --- | --- |
-| Raspberry Pi 5 (8GB) | 1 | Edge node. | `docs/hardware.md` |
-| DS18B20 temperature sensor | 1 | 1-Wire temp input. | `docs/hardware.md`, `edge/sensors/temp.py` |
-| USB mic + USB soundcard | 1 | RMS dBFS input. | `docs/hardware.md`, `edge/sensors/mic_rms.py` |
-| 1602 LCD + PCF8574 backpack | 1 | I2C status display (0x27 / 0x3F). | `docs/hardware.md`, `edge/ui/lcd.py` |
-| Momentary buttons (MODE/LINK/MARKER) | 3 | GPIO active-low with pull-ups. | `docs/hardware.md`, `edge/ui/buttons.py` |
-| 4.7k pull-up resistor | 1 | DS18B20 data line. | `docs/hardware.md` |
-| DS3231 RTC (optional) | 1 | I2C RTC at 0x68. | `docs/hardware.md`, `edge/rtc/ds3231.py` |
-| Buzzer (optional) | 1 | GPIO18, active-high. | `docs/hardware.md` |
+| Raspberry Pi 5 (8GB) | 1 | 엣지 노드. | `docs/hardware.md` |
+| DS18B20 온도 센서 | 1 | 1-Wire 온도 입력. | `docs/hardware.md`, `edge/sensors/temp.py` |
+| USB 마이크 + USB 사운드카드 | 1 | RMS dBFS 입력. | `docs/hardware.md`, `edge/sensors/mic_rms.py` |
+| 1602 LCD + PCF8574 백팩 | 1 | I2C 상태 표시(0x27 / 0x3F). | `docs/hardware.md`, `edge/ui/lcd.py` |
+| 택트 스위치(MODE/LINK/MARKER) | 3 | GPIO active-low(pull-up). | `docs/hardware.md`, `edge/ui/buttons.py` |
+| 4.7k 풀업 저항 | 1 | DS18B20 데이터 라인. | `docs/hardware.md` |
+| DS3231 RTC(옵션) | 1 | I2C RTC(0x68). | `docs/hardware.md`, `edge/rtc/ds3231.py` |
+| 버저(옵션) | 1 | GPIO18, active-high. | `docs/hardware.md` |
 
-### Wiring / pin map (BCM)
-| Signal | RPi pin | Device | Notes |
+### 배선 / 핀 맵(BCM)
+| 신호 | RPi 핀 | 장치 | 비고 |
 | --- | --- | --- | --- |
-| I2C1 SDA | 3 (BCM2) | LCD backpack | `0x27` default, `0x3F` fallback. |
-| I2C1 SCL | 5 (BCM3) | LCD backpack | I2C bus 1. |
-| 1-Wire data | 7 (BCM4) | DS18B20 | 4.7k pull-up to 3V3. |
-| Button MODE | 11 (BCM17) | GPIO button | Internal pull-up, active-low. |
-| Button LINK | 13 (BCM27) | GPIO button | Internal pull-up, active-low. |
-| Button MARKER | 15 (BCM22) | GPIO button | Internal pull-up, active-low. |
-| Buzzer (opt) | 12 (BCM18) | Buzzer | Active-high to GND. |
-| USB | USB-A | Mic/Soundcard | RMS dBFS input. |
+| I2C1 SDA | 3 (BCM2) | LCD 백팩 | 기본 `0x27`, 대체 `0x3F`. |
+| I2C1 SCL | 5 (BCM3) | LCD 백팩 | I2C bus 1. |
+| 1-Wire data | 7 (BCM4) | DS18B20 | 3V3로 4.7k 풀업. |
+| Button MODE | 11 (BCM17) | GPIO 버튼 | 내부 pull-up, active-low. |
+| Button LINK | 13 (BCM27) | GPIO 버튼 | 내부 pull-up, active-low. |
+| Button MARKER | 15 (BCM22) | GPIO 버튼 | 내부 pull-up, active-low. |
+| Buzzer(옵션) | 12 (BCM18) | 버저 | active-high to GND. |
+| USB | USB-A | 마이크/사운드카드 | RMS dBFS 입력. |
 
-### RPi prerequisites
-- Enable 1-Wire: `dtoverlay=w1-gpio,gpiopin=4` (`docs/hardware.md`).
-- Enable I2C (`i2c_arm`) and verify `/dev/i2c-1` (`docs/hardware.md`).
-- Buttons use internal pull-ups; wire to ground for active-low presses.
+### RPi 사전 준비
+- 1-Wire 활성화: `dtoverlay=w1-gpio,gpiopin=4` (`docs/hardware.md`).
+- I2C 활성화(`i2c_arm`) 후 `/dev/i2c-1` 확인(`docs/hardware.md`).
+- 버튼은 내부 pull-up을 사용한다. GND로 연결하면 active-low 입력이 된다.
 
 > [!WARNING]
-> Audio privacy: the mic pipeline computes RMS dBFS only; raw audio is never stored or transmitted (`edge/sensors/mic_rms.py`).
+> 오디오 프라이버시: 마이크 파이프라인은 RMS dBFS만 계산한다. 원시 오디오는 저장하거나 전송하지 않는다(`edge/sensors/mic_rms.py`).
 
 > [!NOTE]
-> `lora_sf10` and `lora_sf12` are tc/netem profiles (IP-level approximation only), not LoRaWAN simulations (`link/shaper/tc_profiles.py`).
+> `lora_sf10`, `lora_sf12`는 tc/netem 프로파일(IP 레벨 근사)이다. LoRaWAN 시뮬레이션이 아니다(`link/shaper/tc_profiles.py`).
 
 <a id="software"></a>
-## Software
+## 소프트웨어
 
-### Runtime requirements
-| Component | Requirement | Evidence |
+### 런타임 요구사항
+| 구성요소 | 요구사항 | 근거 |
 | --- | --- | --- |
 | Python | >= 3.10 | `pyproject.toml` |
-| MQTT broker | Mosquitto binary in PATH | `stack/pi_stack.py`, `infra/mosquitto/mosquitto.conf` |
-| tc/netem | Linux + `CAP_NET_ADMIN` (or root) | `link/shaper/tc_profiles.py` |
+| MQTT 브로커 | Mosquitto 바이너리(PAT H 필요) | `stack/pi_stack.py`, `infra/mosquitto/mosquitto.conf` |
+| tc/netem | Linux + `CAP_NET_ADMIN`(또는 root) | `link/shaper/tc_profiles.py` |
 
-### Install
+### 설치
 ```bash
 python -m venv .venv
 source .venv/bin/activate
 pip install -e .
 ```
 
-Optional extras from `pyproject.toml`:
-| Extra | Adds | Used by |
+`pyproject.toml`의 선택 설치(extra):
+| extra | 추가되는 것 | 사용 위치 |
 | --- | --- | --- |
-| `analysis` | matplotlib | `collector/analyze.py` plots |
+| `analysis` | matplotlib | `collector/analyze.py` 플롯 |
 | `hw` | smbus2, gpiozero, rpi-lgpio | `edge/ui/lcd.py`, `edge/ui/buttons.py`, `edge/rtc/ds3231.py` |
 | `dev` | pytest, ruff | `.github/workflows/ci.yaml`, `scripts/health_check.sh` |
 
-Alternative (non-editable) install:
+편집 설치(-e)가 아닌 대안 설치:
 ```bash
 pip install -r requirements.txt
 ```
 
 <a id="configuration"></a>
-## Configuration
-Key config files:
-| File | Purpose | Used by |
+## 설정
+주요 설정 파일:
+| 파일 | 목적 | 사용 위치 |
 | --- | --- | --- |
-| `configs/device.yaml` | Device id, sensors, UI, MQTT defaults. | `edge/edge_daemon.py`, `experiments/run_scenarios.py` |
-| `configs/policy.yaml` | Adaptive arms + reward + safety. | `edge/edge_daemon.py`, `collector/analyze.py` |
-| `configs/policy_adaptive_*.yaml` | Policy presets (AIoT, quality, etc.). | `edge/edge_daemon.py`, `scripts/run_3h_sequence.sh` |
-| `configs/link_profiles.yaml` | tc/netem profiles. | `link/shaper/tc_profiles.py`, `stack/pi_stack.py`, `experiments/run_scenarios.py` |
-| `infra/systemd/semantic-uplink-stack.env.example` | Env overrides for `scripts/run_stack.sh`. | `scripts/run_stack.sh` |
+| `configs/device.yaml` | device id, 센서, UI, MQTT 기본값. | `edge/edge_daemon.py`, `experiments/run_scenarios.py` |
+| `configs/policy.yaml` | 적응형 arm + reward + safety. | `edge/edge_daemon.py`, `collector/analyze.py` |
+| `configs/policy_adaptive_*.yaml` | 정책 프리셋(AIoT, 품질 등). | `edge/edge_daemon.py`, `scripts/run_3h_sequence.sh` |
+| `configs/link_profiles.yaml` | tc/netem 프로파일. | `link/shaper/tc_profiles.py`, `stack/pi_stack.py`, `experiments/run_scenarios.py` |
+| `infra/systemd/semantic-uplink-stack.env.example` | `scripts/run_stack.sh`의 환경변수 오버라이드 예시. | `scripts/run_stack.sh` |
 
-Example policy YAML (`configs/policy.yaml`):
+정책 YAML 예시(`configs/policy.yaml`):
 ```yaml
 arms:
   - { tau: 1.5, kbits: 6 }
@@ -273,7 +273,7 @@ safety:
   mae_max: 2.0
 ```
 
-Example device YAML (`configs/device.yaml`):
+디바이스 YAML 예시(`configs/device.yaml`):
 ```yaml
 device_id: rpi5a
 sensors:
@@ -290,47 +290,48 @@ mqtt:
   port: 1883
 ```
 
-Environment variables used in scripts:
-- `SEMUP_SEED` sets the edge RNG seed (`edge/edge_daemon.py`).
-- `RUN_DIR`, `DEVICE_CONFIG`, `POLICY_ARMS`, `BROKER_HOST`, `BROKER_PORT`, `TC_IFACE` (see `infra/systemd/semantic-uplink-stack.env.example`).
+스크립트에서 사용하는 환경변수:
+- `SEMUP_SEED`: 엣지 RNG seed를 설정한다(`edge/edge_daemon.py`).
+- `RUN_DIR`, `DEVICE_CONFIG`, `POLICY_ARMS`, `BROKER_HOST`, `BROKER_PORT`, `TC_IFACE` (`infra/systemd/semantic-uplink-stack.env.example` 참고).
 
 > [!IMPORTANT]
-> Analyzer webhooks (`collector/analyze.py --discord-webhook`) should be provided via secrets or local env files. Do not commit real URLs or tokens.
+> 분석기 웹훅(`collector/analyze.py --discord-webhook`)은 시크릿 또는 로컬 env 파일로 주입해야 한다. 실제 URL/토큰을 커밋하지 않는다.
 
 <a id="running--development"></a>
-## Running & Development
-| Task | Command |
+## 실행 및 개발
+| 작업 | 명령 |
 | --- | --- |
-| Edge daemon (full device) | `python -m edge.edge_daemon --device-id rpi5-01 --profile slow_10kbps --mode adaptive --run-dir artifacts/run_rpi5 --device-config configs/device.yaml --arms configs/policy_adaptive_aiot.yaml` |
+| Edge daemon(실디바이스) | `python -m edge.edge_daemon --device-id rpi5-01 --profile slow_10kbps --mode adaptive --run-dir artifacts/run_rpi5 --device-config configs/device.yaml --arms configs/policy_adaptive_aiot.yaml` |
 | Collector | `python -m collector.collector --run-dir artifacts/run1 --broker localhost --port 1883` |
 | Analyze | `python -m collector.analyze --input artifacts/run1/logs --out results/run1 --diagnostic-plots --audit` |
-| Single-Pi stack | `bash scripts/run_stack.sh` |
-| Apply tc profile | `sudo python -m link.shaper.tc_profiles apply --iface lo --profile slow_10kbps` |
-| Scenario runner | `python -m experiments.run_scenarios --run-root artifacts/experiments --profiles slow_10kbps --modes periodic,fixed_tau,adaptive --no-mic --temp --with-collector` |
-| Policy benchmark | `python scripts/bench_policy_rpi5.py --steps 2000 --out artifacts/bench_policy_rpi5.csv` |
+| 단일 Pi 스택 | `bash scripts/run_stack.sh` |
+| tc 프로파일 적용 | `sudo python -m link.shaper.tc_profiles apply --iface lo --profile slow_10kbps` |
+| 시나리오 러너 | `python -m experiments.run_scenarios --run-root artifacts/experiments --profiles slow_10kbps --modes periodic,fixed_tau,adaptive --no-mic --temp --with-collector` |
+| 정책 벤치마크 | `python scripts/bench_policy_rpi5.py --steps 2000 --out artifacts/bench_policy_rpi5.csv` |
 
-Dev checks:
+개발 체크:
 ```bash
 ruff check .
 pytest -q
 ```
 
-You can also run `bash scripts/health_check.sh` for a combined pass.
+`bash scripts/health_check.sh`로 통합 점검을 수행할 수도 있다.
 
 <a id="experiments"></a>
-## Experiments & Evaluation
+## 실험 및 평가
 
-### Metrics (as implemented)
-| Metric | Definition | Where |
+<a id="experiments--evaluation"></a>
+### 메트릭(구현 기준)
+| 메트릭 | 정의 | 위치 |
 | --- | --- | --- |
-| Rate (B/s) | MQTT v3.1.1 publish size (topic + payload) aggregated over receiver time. | `collector/analyze.py`, `common/mqttutil.py` |
-| AoI mean / p95 (ms) | Age of Information from `t_recv_ns`; falls back to inter-event gaps. | `collector/analyze.py`, `common/metrics.py` |
-| MAE_event mean / p95 | Mean absolute residual `abs(res)` on events only. | `collector/analyze.py` |
+| Rate (B/s) | MQTT v3.1.1 publish 크기(topic + payload)를 수신 시간 기준으로 집계한다. | `collector/analyze.py`, `common/mqttutil.py` |
+| AoI mean / p95 (ms) | `t_recv_ns` 기준 AoI. 값이 없으면 inter-event gap로 대체한다. | `collector/analyze.py`, `common/metrics.py` |
+| MAE_event mean / p95 | 이벤트 시점 잔차 `abs(res)`의 평균 절대 오차. | `collector/analyze.py` |
 
 > [!NOTE]
-> MAE is event-based (residual at emit time), not full-signal MAE.
+> MAE는 전체 신호(full-signal) MAE가 아니라, **이벤트 시점의 잔차 기반** 지표다.
 
-### Reproduce scenarios (matrix runner)
+### 시나리오 재현(매트릭스 러너)
 ```bash
 python -m experiments.run_scenarios \
   --run-root artifacts/experiments \
@@ -339,16 +340,16 @@ python -m experiments.run_scenarios \
   --no-mic --temp --with-collector
 ```
 
-Outputs are stored under `artifacts/experiments/<timestamp>_<device_id>` with `plan.json` and `run_meta.json` (`experiments/run_scenarios.py`).
+출력은 `artifacts/experiments/<timestamp>_<device_id>` 아래에 저장된다. `plan.json`, `run_meta.json`이 함께 기록된다(`experiments/run_scenarios.py`).
 
-### 3-policy 3-hour sequence
+### 3정책 × 3시간 시퀀스
 ```bash
 PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
 ```
 
-See `scripts/run_3h_sequence.sh` for required environment variables (e.g., `W1_PATH`, `PROFILE`, `IFACE`, `ADAPTIVE_ARMS`).
+필수 환경변수는 `scripts/run_3h_sequence.sh`에 정의되어 있다(예: `W1_PATH`, `PROFILE`, `IFACE`, `ADAPTIVE_ARMS`).
 
-### Analyze logs
+### 로그 분석
 ```bash
 python -m collector.analyze \
   --input artifacts/slow10_periodic_3h_B/logs \
@@ -359,49 +360,49 @@ python -m collector.analyze \
   --plots --paper-plots --diagnostic-plots --ucb-timeseries --pareto-p95 --audit
 ```
 
-Reference report: `docs/final/FINAL_EVALUATION.md` (dataset and result paths).
+참조 보고서: `docs/final/FINAL_EVALUATION.md`(데이터셋/결과 경로 포함).
 
 <a id="troubleshooting"></a>
-## Troubleshooting
+## 트러블슈팅
 <details>
-<summary>Common issues</summary>
+<summary>자주 발생하는 이슈</summary>
 
-- `arecord` missing: the mic backend falls back to arecord when sounddevice is unavailable; install `alsa-utils` or use `--mic-backend sounddevice` (`edge/sensors/mic_rms.py`).
-- Parquet not written: if `pyarrow` is missing, the collector falls back to CSV (`collector/collector.py`).
-- LCD/RTC not found: install `.[hw]` or disable UI/RTC (`edge/ui/lcd.py`, `edge/rtc/ds3231.py`).
-- Buttons disabled: `gpiozero` missing or GPIO unavailable; install `.[hw]` or `--buttons-disable` (`edge/ui/buttons.py`).
-- tc/netem apply fails: requires root or `CAP_NET_ADMIN`; disable with `--tc-disable` or `TC_ENABLE=0` (`link/shaper/tc_profiles.py`).
-- DS18B20 not detected: set `--temp-backend sysfs`/`mock` or verify `/sys/bus/w1/devices/28-*/w1_slave` (`edge/sensors/temp.py`, `scripts/run_3h_sequence.sh`).
-- Broker connection errors: ensure mosquitto is running or let the stack auto-start it (`stack/pi_stack.py`).
-- AoI spikes: system time jumps; consider RTC or NTP stabilization (`edge/rtc/ds3231.py`, `scripts/run_3h_sequence.sh`).
+- `arecord`가 없음: `sounddevice`가 없을 때 마이크 백엔드가 arecord로 폴백한다. `alsa-utils`를 설치하거나 `--mic-backend sounddevice`를 사용한다(`edge/sensors/mic_rms.py`).
+- Parquet가 생성되지 않음: `pyarrow`가 없으면 collector가 CSV로 폴백한다(`collector/collector.py`).
+- LCD/RTC 미검출: `.[hw]`를 설치하거나 UI/RTC를 비활성화한다(`edge/ui/lcd.py`, `edge/rtc/ds3231.py`).
+- 버튼 비활성: `gpiozero`가 없거나 GPIO 접근이 불가한 상태다. `.[hw]` 설치 또는 `--buttons-disable` 사용(`edge/ui/buttons.py`).
+- tc/netem 적용 실패: root 또는 `CAP_NET_ADMIN` 권한이 필요하다. `--tc-disable` 또는 `TC_ENABLE=0`으로 비활성화한다(`link/shaper/tc_profiles.py`).
+- DS18B20 미검출: `--temp-backend sysfs`/`mock`를 점검하고, `/sys/bus/w1/devices/28-*/w1_slave`를 확인한다(`edge/sensors/temp.py`, `scripts/run_3h_sequence.sh`).
+- 브로커 연결 오류: mosquitto가 실행 중인지 확인한다. 스택 실행 시 자동으로 기동될 수도 있다(`stack/pi_stack.py`).
+- AoI 스파이크: 시스템 시간이 점프할 수 있다. RTC 사용 또는 NTP 안정화를 고려한다(`edge/rtc/ds3231.py`, `scripts/run_3h_sequence.sh`).
 
 </details>
 
 <a id="contributing"></a>
-## Contributing
-- Branch strategy: TODO (no CONTRIBUTING.md in repo; add one if needed).
-- Style: `ruff check .` (see `.github/workflows/ci.yaml`).
-- Tests: `pytest -q` (see `.github/workflows/ci.yaml` and `scripts/health_check.sh`).
-- Hardware changes: update `docs/hardware.md` and CLI defaults in `edge/edge_daemon.py`.
+## 기여
+- 브랜치 전략: TODO (현재 레포에 `CONTRIBUTING.md`가 없다고 가정한다. 필요 시 추가한다).
+- 스타일: `ruff check .` (`.github/workflows/ci.yaml` 참고).
+- 테스트: `pytest -q` (`.github/workflows/ci.yaml`, `scripts/health_check.sh` 참고).
+- 하드웨어 변경: `docs/hardware.md`와 `edge/edge_daemon.py`의 CLI 기본값을 함께 갱신한다.
 
-PR checklist:
-- [ ] Tests and lint pass locally.
-- [ ] Config/schema changes are validated (`common/config.py`).
-- [ ] Hardware pin/address changes documented (`docs/hardware.md`).
+PR 체크리스트:
+- [ ] 로컬에서 lint/test를 통과한다.
+- [ ] config/schema 변경은 검증 로직(`common/config.py`)을 통과한다.
+- [ ] 핀/주소 변경은 `docs/hardware.md`에 기록한다.
 
 <a id="license"></a>
-## License & Citation
-- License: TODO (add a `LICENSE` file at repo root).
-- Citation: TODO (add `CITATION.cff` if this is used in research).
+## 라이선스 및 인용
+- 라이선스: TODO (레포 루트에 `LICENSE` 파일을 추가한다).
+- 인용: TODO (연구용으로 사용한다면 `CITATION.cff` 추가를 고려한다).
 
 <a id="appendix"></a>
-## Appendix
+## 부록
 
-### Glossary
-| Term | Meaning in this repo |
+### 용어
+| 용어 | 이 레포에서의 의미 |
 | --- | --- |
-| AoI | Age of Information computed from receiver time (`t_recv_ns`) when available. |
-| EWMA | Exponentially weighted moving average predictor for residuals. |
-| LinUCB | Contextual bandit that selects `(tau, kbits)` per sample. |
-| Outbox | SQLite WAL queue that stores MQTT publishes until PUBACK. |
-| QoS1 | MQTT publish level used for edge events (dedup in collector). |
+| AoI | 수신 시간(`t_recv_ns`) 기반 AoI. 값이 없으면 가능한 범위에서 대체 계산한다. |
+| EWMA | 잔차 계산을 위한 지수이동평균 예측기. |
+| LinUCB | 샘플 단위로 `(tau, kbits)`를 선택하는 컨텍스추얼 밴딧. |
+| Outbox | PUBACK 수신 전까지 publish를 보관하는 SQLite WAL 큐. |
+| QoS1 | 엣지 이벤트 전송에 사용하는 MQTT QoS 레벨(collector에서 중복 제거). |
