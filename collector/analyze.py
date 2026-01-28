@@ -914,6 +914,8 @@ def estimate_payload_bytes(df: pd.DataFrame) -> pd.Series:
     Failure Modes:
         - Reconstruction errors propagate if rows are malformed.
     """
+    from common.metrics import mqtt_publish_size
+
     if "mqtt_bytes" in df.columns and not df["mqtt_bytes"].isna().any():
         s = df["mqtt_bytes"].astype("int64")
         s.name = "mqtt_bytes"
@@ -939,6 +941,10 @@ def estimate_payload_bytes(df: pd.DataFrame) -> pd.Series:
             "policy": str(row["policy"]),
             # aoi_ms는 엣지에서 생략 → 없음
         })
+        payload_len = len(msg.to_json_bytes())
+        topic = row.get("topic", None)
+        if isinstance(topic, str) and topic:
+            return int(mqtt_publish_size(topic, payload_len, qos=1))
         return int(msg.estimated_mqtt_size(qos=1))
 
     return df.apply(_calc, axis=1).astype("int64")

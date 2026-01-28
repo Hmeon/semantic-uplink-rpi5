@@ -273,6 +273,11 @@ safety:
   mae_max: 2.0
 ```
 
+> [!NOTE]
+> `policy.yaml`의 `tau`는 **시간(초)** 이 아니라, EWMA 예측기 기준의 **잔차 임계값(센서 단위)** 이다.
+> - `mic_rms`: dBFS 단위(예: 1.5, 3.0 …)
+> - `temp`: °C 단위(예: 0.1, 0.2 …)
+
 디바이스 YAML 예시(`configs/device.yaml`):
 ```yaml
 device_id: rpi5a
@@ -288,11 +293,21 @@ ui:
 mqtt:
   host: localhost
   port: 1883
+  base_topic: edge
+  # Optional auth/TLS (recommended if exposing broker beyond localhost)
+  # username: "user"
+  # password: "pass"
+  # tls: false
+  # cafile: "/etc/ssl/certs/ca-certificates.crt"
+  # certfile: "/path/to/client.crt"
+  # keyfile: "/path/to/client.key"
 ```
 
 스크립트에서 사용하는 환경변수:
 - `SEMUP_SEED`: 엣지 RNG seed를 설정한다(`edge/edge_daemon.py`).
-- `RUN_DIR`, `DEVICE_CONFIG`, `POLICY_ARMS`, `BROKER_HOST`, `BROKER_PORT`, `TC_IFACE` (`infra/systemd/semantic-uplink-stack.env.example` 참고).
+- `RUN_DIR`, `DEVICE_CONFIG`, `POLICY_ARMS`, `BROKER_HOST`, `BROKER_PORT`, `BASE_TOPIC`,
+  `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TLS`, `MOSQUITTO_LISTEN_HOST`, `TC_IFACE`
+  (`infra/systemd/semantic-uplink-stack.env.example` 참고).
 
 > [!IMPORTANT]
 > 분석기 웹훅(`collector/analyze.py --discord-webhook`)은 시크릿 또는 로컬 env 파일로 주입해야 한다. 실제 URL/토큰을 커밋하지 않는다.
@@ -302,7 +317,7 @@ mqtt:
 | 작업 | 명령 |
 | --- | --- |
 | Edge daemon(실디바이스) | `python -m edge.edge_daemon --device-id rpi5-01 --profile slow_10kbps --mode adaptive --run-dir artifacts/run_rpi5 --device-config configs/device.yaml --arms configs/policy_adaptive_aiot.yaml` |
-| Collector | `python -m collector.collector --run-dir artifacts/run1 --broker localhost --port 1883` |
+| Collector | `python -m collector.collector --run-dir artifacts/run1 --broker localhost --port 1883 --base-topic edge` |
 | Analyze | `python -m collector.analyze --input artifacts/run1/logs --out results/run1 --diagnostic-plots --audit` |
 | 단일 Pi 스택 | `bash scripts/run_stack.sh` |
 | tc 프로파일 적용 | `sudo python -m link.shaper.tc_profiles apply --iface lo --profile slow_10kbps` |
@@ -380,9 +395,9 @@ python -m collector.analyze \
 
 <a id="contributing"></a>
 ## 기여
-- 브랜치 전략: TODO (현재 레포에 `CONTRIBUTING.md`가 없다고 가정한다. 필요 시 추가한다).
-- 스타일: `ruff check .` (`.github/workflows/ci.yaml` 참고).
-- 테스트: `pytest -q` (`.github/workflows/ci.yaml`, `scripts/health_check.sh` 참고).
+- 기여 가이드: `CONTRIBUTING.md` 참고.
+- 스타일: `ruff check` (`.github/workflows/ci.yaml` 참고).
+- 테스트: `python -m pytest -q` (`.github/workflows/ci.yaml`, `scripts/health_check.sh` 참고).
 - 하드웨어 변경: `docs/hardware.md`와 `edge/edge_daemon.py`의 CLI 기본값을 함께 갱신한다.
 
 PR 체크리스트:
@@ -392,8 +407,8 @@ PR 체크리스트:
 
 <a id="license"></a>
 ## 라이선스 및 인용
-- 라이선스: TODO (레포 루트에 `LICENSE` 파일을 추가한다).
-- 인용: TODO (연구용으로 사용한다면 `CITATION.cff` 추가를 고려한다).
+- 라이선스: Apache-2.0 (`LICENSE`)
+- 인용: `CITATION.cff` 참고.
 
 <a id="appendix"></a>
 ## 부록

@@ -21,6 +21,14 @@ BROKER_PORT=${BROKER_PORT:-1883}
 BROKER_MODE=${BROKER_MODE:-auto}           # auto | subprocess | none
 MOSQUITTO_BIN=${MOSQUITTO_BIN:-mosquitto}
 MOSQUITTO_LISTEN_HOST=${MOSQUITTO_LISTEN_HOST:-127.0.0.1}
+MOSQUITTO_VERBOSE=${MOSQUITTO_VERBOSE:-0}
+BASE_TOPIC=${BASE_TOPIC:-}
+MQTT_USERNAME=${MQTT_USERNAME:-}
+MQTT_PASSWORD=${MQTT_PASSWORD:-}
+MQTT_TLS=${MQTT_TLS:-0}
+MQTT_CAFILE=${MQTT_CAFILE:-}
+MQTT_CERTFILE=${MQTT_CERTFILE:-}
+MQTT_KEYFILE=${MQTT_KEYFILE:-}
 
 COLLECTOR_FLUSH_INTERVAL_S=${COLLECTOR_FLUSH_INTERVAL_S:-10}
 
@@ -50,10 +58,37 @@ ARGS=(
   --tc-profiles-config "${TC_PROFILES_CONFIG}"
 )
 
+if [[ -n "${BASE_TOPIC}" ]]; then
+  ARGS+=(--base-topic "${BASE_TOPIC}")
+fi
+
+if [[ -n "${MQTT_USERNAME}" ]]; then
+  ARGS+=(--mqtt-username "${MQTT_USERNAME}")
+fi
+if [[ -n "${MQTT_PASSWORD}" ]]; then
+  ARGS+=(--mqtt-password "${MQTT_PASSWORD}")
+fi
+if [[ "${MQTT_TLS}" == "1" ]]; then
+  ARGS+=(--mqtt-tls)
+  if [[ -n "${MQTT_CAFILE}" ]]; then
+    ARGS+=(--mqtt-cafile "${MQTT_CAFILE}")
+  fi
+  if [[ -n "${MQTT_CERTFILE}" ]]; then
+    ARGS+=(--mqtt-certfile "${MQTT_CERTFILE}")
+  fi
+  if [[ -n "${MQTT_KEYFILE}" ]]; then
+    ARGS+=(--mqtt-keyfile "${MQTT_KEYFILE}")
+  fi
+fi
+
 if [[ "${BUTTONS_ENABLE}" == "1" ]]; then
   ARGS+=(--buttons-enable)
 else
   ARGS+=(--buttons-disable)
+fi
+
+if [[ "${MOSQUITTO_VERBOSE}" == "1" ]]; then
+  ARGS+=(--mosquitto-verbose)
 fi
 
 if [[ "${TC_ENABLE}" == "1" ]]; then
@@ -67,4 +102,3 @@ if [[ "${TC_BOTH}" == "1" ]]; then
 fi
 
 exec "${PYTHON}" -m stack.pi_stack "${ARGS[@]}"
-

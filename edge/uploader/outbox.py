@@ -448,7 +448,11 @@ class Outbox:
                 self._update_loss_ewma(0.0)
                 if row is not None:
                     topic = str(row["topic"])
-                    if topic.startswith("edge/"):
+                    # Track ACK latency EWMA only for sensor events.
+                    # Topic format is `{base_topic}/{device_id}/{sensor}/event` where `base_topic`
+                    # may be customized via device config.
+                    parts = topic.split("/")
+                    if len(parts) >= 4 and parts[-1] == "event":
                         created_ns = int(row["created_ns"])
                         latency_ms = (time.time_ns() - created_ns) / 1e6
                         if math.isfinite(latency_ms) and latency_ms >= 0.0:

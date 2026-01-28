@@ -352,6 +352,13 @@ class EdgeDaemon:
         port: int = 1883,
         client_id: str = "edge-pub",
         keepalive: int = 30,
+        username: str | None = None,
+        password: str | None = None,
+        tls: bool = False,
+        cafile: str | None = None,
+        certfile: str | None = None,
+        keyfile: str | None = None,
+        event_base_topic: str = "edge",
         seed: int | None = None,
         mic: MicCfg | None = None,
         temp: TempCfg | None = None,
@@ -373,6 +380,13 @@ class EdgeDaemon:
         self.port = int(port)
         self.client_id = client_id
         self.keepalive = int(keepalive)
+        self.username = username
+        self.password = password
+        self.tls = bool(tls)
+        self.cafile = cafile
+        self.certfile = certfile
+        self.keyfile = keyfile
+        self.event_base_topic = str(event_base_topic).strip().strip("/") or "edge"
         self.mic_cfg = mic or MicCfg()
         self.temp_cfg = temp or TempCfg()
         self.rtc_cfg = rtc or RTCCfg()
@@ -391,6 +405,12 @@ class EdgeDaemon:
             port=self.port,
             client_id=self.client_id,
             keepalive=self.keepalive,
+            username=self.username,
+            password=self.password,
+            tls=self.tls,
+            cafile=self.cafile,
+            certfile=self.certfile,
+            keyfile=self.keyfile,
         )
 
         self._stop = threading.Event()
@@ -883,7 +903,7 @@ class EdgeDaemon:
                 payload = res.event.to_json_bytes()
                 self._status.record_payload(len(payload), res.event.ts)
                 self.outbox.enqueue(
-                    res.event.mqtt_topic(),
+                    res.event.mqtt_topic(self.event_base_topic),
                     payload,
                     qos=1,
                     retain=False,
@@ -989,6 +1009,7 @@ class EdgeDaemon:
             sensor=sensor,
             profile=self.profile,
             mode=self.mode,
+            base_topic=self.event_base_topic,
             ewma_cfg=ewma_cfg,
             linucb_cfg=linucb_cfg,
             nominal_period_s=nominal_period_s,
@@ -1094,6 +1115,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     broker_default = device_cfg.mqtt.host if device_cfg is not None else "localhost"
     port_default = int(device_cfg.mqtt.port) if device_cfg is not None else 1883
+    base_topic_default = str(device_cfg.mqtt.base_topic) if device_cfg is not None else "edge"
+    username_default = device_cfg.mqtt.username if device_cfg is not None else None
+    password_default = device_cfg.mqtt.password if device_cfg is not None else None
+    tls_default = bool(device_cfg.mqtt.tls) if device_cfg is not None else False
+    cafile_default = device_cfg.mqtt.cafile if device_cfg is not None else None
+    certfile_default = device_cfg.mqtt.certfile if device_cfg is not None else None
+    keyfile_default = device_cfg.mqtt.keyfile if device_cfg is not None else None
     mic_enable_default = bool(device_cfg.sensors.mic is not None) if device_cfg is not None else False
     temp_enable_default = bool(device_cfg.sensors.temp is not None) if device_cfg is not None else False
     mic_sr_default = (
@@ -1158,6 +1186,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     p.add_argument("--device-id", default=device_id_default)
     p.add_argument(
+        "--base-topic",
+        default=base_topic_default,
+        help="MQTT base topic prefix for event publishing (default: from device config)",
+    )
+    p.add_argument(
         "--profile",
         choices=[e.value for e in LinkProfile],
         default=LinkProfile.SLOW_10KBPS.value,
@@ -1180,6 +1213,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--port", type=int, default=port_default)
     p.add_argument("--client-id", default="edge-pub")
     p.add_argument("--keepalive", type=int, default=30)
+    p.add_argument("--username", default=username_default, help="MQTT username (optional)")
+    p.add_argument("--password", default=password_default, help="MQTT password (optional)")
+    p.add_argument(
+        "--tls",
+        dest="tls",
+        action=argparse.BooleanOptionalAction,
+        default=tls_default,
+        help="enable MQTT TLS (optional)",
+    )
+    p.add_argument("--cafile", default=cafile_default, help="CA file for MQTT TLS (optional)")
+    p.add_argument("--certfile", default=certfile_default, help="client cert for MQTT TLS (optional)")
+    p.add_argument("--keyfile", default=keyfile_default, help="client key for MQTT TLS (optional)")
     p.add_argument("--seed", type=int, default=None, help="random seed (reproducibility)")
 
     # Outbox
@@ -1431,6 +1476,13 @@ def main(argv: list[str] | None = None):
         port=args.port,
         client_id=args.client_id,
         keepalive=args.keepalive,
+        username=args.username,
+        password=args.password,
+        tls=bool(args.tls),
+        cafile=args.cafile,
+        certfile=args.certfile,
+        keyfile=args.keyfile,
+        event_base_topic=args.base_topic,
         seed=int(seed),
         mic=mic_cfg,
         temp=temp_cfg,

@@ -57,6 +57,7 @@ class ExperimentPlan:
         cooldown_s: Cooldown duration in seconds.
         broker: MQTT broker host.
         port: MQTT broker port.
+        base_topic: MQTT base topic prefix for event publish/subscribe.
         seed: RNG seed for reproducibility.
         use_mic: Enable microphone sensor.
         use_temp: Enable temperature sensor.
@@ -111,6 +112,7 @@ class ExperimentPlan:
     # 브로커
     broker: str = "localhost"
     port: int = 1883
+    base_topic: str = "edge"
     seed: int = 0
 
     # 센서 사용
@@ -296,6 +298,7 @@ class ScenarioRunner:
             "--mode", sc.mode.value,
             "--broker", p.broker,
             "--port", str(p.port),
+            "--base-topic", p.base_topic,
             "--client-id", f"edge-{p.device_id}",
             "--run-dir", str(run_dir),
             "--seed", str(p.seed),
@@ -346,6 +349,7 @@ class ScenarioRunner:
             "--run-dir", str(sc.out_dir),
             "--broker", self.plan.broker,
             "--port", str(self.plan.port),
+            "--base-topic", self.plan.base_topic,
             "--flush-interval-s", str(self.plan.collector_flush_interval_s),
             "--client-id", f"collector-{self.plan.device_id}",
         ]
@@ -644,6 +648,11 @@ def parse_args(argv: list[str] | None = None) -> ExperimentPlan:
     device_id_default = device_cfg.device_id if device_cfg is not None else "rpi5-01"
     broker_default = device_cfg.mqtt.host if device_cfg is not None else "localhost"
     port_default = int(device_cfg.mqtt.port) if device_cfg is not None else 1883
+    base_topic_default = (
+        str(device_cfg.mqtt.base_topic).strip().strip("/")
+        if device_cfg is not None
+        else "edge"
+    )
     use_mic_default = bool(device_cfg.sensors.mic is not None) if device_cfg is not None else True
     use_temp_default = bool(device_cfg.sensors.temp is not None) if device_cfg is not None else True
     mic_sr_default = (
@@ -686,6 +695,11 @@ def parse_args(argv: list[str] | None = None) -> ExperimentPlan:
 
     ap.add_argument("--broker", default=broker_default)
     ap.add_argument("--port", type=int, default=port_default)
+    ap.add_argument(
+        "--base-topic",
+        default=base_topic_default,
+        help="MQTT base topic prefix (default from device YAML if provided)",
+    )
     ap.add_argument("--seed", type=int, default=0, help="random seed for reproducibility")
 
     # 기본은 둘 다 활성(평가/데모 기준). 필요 시 --no-mic / --no-temp 로 비활성.
@@ -733,13 +747,23 @@ def parse_args(argv: list[str] | None = None) -> ExperimentPlan:
     ap.add_argument("--collector-flush-interval-s", type=int, default=10)
     args = ap.parse_args(argv)
 
+    device_config_final = _opt_path(args.device_config)
+    link_profiles_config_final = _opt_path(args.link_profiles_config)
+    base_topic_final = str(args.base_topic).strip().strip("/")
+    if not base_topic_final:
+        print("[exp] ERROR: --base-topic must be non-empty", file=sys.stderr)
+        sys.exit(2)
+    if "+" in base_topic_final or "#" in base_topic_final:
+        print("[exp] ERROR: --base-topic must not contain MQTT wildcards", file=sys.stderr)
+        sys.exit(2)
+
     plan = ExperimentPlan(
         device_id=args.device_id,
-        device_config=args.device_config,
+        device_config=device_config_final,
         iface=args.iface,
         both=bool(args.both),
         run_root=Path(args.run_root),
-        link_profiles_config=args.link_profiles_config,
+        link_profiles_config=link_profiles_config_final,
 
         warmup_s=args.warmup_s,
         run_s=args.run_s,
@@ -747,6 +771,7 @@ def parse_args(argv: list[str] | None = None) -> ExperimentPlan:
 
         broker=args.broker,
         port=args.port,
+        base_topic=base_topic_final,
         seed=int(args.seed),
 
         use_mic=bool(args.use_mic),

@@ -16,3 +16,10 @@ mqtt:
   host: localhost
   port: 1883
   base_topic: "edge"
+  # Optional auth/TLS (recommended if exposing broker beyond localhost)
+  # username: "user"
+  # password: "pass"
+  # tls: false
+  # cafile: "/etc/ssl/certs/ca-certificates.crt"
+  # certfile: "/path/to/client.crt"
+  # keyfile: "/path/to/client.key"

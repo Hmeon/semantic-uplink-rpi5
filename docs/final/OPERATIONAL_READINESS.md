@@ -29,11 +29,15 @@
 - SIGINT/SIGTERM handled in collector and stack runner; edge exits cleanly via normal process termination.
 
 ## Systemd example
-- See `docs/final/systemd/semantic-uplink-stack.service`.
-- Install:
-  - `sudo cp docs/final/systemd/semantic-uplink-stack.service /etc/systemd/system/`
-  - `sudo systemctl daemon-reload`
-  - `sudo systemctl enable --now semantic-uplink-stack.service`
+- Unit/env templates:
+  - `infra/systemd/semantic-uplink-stack.service`
+  - `infra/systemd/semantic-uplink-stack.env.example`
+- Recommended install (generates a unit pointing to your repo path):
+  - `sudo ./scripts/install_systemd.sh`
+- Manual install:
+  - Copy the unit to `/etc/systemd/system/semantic-uplink-stack.service`
+  - Copy env example to `/etc/semantic-uplink-stack.env` and edit values
+  - `sudo systemctl daemon-reload && sudo systemctl enable --now semantic-uplink-stack.service`
 
 ## Notes for long-running RPi5
 - Prefer log rotation to protect SD card endurance.

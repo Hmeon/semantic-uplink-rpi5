@@ -18,6 +18,7 @@ import logging
 import os
 import re
 import signal
+import ssl
 import threading
 import time
 from collections import OrderedDict
@@ -61,6 +62,13 @@ class Config:
         run_dir: Root directory for run artifacts.
         broker: MQTT broker hostname or IP.
         port: MQTT broker port.
+        base_topic: Base topic prefix for edge event topics.
+        username: Optional broker username.
+        password: Optional broker password.
+        tls: Enable TLS when True.
+        cafile: Optional CA file for TLS validation.
+        certfile: Optional client certificate for TLS.
+        keyfile: Optional client key for TLS.
         flush_interval_s: Interval between periodic flushes in seconds.
         client_id: MQTT client identifier.
         max_runtime_s: Optional auto-stop time in seconds (test helper).
@@ -84,6 +92,13 @@ class Config:
     run_dir: str
     broker: str = "localhost"
     port: int = 1883
+    base_topic: str = "edge"
+    username: str | None = None
+    password: str | None = None
+    tls: bool = False
+    cafile: str | None = None
+    certfile: str | None = None
+    keyfile: str | None = None
     flush_interval_s: int = 10
     client_id: str = "collector"
     max_runtime_s: float | None = None  # test helper: stop after N seconds
@@ -102,7 +117,7 @@ class Collector:
         OSError: If required run directories cannot be created.
 
     Contract:
-        - Expects EventMsg JSON on `edge/{device}/{sensor}/event`, policy decisions on
+        - Expects EventMsg JSON on `{base_topic}/{device}/{sensor}/event`, policy decisions on
           `policy/{device}/decision`, and markers on `marker/{device}`.
         - De-duplication key is (device_id, sensor, seq); duplicates are dropped across flushes
           within the TTL/size bounds of the in-memory cache.
@@ -197,7 +212,7 @@ class Collector:
         if rc != 0:
             logger.error("MQTT connect failed: rc=%s", rc)
             return
-        client.subscribe("edge/+/+/event", qos=1)
+        client.subscribe(f"{self.cfg.base_topic}/+/+/event", qos=1)
         client.subscribe("policy/+/decision", qos=1)
         client.subscribe("marker/+", qos=1)
         logger.info(
@@ -234,10 +249,16 @@ class Collector:
             sensor = None
             try:
                 parts = str(topic).split("/")
-                if len(parts) >= 2:
-                    device_id = parts[1]
-                if len(parts) >= 3:
-                    sensor = parts[2]
+                if parts and parts[-1] == "event" and len(parts) >= 4:
+                    # {base_topic}/{device_id}/{sensor}/event (base_topic may include slashes)
+                    device_id = parts[-3]
+                    sensor = parts[-2]
+                elif parts and parts[-1] == "decision" and len(parts) >= 3:
+                    # policy/{device_id}/decision
+                    device_id = parts[-2]
+                elif parts and parts[0] == "marker" and len(parts) >= 2:
+                    # marker/{device_id}
+                    device_id = parts[-1]
             except Exception:
                 device_id = None
                 sensor = None
@@ -301,7 +322,8 @@ class Collector:
             t_recv_ns = time.time_ns()
         self._last_ns = int(t_recv_ns)
 
-        if topic.startswith("edge/") and topic.endswith("/event"):
+        event_prefix = f"{self.cfg.base_topic}/"
+        if topic.startswith(event_prefix) and topic.endswith("/event"):
             self._handle_event_message(
                 topic, payload, qos, dup, retain, t_recv_ns=int(t_recv_ns)
             )
@@ -748,7 +770,13 @@ class Collector:
             self._client.reconnect_delay_set(min_delay=1, max_delay=60)
         except Exception:
             pass
-        # subscriber side는 username/password 필요시 환경변수 등으로 확장
+        if self.cfg.username:
+            self._client.username_pw_set(self.cfg.username, self.cfg.password)
+        if bool(self.cfg.tls):
+            ctx = ssl.create_default_context(cafile=self.cfg.cafile)
+            if self.cfg.certfile and self.cfg.keyfile:
+                ctx.load_cert_chain(certfile=self.cfg.certfile, keyfile=self.cfg.keyfile)
+            self._client.tls_set_context(ctx)
         # connect_async keeps the collector alive even when the broker is down on startup.
         self._client.connect_async(self.cfg.broker, self.cfg.port, keepalive=60)
         self._client.loop_start()
@@ -852,8 +880,25 @@ def main():
     parser.add_argument("--run-dir", required=True, help="artifacts/{run_id} 경로(사전 생성 권장)")
     parser.add_argument("--broker", default="localhost")
     parser.add_argument("--port", type=int, default=1883)
+    parser.add_argument(
+        "--base-topic",
+        default="edge",
+        help="base topic prefix for edge events (default: edge)",
+    )
     parser.add_argument("--flush-interval-s", type=int, default=10)
     parser.add_argument("--client-id", default="collector")
+    parser.add_argument("--username", default=None, help="MQTT username (optional)")
+    parser.add_argument("--password", default=None, help="MQTT password (optional)")
+    parser.add_argument(
+        "--tls",
+        dest="tls",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="enable MQTT TLS (optional)",
+    )
+    parser.add_argument("--cafile", default=None, help="CA file for MQTT TLS (optional)")
+    parser.add_argument("--certfile", default=None, help="client cert for MQTT TLS (optional)")
+    parser.add_argument("--keyfile", default=None, help="client key for MQTT TLS (optional)")
     parser.add_argument("--clock-offset-ns", type=int, default=0)
     parser.add_argument("--dedup-cache-max-keys", type=int, default=100_000)
     parser.add_argument("--dedup-cache-ttl-s", type=float, default=300.0)
@@ -871,6 +916,13 @@ def main():
         run_dir=args.run_dir,
         broker=args.broker,
         port=args.port,
+        base_topic=str(args.base_topic),
+        username=args.username,
+        password=args.password,
+        tls=bool(args.tls),
+        cafile=args.cafile,
+        certfile=args.certfile,
+        keyfile=args.keyfile,
         flush_interval_s=args.flush_interval_s,
         client_id=args.client_id,
         max_runtime_s=args.max_runtime_s,

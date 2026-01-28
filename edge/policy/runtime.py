@@ -73,7 +73,7 @@ class StepResult:
         reward: Optional reward value used for learning.
         aoi_ms: AoI estimate in milliseconds.
         mae_est: MAE estimate for the predictor.
-        rate_bps: Estimated transmit rate in bytes per second.
+        rate_bps: Estimated transmit rate in bits per second.
 
     Returns:
         None.
@@ -106,6 +106,7 @@ class SensorPolicyRuntime:
         sensor: Sensor type associated with this runtime.
         profile: Link profile for policy context.
         mode: Policy mode (periodic/fixed/adaptive).
+        base_topic: MQTT base topic prefix for event size/rate estimation.
         ewma_cfg: EWMA predictor configuration.
         linucb_cfg: LinUCB configuration when in adaptive mode.
         nominal_period_s: Optional nominal sampling period for AoI fallback.
@@ -135,6 +136,7 @@ class SensorPolicyRuntime:
         sensor: SensorType,
         profile: LinkProfile,
         mode: PolicyMode,
+        base_topic: str = "edge",
         ewma_cfg: EWMAConfig,
         linucb_cfg: LinUCBConfig | None = None,
         nominal_period_s: float | None = None,
@@ -143,6 +145,9 @@ class SensorPolicyRuntime:
         self.sensor = sensor
         self.profile = profile
         self.mode = mode
+        self._base_topic = str(base_topic).strip().strip("/") or "edge"
+        if "+" in self._base_topic or "#" in self._base_topic:
+            raise ValueError("base_topic must not contain MQTT wildcards '+' or '#'")
         self._predictor = EWMAPredictor(ewma_cfg)
         self._ewma_cfg = ewma_cfg
         self._nominal_period_s = nominal_period_s
@@ -393,7 +398,7 @@ class SensorPolicyRuntime:
 
     def _rate_from_event(self, event: EventMsg, aoi_ms: float) -> float:
         try:
-            size_bytes = event.estimated_mqtt_size(qos=1)
+            size_bytes = event.estimated_mqtt_size(qos=1, base_topic=self._base_topic)
         except Exception:
             size_bytes = len(event.to_json_bytes())
         interval_s = aoi_ms / 1000.0 if aoi_ms > 0 else None

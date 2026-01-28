@@ -273,6 +273,11 @@ safety:
   mae_max: 2.0
 ```
 
+> [!NOTE]
+> `tau` in `policy.yaml` is **not a time interval (seconds)**. In this project it is an EWMA **residual threshold in sensor units**:
+> - `mic_rms`: dBFS units (e.g., 1.5, 3.0, …)
+> - `temp`: °C units (e.g., 0.1, 0.2, …)
+
 Example device YAML (`configs/device.yaml`):
 ```yaml
 device_id: rpi5a
@@ -288,11 +293,21 @@ ui:
 mqtt:
   host: localhost
   port: 1883
+  base_topic: edge
+  # Optional auth/TLS (recommended if exposing broker beyond localhost)
+  # username: "user"
+  # password: "pass"
+  # tls: false
+  # cafile: "/etc/ssl/certs/ca-certificates.crt"
+  # certfile: "/path/to/client.crt"
+  # keyfile: "/path/to/client.key"
 ```
 
 Environment variables used in scripts:
 - `SEMUP_SEED` sets the edge RNG seed (`edge/edge_daemon.py`).
-- `RUN_DIR`, `DEVICE_CONFIG`, `POLICY_ARMS`, `BROKER_HOST`, `BROKER_PORT`, `TC_IFACE` (see `infra/systemd/semantic-uplink-stack.env.example`).
+- `RUN_DIR`, `DEVICE_CONFIG`, `POLICY_ARMS`, `BROKER_HOST`, `BROKER_PORT`, `BASE_TOPIC`,
+  `MQTT_USERNAME`, `MQTT_PASSWORD`, `MQTT_TLS`, `MOSQUITTO_LISTEN_HOST`, `TC_IFACE`
+  (see `infra/systemd/semantic-uplink-stack.env.example`).
 
 > [!IMPORTANT]
 > Analyzer webhooks (`collector/analyze.py --discord-webhook`) should be provided via secrets or local env files. Do not commit real URLs or tokens.
@@ -302,7 +317,7 @@ Environment variables used in scripts:
 | Task | Command |
 | --- | --- |
 | Edge daemon (full device) | `python -m edge.edge_daemon --device-id rpi5-01 --profile slow_10kbps --mode adaptive --run-dir artifacts/run_rpi5 --device-config configs/device.yaml --arms configs/policy_adaptive_aiot.yaml` |
-| Collector | `python -m collector.collector --run-dir artifacts/run1 --broker localhost --port 1883` |
+| Collector | `python -m collector.collector --run-dir artifacts/run1 --broker localhost --port 1883 --base-topic edge` |
 | Analyze | `python -m collector.analyze --input artifacts/run1/logs --out results/run1 --diagnostic-plots --audit` |
 | Single-Pi stack | `bash scripts/run_stack.sh` |
 | Apply tc profile | `sudo python -m link.shaper.tc_profiles apply --iface lo --profile slow_10kbps` |
@@ -379,9 +394,9 @@ Reference report: `docs/final/FINAL_EVALUATION.md` (dataset and result paths).
 
 <a id="contributing"></a>
 ## Contributing
-- Branch strategy: TODO (no CONTRIBUTING.md in repo; add one if needed).
-- Style: `ruff check .` (see `.github/workflows/ci.yaml`).
-- Tests: `pytest -q` (see `.github/workflows/ci.yaml` and `scripts/health_check.sh`).
+- Contribution guide: see `CONTRIBUTING.md`.
+- Style: `ruff check` (see `.github/workflows/ci.yaml`).
+- Tests: `python -m pytest -q` (see `.github/workflows/ci.yaml` and `scripts/health_check.sh`).
 - Hardware changes: update `docs/hardware.md` and CLI defaults in `edge/edge_daemon.py`.
 
 PR checklist:
@@ -391,8 +406,8 @@ PR checklist:
 
 <a id="license"></a>
 ## License & Citation
-- License: TODO (add a `LICENSE` file at repo root).
-- Citation: TODO (add `CITATION.cff` if this is used in research).
+- License: Apache-2.0 (`LICENSE`)
+- Citation: see `CITATION.cff`.
 
 <a id="appendix"></a>
 ## Appendix

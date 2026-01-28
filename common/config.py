@@ -18,7 +18,7 @@ class ArmConfig(BaseModel):
     """Policy arm definition for (tau, kbits).
 
     Args:
-        tau: Threshold/interval for the arm (must be > 0).
+        tau: EWMA residual threshold for the arm (sensor units; must be > 0).
         kbits: Quantization bit width (1..16).
 
     Returns:
@@ -93,7 +93,7 @@ class ScaleConfig(BaseModel):
 
     Args:
         aoi_ms: AoI scale in milliseconds.
-        rate_bps: Rate scale in bytes per second.
+        rate_bps: Rate scale in bits per second.
 
     Returns:
         None.
@@ -496,6 +496,12 @@ class DeviceMQTTConfig(BaseModel):
         host: Broker hostname or IP.
         port: Broker port.
         base_topic: Base topic prefix for publishing.
+        username: Optional broker username.
+        password: Optional broker password.
+        tls: Enable TLS when True.
+        cafile: Optional CA file for TLS validation.
+        certfile: Optional client certificate for TLS.
+        keyfile: Optional client key for TLS.
 
     Returns:
         None.
@@ -517,6 +523,24 @@ class DeviceMQTTConfig(BaseModel):
     host: str
     port: int = 1883
     base_topic: str = "edge"
+    username: str | None = None
+    password: str | None = None
+    tls: bool = False
+    cafile: str | None = None
+    certfile: str | None = None
+    keyfile: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_mqtt(self) -> DeviceMQTTConfig:
+        base = str(self.base_topic).strip().strip("/")
+        if not base:
+            raise ValueError("mqtt.base_topic must be non-empty")
+        if "+" in base or "#" in base:
+            raise ValueError("mqtt.base_topic must not contain MQTT wildcards '+' or '#'")
+        self.base_topic = base
+        if (self.certfile is None) != (self.keyfile is None):
+            raise ValueError("mqtt.certfile and mqtt.keyfile must be provided together")
+        return self
 
 
 class DeviceConfig(BaseModel):

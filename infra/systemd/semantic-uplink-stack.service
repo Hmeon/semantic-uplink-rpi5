@@ -1,4 +1,4 @@
-﻿[Unit]
+[Unit]
 Description=Semantic Uplink (edge + collector + broker)
 After=network-online.target
 Wants=network-online.target
@@ -16,3 +16,4 @@ RestartSec=2
 
 [Install]
 WantedBy=multi-user.target
+

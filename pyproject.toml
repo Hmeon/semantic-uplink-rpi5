@@ -4,11 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "semantic-uplink-rpi5"
-version = "0.1.0"
+version = "0.1.1"
 description = "AIoT semantic uplink PoC on Raspberry Pi 5 (edge prediction + policy LinUCB + MQTT + tc + AoI/MAE/Rate)"
 readme = "README.md"
 requires-python = ">=3.10"
-authors = [{name="Project Owner", email="owner@example.com"}]
+license = { text = "Apache-2.0" }
+authors = [{name="KIM GI RYEONG", email="20203078@office.deu.ac.kr"}]
 
 dependencies = [
     "numpy>=1.24",

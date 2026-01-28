@@ -168,8 +168,8 @@ class EventMsg:
         sensor: Sensor type identifier.
         val: Quantized sensor value.
         pred: Predictor output for the same sample.
-        res: Residual error (val - pred).
-        tau: Sampling or decision interval in seconds.
+        res: Absolute residual against the last EWMA prediction (raw units).
+        tau: EWMA residual threshold used for event triggering (sensor units).
         kbits: Quantization bit width (1..16).
         profile: Link profile identifier.
         policy: Policy mode identifier.
@@ -415,14 +415,14 @@ class EventMsg:
         return cls.from_dict(d)
 
     # ---- 토픽/크기 ----
-    def mqtt_topic(self) -> str:
+    def mqtt_topic(self, base_topic: str = "edge") -> str:
         """Return the MQTT topic for this event.
 
         Args:
-            None.
+            base_topic: Base topic prefix for publishing/subscribing (default: "edge").
 
         Returns:
-            Topic string formatted as `edge/{device_id}/{sensor}/event`.
+            Topic string formatted as `{base_topic}/{device_id}/{sensor}/event`.
 
         Raises:
             None.
@@ -436,14 +436,19 @@ class EventMsg:
         Failure Modes:
             - None.
         """
-        # edge/{device_id}/{sensor}/event
-        return f"edge/{self.device_id}/{self.sensor.value}/event"
+        base = str(base_topic).strip().strip("/")
+        if not base:
+            raise ValueError("base_topic must be non-empty")
+        if "+" in base or "#" in base:
+            raise ValueError("base_topic must not contain MQTT wildcards '+' or '#'")
+        return f"{base}/{self.device_id}/{self.sensor.value}/event"
 
-    def estimated_mqtt_size(self, qos: int = 1) -> int:
+    def estimated_mqtt_size(self, qos: int = 1, *, base_topic: str = "edge") -> int:
         """Estimate MQTT v3.1.1 publish size including headers.
 
         Args:
             qos: MQTT QoS level used to compute header sizing.
+            base_topic: Base topic prefix used to construct the topic string.
 
         Returns:
             Total bytes for a PUBLISH packet at the given QoS.
@@ -463,7 +468,7 @@ class EventMsg:
         if mqtt_v311_publish_size is None:
             raise RuntimeError("mqtt_v311_publish_size unavailable")
         payload_len = len(self.to_json_bytes())
-        return mqtt_v311_publish_size(self.mqtt_topic(), payload_len, qos=qos)
+        return mqtt_v311_publish_size(self.mqtt_topic(base_topic), payload_len, qos=qos)
 
 # -------------------- PolicyDecision --------------------
 
@@ -479,7 +484,7 @@ class PolicyDecisionMsg:
         state_res_var: Residual variance estimate (>= 0).
         state_loss: Loss estimate in [0, 1].
         state_q_len: Outbox queue length (>= 0).
-        tau: Selected sampling interval in seconds.
+        tau: Selected EWMA residual threshold (sensor units).
         kbits: Selected quantization bit width (1..16).
         reward: Scalar reward used by the policy.
         arm_id: Optional arm index for diagnostics.

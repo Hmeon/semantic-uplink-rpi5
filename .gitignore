@@ -51,3 +51,7 @@ yarn-error.log*
 
 # Jupyter
 .ipynb_checkpoints/
+
+# Local LLM artifacts
+.gemini/
+semantic_uplink_rpi5.zip
