@@ -1,0 +1,74 @@
+# KPI-eval policy config (LinUCB, PoC) + KPI4 coverage liveness.
+#
+# Same as `configs/policy_poc_covforce.yaml` but:
+# - keeps EWMA event-level diagnostics off (payload-fair KPI eval)
+# - enables LinUCB decision diagnostics (so pipeline metrics are not empty)
+#
+# Rationale:
+# - `EventMsg.event_reason` is only serialized when EWMA diagnostics are enabled.
+# - If only adaptive inflates payload bytes, KPI2 (rate vs fixed_tau) can be biased.
+# - Decision diagnostics are written to `decisions_*.parquet` and do not affect MQTT bytes when
+#   `--decision-publish local` is used in the synthetic generator.
+
+arms:
+  - { tau: 1.5, kbits: 6 }
+  - { tau: 3.0, kbits: 6 }
+  - { tau: 6.0, kbits: 8 }
+
+linucb:
+  alpha_ucb: 0.75
+  lambda_ridge: 1.0
+  warmup_per_arm: 10
+
+scales:
+  aoi_ms: 1000.0
+  rate_bps: 1024.0
+  q_len: 50.0
+
+sensors:
+  mic_rms:
+    arms:
+      - { tau: 1.5, kbits: 6 }
+      - { tau: 2.5, kbits: 6 }
+      - { tau: 3.0, kbits: 6 }  # fixed_tau baseline
+      - { tau: 3.5, kbits: 6 }
+      - { tau: 4.5, kbits: 6 }
+      - { tau: 6.0, kbits: 6 }
+    safety:
+      residual_guard_enabled: false
+      mae_max: 100.0
+      mae_est_max: 3.0
+    linucb:
+      ucb_min_tau: 3.0
+      safe_arm: { tau: 1.5, kbits: 6 }
+      aoi_safe_arm: { tau: 3.0, kbits: 6 }
+
+  temp:
+    arms:
+      - { tau: 0.20, kbits: 8 }  # fixed_tau baseline
+      - { tau: 0.30, kbits: 8 }
+    safety:
+      residual_guard_enabled: false
+      mae_max: 10.0
+      mae_est_max: 0.2
+    linucb:
+      ucb_min_tau: 0.2
+      safe_arm: { tau: 0.2, kbits: 8 }
+      aoi_safe_arm: { tau: 0.2, kbits: 8 }
+
+reward:
+  alpha: 1.0
+  beta: 0.5
+  gamma: 0.5
+  coverage_step_penalty_n: 6.0
+  coverage_miss_penalty_n: 0.0
+
+safety:
+  aoi_max_ms: 12000
+  mae_max: 2.0
+  safety_force_emit_on_aoi: false
+  coverage_force_emit_on_unhit_segment: true
+
+diagnostics:
+  enabled: true
+  events_enabled: false

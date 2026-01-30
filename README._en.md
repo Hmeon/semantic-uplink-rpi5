@@ -45,6 +45,9 @@ Semantic Uplink is an edge-to-collector pipeline that sends only meaningful sens
 | `docs/final/_entrypoints.md` | Verified CLI entrypoints and scripts. |
 | `docs/final/FINAL_EVALUATION.md` | Final 3-hour comparison, dataset paths, and exact CLI options. |
 | `docs/final/OPERATIONAL_READINESS.md` | RPi5 install/run notes and operational guidance. |
+| `docs/final/RESULTS_DEV_HISTORY_SCNA_SCNB_POC_COVFORCE_KPI.md` | (Final) The 8 final scnA/scnB `poc_covforce_kpi` result folders + development history. |
+| `docs/specs/KPI_DIAGNOSIS_AND_RECOMMENDATION.md` | KPI failure diagnosis and “KPI vs LinUCB improvement” decision record. |
+| `docs/field_synthetic_scenarios_A_B_spec_v1.md` | Field-like synthetic Scenario A/B spec (pre-field measurement stage). |
 | `docs/metrics/FIGURE_NAMING.md` | Plot naming conventions for analysis outputs. |
 | `docs/metrics/LABEL_STYLE.md` | Plot label style guidelines. |
 
@@ -154,7 +157,7 @@ sequenceDiagram
 
 ### Adaptive policy (LinUCB)
 - Action space: `(tau, kbits)` arms from `configs/policy*.yaml` (required for adaptive mode).
-- Context vector: `[1, aoi_norm, |res|_norm, resvar_norm, loss, qlen_norm]` where AoI includes ACK delay and `qlen_norm = q_len / 50` (`edge/policy/linucb.py`, `edge/policy/runtime.py`).
+- Context vector: `[1, aoi_norm, |res|_norm, resvar_norm, loss, qlen_norm]` where AoI includes ACK delay and `qlen_norm = log1p(q_len) / log1p(q_len_scale)` (default `q_len_scale=50`, set via `scales.q_len`; `edge/policy/linucb.py`, `edge/policy/runtime.py`).
 - Reward: `r = -(w_aoi * aoi/aoi_scale + w_mae * mae/mae_scale + w_rate * rate/rate_scale)` (`edge/policy/linucb.py`).
 - Update rule: per-arm ridge regression with `A <- A + x x^T`, `b <- b + r x`; selection uses `score = theta^T x + alpha_ucb * sqrt(x^T A^-1 x)` (`edge/policy/linucb.py`).
 - Safety/exploration: AoI or MAE violations force a safe arm; defaults are `alpha_ucb=0.75`, `lambda_ridge=1.0`, `warmup_per_arm=1` (`edge/policy/linucb.py`).
@@ -255,6 +258,7 @@ Key config files:
 | `configs/device.yaml` | Device id, sensors, UI, MQTT defaults. | `edge/edge_daemon.py`, `experiments/run_scenarios.py` |
 | `configs/policy.yaml` | Adaptive arms + reward + safety. | `edge/edge_daemon.py`, `collector/analyze.py` |
 | `configs/policy_adaptive_*.yaml` | Policy presets (AIoT, quality, etc.). | `edge/edge_daemon.py`, `scripts/run_3h_sequence.sh` |
+| `configs/policy_poc_covforce_kpi.yaml` | KPI-oriented preset (coverage liveness + payload-fair + decision diagnostics). | `scripts/generate_synthetic_run.py`, `scripts/run_3h_sequence.sh`, `collector/analyze.py` |
 | `configs/link_profiles.yaml` | tc/netem profiles. | `link/shaper/tc_profiles.py`, `stack/pi_stack.py`, `experiments/run_scenarios.py` |
 | `infra/systemd/semantic-uplink-stack.env.example` | Env overrides for `scripts/run_stack.sh`. | `scripts/run_stack.sh` |
 
@@ -356,23 +360,78 @@ python -m experiments.run_scenarios \
 
 Outputs are stored under `artifacts/experiments/<timestamp>_<device_id>` with `plan.json` and `run_meta.json` (`experiments/run_scenarios.py`).
 
-### 3-policy 3-hour sequence
+### Field measurement (single RPi5): 3-policy 3-hour sequence (recommended)
+`scripts/run_3h_sequence.sh` runs **on a single RPi5** and executes: `periodic → fixed_tau → adaptive` (each 3h).
+- Recommended setup is broker/collector/edge on the same host for stable `t_recv_ns`-based AoI.
+- The script writes `CHECKLIST.md`, `RUN_META.txt`, and a `sequence.log` for reproducibility.
+- It runs `collector.analyze` at the end and writes `results/field_runs/<run_root>/kpi_verdict.json`.
+
+Preflight (quick list):
+- (required) Packages: `mosquitto`, `mosquitto-clients`, `alsa-utils`, `coreutils` (for `timeout`), `python3-venv`
+- (required) Broker running: `mosquitto -c infra/mosquitto/mosquitto.conf` (or keep mosquitto running via systemd)
+- (recommended) Time sync: `timedatectl status` shows `System clock synchronized: yes` (script may temporarily stop NTP)
+- (sensor) DS18B20: verify `ls /sys/bus/w1/devices/28-*/w1_slave` (override via `W1_PATH` if needed; wiring/overlay: see `docs/hardware.md`)
+- (sensor) Mic: use `arecord -l` then set `MIC_DEVICE=hw:2,0` (example)
+- (tc/netem) Shaping requires root or `CAP_NET_ADMIN` when `TC_ENABLE=1`; set `TC_ENABLE=0` to skip shaping / measure the real link
+
+Install example (Raspberry Pi OS / Debian):
 ```bash
-PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
+sudo apt-get update
+sudo apt-get install -y mosquitto mosquitto-clients alsa-utils i2c-tools coreutils python3-venv
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .[analysis,hw]
 ```
 
-See `scripts/run_3h_sequence.sh` for required environment variables (e.g., `W1_PATH`, `PROFILE`, `IFACE`, `ADAPTIVE_ARMS`).
-
-### Analyze logs
+Quick smoke test (recommended): before the full 9h run (3h × 3 policies), validate the stack with 2min × 3 policies.
 ```bash
-python -m collector.analyze \
-  --input artifacts/slow10_periodic_3h_B/logs \
-  --input artifacts/slow10_fixed_3h_B/logs \
-  --input artifacts/slow10_linucb_3h_B/logs \
-  --out results/final_compare_3h_slow_10kbps \
-  --baseline-policy periodic \
-  --plots --paper-plots --diagnostic-plots --ucb-timeseries --pareto-p95 --audit
+RUN_SECONDS=120 KPI_ENFORCE_PASS=0 FIELD_LABEL=SMOKE \
+  ADAPTIVE_ARMS=configs/policy_poc_covforce_kpi.yaml \
+  PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
 ```
+
+```bash
+# Field A
+FIELD_LABEL=A SEMUP_SEED=0 DEVICE_ID=rpi5a \
+  ADAPTIVE_ARMS=configs/policy_poc_covforce_kpi.yaml \
+  DECISION_PUBLISH=event \
+  ANALYZE_EXTRA_ARGS="--diagnostic-plots --ucb-timeseries --pareto-p95 --save-parquet" \
+  PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
+
+# Field B (same settings)
+FIELD_LABEL=B SEMUP_SEED=0 DEVICE_ID=rpi5a \
+  ADAPTIVE_ARMS=configs/policy_poc_covforce_kpi.yaml \
+  DECISION_PUBLISH=event \
+  ANALYZE_EXTRA_ARGS="--diagnostic-plots --ucb-timeseries --pareto-p95 --save-parquet" \
+  PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
+```
+
+Outputs:
+- run root: `artifacts/field_runs/<run_root>/`
+- results: `results/field_runs/<run_root>/kpi_verdict.json`
+
+(Recommended) Archive the run (for backup/sharing):
+```bash
+tar -czf "field_run_<run_root>.tar.gz" "artifacts/field_runs/<run_root>" "results/field_runs/<run_root>"
+```
+
+See `scripts/run_3h_sequence.sh` for environment variables (e.g., `W1_PATH`, `MIC_DEVICE`, `PROFILE`, `IFACE`, `TC_ENABLE`, `ADAPTIVE_ARMS`, `DECISION_PUBLISH`, `RUN_ROOT_DIR`, `ANALYZE_EXTRA_ARGS`).
+
+### Analyze logs (re-run / analyze-only)
+```bash
+ANALYZE_ONLY=1 RUN_ROOT_DIR=artifacts/field_runs/<run_root> \
+  PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
+```
+
+### Compare Scenario A/B results
+```bash
+python scripts/compare_field_results.py \
+  --results-a results/field_runs/<run_root_A> \
+  --results-b results/field_runs/<run_root_B>
+```
+
+KPI (strict PASS/FAIL):
+- `collector.analyze` emits `kpi_final.csv` (K1..K5 + overall per profile × sensor) and `kpi_verdict.json` (project PASS/FAIL).
+- KPI definition: `docs/specs/architecture.md`.
 
 Reference report: `docs/final/FINAL_EVALUATION.md` (dataset and result paths).
 
@@ -383,6 +442,7 @@ Reference report: `docs/final/FINAL_EVALUATION.md` (dataset and result paths).
 
 - `arecord` missing: the mic backend falls back to arecord when sounddevice is unavailable; install `alsa-utils` or use `--mic-backend sounddevice` (`edge/sensors/mic_rms.py`).
 - Parquet not written: if `pyarrow` is missing, the collector falls back to CSV (`collector/collector.py`).
+- LinUCB/pipeline diagnostics empty: decision-based diagnostics are skipped if `decisions_*.parquet` is missing. Enable decision logging with `--decision-publish event` (or `DECISION_PUBLISH=event`) and set `diagnostics.enabled: true` in the active policy YAML (for payload-fair rate comparisons, prefer `diagnostics.events_enabled: false`).
 - LCD/RTC not found: install `.[hw]` or disable UI/RTC (`edge/ui/lcd.py`, `edge/rtc/ds3231.py`).
 - Buttons disabled: `gpiozero` missing or GPIO unavailable; install `.[hw]` or `--buttons-disable` (`edge/ui/buttons.py`).
 - tc/netem apply fails: requires root or `CAP_NET_ADMIN`; disable with `--tc-disable` or `TC_ENABLE=0` (`link/shaper/tc_profiles.py`).

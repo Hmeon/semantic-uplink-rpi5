@@ -65,6 +65,10 @@ class RewardConfig(BaseModel):
         alpha: AoI weight.
         beta: MAE weight.
         gamma: Rate weight.
+        coverage_step_penalty_n: Dimensionless per-step penalty while inside an un-hit anomaly
+            segment (used for KPI4 shaping; applied via MAE overage in the runtime).
+        coverage_miss_penalty_n: Dimensionless one-shot penalty when an anomaly segment ends
+            without any event emission.
 
     Returns:
         None.
@@ -86,6 +90,8 @@ class RewardConfig(BaseModel):
     alpha: float = 1.0
     beta: float = 1.0
     gamma: float = 1.0
+    coverage_step_penalty_n: float = 1.0
+    coverage_miss_penalty_n: float = 0.0
 
 
 class ScaleConfig(BaseModel):
@@ -94,6 +100,7 @@ class ScaleConfig(BaseModel):
     Args:
         aoi_ms: AoI scale in milliseconds.
         rate_bps: Rate scale in bits per second.
+        q_len: Queue length normalization scale (outbox pending count).
 
     Returns:
         None.
@@ -114,6 +121,7 @@ class ScaleConfig(BaseModel):
 
     aoi_ms: float = 1000.0
     rate_bps: float = 1024.0
+    q_len: float = 50.0
 
 
 class SafetyConfig(BaseModel):
@@ -121,8 +129,12 @@ class SafetyConfig(BaseModel):
 
     Args:
         aoi_max_ms: AoI limit in milliseconds.
-        mae_max: MAE limit in sensor units.
+        residual_guard_enabled: Enable residual-based safe-arm forcing when True.
+        mae_max: Residual (|x - pred|) limit in sensor units (legacy name).
+        mae_est_max: Optional staleness MAE limit for |x - last_sent| (reward shaping).
         safety_force_emit_on_aoi: Force emission when AoI exceeds limit.
+        coverage_force_emit_on_unhit_segment: Force a single emission per anomaly segment
+            (len>=2) until the segment is "hit" (KPI4 liveness).
 
     Returns:
         None.
@@ -142,15 +154,20 @@ class SafetyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     aoi_max_ms: float = 5_000.0
+    residual_guard_enabled: bool = True
     mae_max: float = 2.0
+    mae_est_max: float | None = None
     safety_force_emit_on_aoi: bool = False
+    coverage_force_emit_on_unhit_segment: bool = False
 
 
 class PolicyDiagnosticsConfig(BaseModel):
     """Toggle policy diagnostics emission.
 
     Args:
-        enabled: Enable diagnostic metrics when True.
+        enabled: Enable policy (LinUCB) diagnostics when True.
+        events_enabled: Optional override for event-level diagnostics (EWMA). When None,
+            defaults to `enabled`.
 
     Returns:
         None.
@@ -170,6 +187,59 @@ class PolicyDiagnosticsConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     enabled: bool = False
+    events_enabled: bool | None = None
+
+
+class LinUCBHyperParamsConfig(BaseModel):
+    """Optional LinUCB hyperparameters (kept separate from reward/safety).
+
+    Args:
+        alpha_ucb: Exploration coefficient for LinUCB UCB term.
+        lambda_ridge: Ridge regularization strength.
+        warmup_per_arm: Forced exploration steps per arm at startup.
+        ucb_min_tau: Optional minimum tau for non-safety selection.
+        safe_arm: Optional explicitly-defined safe arm (tau/kbits).
+        aoi_safe_arm: Optional safe arm used when AoI-limit forcing is active.
+
+    Returns:
+        None.
+
+    Raises:
+        ValueError: If numeric values are invalid.
+
+    Side Effects:
+        - None.
+
+    Contract:
+        - Extra fields are forbidden.
+
+    Failure Modes:
+        - Invalid types surface as validation errors.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    alpha_ucb: float = 0.75
+    lambda_ridge: float = 1.0
+    warmup_per_arm: int = 1
+    ucb_min_tau: float | None = None
+    safe_arm: ArmConfig | None = None
+    aoi_safe_arm: ArmConfig | None = None
+
+    @field_validator("alpha_ucb", "lambda_ridge")
+    @classmethod
+    def _finite_nonneg_float(cls, v: float) -> float:
+        fv = float(v)
+        if not (fv >= 0.0):
+            raise ValueError("must be >= 0")
+        return fv
+
+    @field_validator("warmup_per_arm")
+    @classmethod
+    def _warmup_nonneg(cls, v: int) -> int:
+        iv = int(v)
+        if iv < 0:
+            raise ValueError("warmup_per_arm must be >= 0")
+        return iv
 
 
 class SensorPolicyConfig(BaseModel):
@@ -177,6 +247,7 @@ class SensorPolicyConfig(BaseModel):
 
     Args:
         arms: Optional arm list overriding the global arms.
+        linucb: Optional LinUCB hyperparameter overrides.
         reward: Optional reward weight overrides.
         safety: Optional safety threshold overrides.
         diagnostics: Optional diagnostics toggle overrides.
@@ -200,6 +271,7 @@ class SensorPolicyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     arms: list[ArmConfig] | None = None
+    linucb: LinUCBHyperParamsConfig | None = None
     reward: RewardConfig | None = None
     safety: SafetyConfig | None = None
     diagnostics: PolicyDiagnosticsConfig | None = None
@@ -211,6 +283,7 @@ class PolicyConfig(BaseModel):
 
     Args:
         arms: Arm grid for the policy.
+        linucb: Optional LinUCB hyperparameters (alpha/lambda/warmup/safe_arm).
         reward: Reward weight configuration.
         safety: Safety threshold configuration.
         diagnostics: Diagnostic emission configuration.
@@ -236,6 +309,13 @@ class PolicyConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     arms: list[ArmConfig]
+    linucb: LinUCBHyperParamsConfig | None = None
+    # Legacy top-level LinUCB keys (kept for backward compatibility).
+    alpha_ucb: float | None = None
+    lambda_ridge: float | None = None
+    warmup_per_arm: int | None = None
+    safe_arm: ArmConfig | None = None
+    aoi_safe_arm: ArmConfig | None = None
     reward: RewardConfig = Field(default_factory=RewardConfig)
     safety: SafetyConfig = Field(default_factory=SafetyConfig)
     diagnostics: PolicyDiagnosticsConfig = Field(default_factory=PolicyDiagnosticsConfig)
@@ -318,7 +398,11 @@ def load_policy_config_dict(path: str | Path) -> dict[str, Any]:
     Failure Modes:
         - Validation errors are surfaced as ValueError with context.
     """
-    return load_policy_config(path).model_dump()
+    # Keep downstream config merging simple:
+    # - omit `None` fields (e.g., optional legacy keys)
+    # - omit default-valued fields so per-sensor overrides remain *partial* (do not accidentally
+    #   overwrite the global section with schema defaults like aoi_max_ms=5000).
+    return load_policy_config(path).model_dump(exclude_none=True, exclude_defaults=True)
 
 
 class DeviceMicConfig(BaseModel):

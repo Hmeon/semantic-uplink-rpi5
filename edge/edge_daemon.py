@@ -986,9 +986,26 @@ class EdgeDaemon:
         min_emit_ms: int,
         nominal_period_s: float | None,
     ) -> SensorPolicyRuntime:
-        diag_enabled = False
+        policy_diag_enabled = False
+        ewma_diag_enabled = False
+        diag_cfg = (self._arms_cfg.get("diagnostics") or {}) if isinstance(self._arms_cfg, dict) else {}
         if self.mode == PolicyMode.ADAPTIVE:
-            diag_enabled = bool((self._arms_cfg.get("diagnostics") or {}).get("enabled", False))
+            # Per-sensor override for diagnostics (match _make_linucb_config merge semantics).
+            sensor_cfg = ((self._arms_cfg.get("sensors") or {}).get(sensor.value) or {}) if isinstance(self._arms_cfg, dict) else {}
+            sensor_diag = sensor_cfg.get("diagnostics") if isinstance(sensor_cfg, dict) else None
+            if isinstance(diag_cfg, dict) and isinstance(sensor_diag, dict):
+                merged_diag = dict(diag_cfg)
+                merged_diag.update(sensor_diag)
+                diag_cfg = merged_diag
+            elif sensor_diag is not None:
+                diag_cfg = sensor_diag
+
+            policy_diag_enabled = bool((diag_cfg or {}).get("enabled", False)) if isinstance(diag_cfg, dict) else bool(diag_cfg)
+            events_enabled_raw = (diag_cfg or {}).get("events_enabled", None) if isinstance(diag_cfg, dict) else None
+            if events_enabled_raw is None:
+                ewma_diag_enabled = bool(policy_diag_enabled)
+            else:
+                ewma_diag_enabled = bool(events_enabled_raw)
         ewma_cfg = EWMAConfig(
             device_id=self.device_id,
             sensor=sensor,
@@ -999,7 +1016,7 @@ class EdgeDaemon:
             heartbeat_s=heartbeat_s,
             min_emit_interval_ms=min_emit_ms,
             bootstrap_emit=True,
-            diagnostics_enabled=diag_enabled,
+            diagnostics_enabled=bool(ewma_diag_enabled),
         )
         linucb_cfg = None
         if self.mode == PolicyMode.ADAPTIVE:
@@ -1019,10 +1036,17 @@ class EdgeDaemon:
         cfg = self._arms_cfg or {}
         sensor_cfg = (cfg.get("sensors") or {}).get(sensor.value) or {}
         if sensor_cfg:
+            def _merge_section(base_val, override_val):
+                if isinstance(base_val, dict) and isinstance(override_val, dict):
+                    out = dict(base_val)
+                    out.update(override_val)
+                    return out
+                return override_val
+
             merged = dict(cfg)
-            for key in ("arms", "reward", "safety", "diagnostics", "scales"):
+            for key in ("arms", "reward", "safety", "diagnostics", "scales", "linucb"):
                 if key in sensor_cfg and sensor_cfg[key] is not None:
-                    merged[key] = sensor_cfg[key]
+                    merged[key] = _merge_section(cfg.get(key), sensor_cfg[key])
             cfg = merged
         arms = cfg.get("arms") or []
         if not arms:
@@ -1205,7 +1229,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--decision-publish",
         choices=["always", "event", "never"],
-        default="always",
+        default="never",
         help="publish policy decision messages (always|event|never)",
     )
     p.add_argument("--run-dir", default=None, help="기록 루트(artifacts/<ts>_<device_id> 기본)")

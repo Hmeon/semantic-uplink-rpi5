@@ -1,15 +1,71 @@
-# 정책/팔(arms) 정의 — (tau, kbits) 조합
-arms:
+# Adaptive policy config (LinUCB): (tau, kbits) arms + reward/safety.
+#
+# Notes:
+# - `tau` is an EWMA residual threshold (sensor units), NOT time.
+# - Use `sensors.<sensor>.arms` to define per-sensor tau scales.
+
+arms:  # fallback arms (used when no per-sensor override exists)
   - { tau: 1.5, kbits: 6 }
-  - { tau: 3.0, kbits: 8 }
-  - { tau: 6.0, kbits: 10 }
+  - { tau: 3.0, kbits: 6 }
+  - { tau: 6.0, kbits: 8 }
+
+linucb:
+  alpha_ucb: 0.75
+  lambda_ridge: 1.0
+  warmup_per_arm: 1
+
+scales:
+  aoi_ms: 1000.0
+  rate_bps: 1024.0
+  q_len: 50.0
+
+sensors:
+  mic_rms:
+    arms:
+      # tau in dBFS residual
+      - { tau: 1.5, kbits: 6 }
+      - { tau: 2.5, kbits: 6 }
+      - { tau: 3.0, kbits: 6 }  # fixed_tau baseline
+      - { tau: 3.5, kbits: 6 }
+      - { tau: 4.5, kbits: 6 }
+    safety:
+      mae_max: 3.0
+      mae_est_max: 3.0
+    linucb:
+      ucb_min_tau: 3.0
+      safe_arm: { tau: 1.5, kbits: 6 }
+      aoi_safe_arm: { tau: 3.0, kbits: 6 }
+
+  temp:
+    arms:
+      # tau in °C residual
+      - { tau: 0.05, kbits: 8 }
+      - { tau: 0.05, kbits: 10 }
+      - { tau: 0.10, kbits: 8 }
+      - { tau: 0.10, kbits: 10 }
+      - { tau: 0.20, kbits: 8 }  # fixed_tau baseline
+      - { tau: 0.20, kbits: 10 }
+      - { tau: 0.30, kbits: 8 }
+      - { tau: 0.30, kbits: 10 }
+    safety:
+      mae_max: 0.2
+      mae_est_max: 0.2
+    linucb:
+      ucb_min_tau: 0.2
+      safe_arm: { tau: 0.05, kbits: 8 }
+      aoi_safe_arm: { tau: 0.2, kbits: 8 }
+
 reward:
-  alpha: 1.0   # AoI 가중
-  beta:  1.0   # MAE 가중
-  gamma: 0.5   # 전송량 가중
+  alpha: 1.0  # AoI weight
+  beta: 1.0   # MAE weight
+  gamma: 0.5  # rate weight
+
 safety:
-  aoi_max_ms: 5000
+  # Keep slightly above the fixed heartbeat (10s) so AoI-limit safety does not
+  # preempt the heartbeat and accidentally increase event rate.
+  aoi_max_ms: 12000
   mae_max: 2.0
   safety_force_emit_on_aoi: false
+
 diagnostics:
   enabled: false

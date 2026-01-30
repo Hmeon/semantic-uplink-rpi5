@@ -577,11 +577,22 @@ class Collector:
                     markers_part = int(self._markers_part)
                     self._markers_part += 1
 
+            def _replace_retry(tmp: str, dst: str) -> None:
+                # Windows can transiently lock freshly-written files (indexer/AV),
+                # causing atomic replace to fail with PermissionError. Retry briefly.
+                for i in range(10):
+                    try:
+                        os.replace(tmp, dst)
+                        return
+                    except PermissionError:
+                        time.sleep(0.02 * (i + 1))
+                os.replace(tmp, dst)
+
             def _write_csv(df: pd.DataFrame, fname: str) -> None:
                 tmp = os.path.join(self._logs_dir, f"{fname}.tmp")
                 dst = os.path.join(self._logs_dir, fname)
                 df.to_csv(tmp, index=False)
-                os.replace(tmp, dst)
+                _replace_retry(tmp, dst)
 
             def _write_table(df: pd.DataFrame, base: str) -> None:
                 if self._storage_format == "csv":
@@ -591,7 +602,7 @@ class Collector:
                 dst = os.path.join(self._logs_dir, f"{base}.parquet")
                 try:
                     df.to_parquet(tmp, index=False)
-                    os.replace(tmp, dst)
+                    _replace_retry(tmp, dst)
                 except ImportError as exc:
                     if os.path.exists(tmp):
                         try:
@@ -724,7 +735,7 @@ class Collector:
             dst = os.path.join(self._logs_dir, "collector_meta.json")
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(meta, f, ensure_ascii=False, indent=2)
-            os.replace(tmp, dst)
+            _replace_retry(tmp, dst)
 
             logger.info(
                 "flush events+=%s decisions+=%s markers+=%s total_events_unique=%s "

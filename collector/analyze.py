@@ -70,11 +70,60 @@ from common.config import load_policy_config_dict
 from common.discord_webhook import DiscordWebhookError, send_discord_message
 from common.logging_setup import add_logging_cli_args, setup_logging_from_args
 from common.metrics import percent_improvement
-from common.schema import EventMsg, LinkProfile, PolicyMode
+from common.quantize import quantize_array, quantizer_for_sensor
+from common.schema import EventMsg, LinkProfile, PolicyMode, SensorType
 
 logger = logging.getLogger(__name__)
 
 # ----------------------------- I/O -----------------------------
+
+def _infer_run_dir_from_file(p: Path) -> Path:
+    """Return the run directory that contains `logs/` for a given log file path."""
+    return p.parent.parent if p.parent.name == "logs" else p.parent
+
+
+def _read_json_best_effort(p: Path) -> dict | None:
+    try:
+        return json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+
+
+def _extract_run_meta(run_dir: Path) -> dict[str, object]:
+    """Extract best-effort run metadata (seed/scenario) for alignment diagnostics."""
+    # Synthetic field runs write run_meta.json at the run root; the "simple" generator
+    # writes the synthetic seed into logs/collector_meta.json.
+    meta: dict[str, object] = {}
+
+    run_meta = _read_json_best_effort(run_dir / "run_meta.json")
+    if isinstance(run_meta, dict):
+        seed = run_meta.get("seed")
+        if isinstance(seed, (int, float)) and math.isfinite(float(seed)):
+            meta["meta_seed"] = int(seed)
+        scenario = run_meta.get("scenario")
+        if isinstance(scenario, dict):
+            sid = scenario.get("id")
+            if isinstance(sid, str) and sid.strip():
+                meta["meta_scenario"] = sid.strip()
+        elif isinstance(scenario, str) and scenario.strip():
+            meta["meta_scenario"] = scenario.strip()
+
+    if "meta_seed" not in meta or "meta_scenario" not in meta:
+        col_meta = _read_json_best_effort(run_dir / "logs" / "collector_meta.json")
+        if isinstance(col_meta, dict):
+            synth = col_meta.get("synthetic")
+            if isinstance(synth, dict):
+                if "meta_seed" not in meta:
+                    seed = synth.get("seed")
+                    if isinstance(seed, (int, float)) and math.isfinite(float(seed)):
+                        meta["meta_seed"] = int(seed)
+                if "meta_scenario" not in meta:
+                    sid = synth.get("scenario") or synth.get("scenario_id")
+                    if isinstance(sid, str) and sid.strip():
+                        meta["meta_scenario"] = sid.strip()
+
+    return meta
+
 
 def _discover_files(inputs: Iterable[str | os.PathLike]) -> list[Path]:
     files: list[Path] = []
@@ -176,6 +225,7 @@ def load_events(paths: list[str | os.PathLike]) -> pd.DataFrame:
         raise FileNotFoundError("no input files found (parquet/csv)")
 
     dfs = []
+    meta_cache: dict[Path, dict[str, object]] = {}
     for f in files:
         if f.suffix.lower() == ".parquet":
             try:
@@ -215,6 +265,17 @@ def load_events(paths: list[str | os.PathLike]) -> pd.DataFrame:
                 raise ValueError(f"{f} missing columns: {sorted(missing)}")
         df["__source_file"] = str(f)
         df["run_id"] = _infer_run_id_from_path(f)
+
+        # Best-effort run metadata to support correct seq-aligned aggregation across seeds.
+        run_dir = _infer_run_dir_from_file(f)
+        meta = meta_cache.get(run_dir)
+        if meta is None:
+            meta = _extract_run_meta(run_dir)
+            meta_cache[run_dir] = meta
+        if "meta_seed" in meta:
+            df["meta_seed"] = int(meta["meta_seed"])
+        if "meta_scenario" in meta:
+            df["meta_scenario"] = str(meta["meta_scenario"])
         dfs.append(df)
 
     if not dfs:
@@ -236,6 +297,8 @@ def load_events(paths: list[str | os.PathLike]) -> pd.DataFrame:
         # optional
         "t_recv_ns": "Int64",
         "mqtt_bytes": "Int64",
+        "meta_seed": "Int64",
+        "meta_scenario": "string",
     }
     for k, t in cast_cols.items():
         if k in out.columns:
@@ -662,56 +725,89 @@ def summarize_decisions_diagnostics_by_run(
         row["outbox_pending_auc_s"] = float(outbox_auc_s)
         row["outbox_pending_recovery_s"] = float(outbox_recovery_s)
 
-        # --- arm-level diagnostics (arm_id required) ---
+        # --- arm-level diagnostics (prefer arm_id, fall back to (tau, kbits)) ---
         row["linucb_switch_rate"] = float("nan")
         row[entropy_col] = float("nan")
+        ga = pd.DataFrame()
         if "arm_id" in g.columns and g["arm_id"].notna().any():
             ga = g.dropna(subset=["arm_id"]).copy()
             ga["arm_id"] = ga["arm_id"].astype("int64")
+        elif "tau" in g.columns and "kbits" in g.columns and g["tau"].notna().any() and g["kbits"].notna().any():
+            # When LinUCB diagnostics are disabled, decision logs may omit `arm_id`.
+            # In that case, derive a stable per-group arm_id from the chosen (tau, kbits) action.
+            ga = g.dropna(subset=["tau", "kbits"]).copy()
+            ga["tau"] = pd.to_numeric(ga["tau"], errors="coerce")
+            ga["kbits"] = pd.to_numeric(ga["kbits"], errors="coerce")
+            ga = ga.replace([np.inf, -np.inf], np.nan).dropna(subset=["tau", "kbits"])
             if not ga.empty:
-                counts = ga["arm_id"].value_counts().sort_index()
-                total = int(counts.sum())
-                for arm_id, cnt in counts.items():
-                    arm_rows.append(
-                        {
-                            "run_id": str(run_id),
-                            "profile": str(prof),
-                            "policy": str(pol),
-                            "sensor": str(sensor),
-                            "arm_id": int(arm_id),
-                            "count": int(cnt),
-                            "frac": float(cnt / total) if total > 0 else float("nan"),
-                            "n_decisions": int(total),
-                        }
-                    )
+                uniq = (
+                    ga[["tau", "kbits"]]
+                    .drop_duplicates()
+                    .sort_values(["tau", "kbits"], kind="mergesort")
+                    .reset_index(drop=True)
+                )
+                uniq["_arm_id"] = np.arange(int(len(uniq)), dtype=np.int64)
+                ga = ga.merge(uniq, how="left", on=["tau", "kbits"])
+                ga["arm_id"] = ga["_arm_id"].astype("int64")
 
-                av = ga["arm_id"].to_numpy()
-                if av.size >= 2:
-                    row["linucb_switch_rate"] = float(np.mean(av[1:] != av[:-1]))
+        if not ga.empty:
+            counts = ga["arm_id"].value_counts().sort_index()
+            total = int(counts.sum())
+            for arm_id, cnt in counts.items():
+                tau_v = float("nan")
+                kbits_v: int | None = None
+                try:
+                    sub = ga.loc[ga["arm_id"] == int(arm_id)]
+                    if not sub.empty:
+                        if "tau" in sub.columns and sub["tau"].notna().any():
+                            tau_v = float(sub["tau"].iloc[0])
+                        if "kbits" in sub.columns and sub["kbits"].notna().any():
+                            kbits_v = int(sub["kbits"].iloc[0])
+                except Exception:
+                    tau_v = float("nan")
+                    kbits_v = None
+                arm_rows.append(
+                    {
+                        "run_id": str(run_id),
+                        "profile": str(prof),
+                        "policy": str(pol),
+                        "sensor": str(sensor),
+                        "arm_id": int(arm_id),
+                        "tau": float(tau_v),
+                        "kbits": int(kbits_v) if kbits_v is not None else pd.NA,
+                        "count": int(cnt),
+                        "frac": float(cnt / total) if total > 0 else float("nan"),
+                        "n_decisions": int(total),
+                    }
+                )
 
-                t0 = int(ga["_t_ns"].iloc[0])
-                ga["_window_idx"] = ((ga["_t_ns"] - t0) // window_ns).astype("int64")
-                win_entropies = []
-                for w, gw in ga.groupby("_window_idx", sort=False, observed=True):
-                    c = gw["arm_id"].value_counts().to_numpy(dtype=np.float64)
-                    h = _entropy_log2_from_counts(c)
-                    entropy_rows.append(
-                        {
-                            "run_id": str(run_id),
-                            "profile": str(prof),
-                            "policy": str(pol),
-                            "sensor": str(sensor),
-                            "time_base": str(time_col),
-                            "window_s": int(window_s),
-                            "window_idx": int(w),
-                            "n_decisions": int(len(gw)),
-                            "entropy_log2": float(h),
-                        }
-                    )
-                    if math.isfinite(h):
-                        win_entropies.append(float(h))
-                if win_entropies:
-                    row[entropy_col] = float(np.mean(win_entropies))
+            av = ga["arm_id"].to_numpy()
+            if av.size >= 2:
+                row["linucb_switch_rate"] = float(np.mean(av[1:] != av[:-1]))
+
+            t0 = int(ga["_t_ns"].iloc[0])
+            ga["_window_idx"] = ((ga["_t_ns"] - t0) // window_ns).astype("int64")
+            win_entropies = []
+            for w, gw in ga.groupby("_window_idx", sort=False, observed=True):
+                c = gw["arm_id"].value_counts().to_numpy(dtype=np.float64)
+                h = _entropy_log2_from_counts(c)
+                entropy_rows.append(
+                    {
+                        "run_id": str(run_id),
+                        "profile": str(prof),
+                        "policy": str(pol),
+                        "sensor": str(sensor),
+                        "time_base": str(time_col),
+                        "window_s": int(window_s),
+                        "window_idx": int(w),
+                        "n_decisions": int(len(gw)),
+                        "entropy_log2": float(h),
+                    }
+                )
+                if math.isfinite(h):
+                    win_entropies.append(float(h))
+            if win_entropies:
+                row[entropy_col] = float(np.mean(win_entropies))
 
         # --- safe arm intervention diagnostics ---
         row["linucb_safe_forced_rate"] = float("nan")
@@ -1196,6 +1292,26 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
         else:
             event_rate_hz = float("nan")
 
+        # (tau, kbits) action diversity. This is observable from Event logs even when
+        # decision logs are disabled (e.g., edge `--decision-publish never`).
+        action_unique_count = float("nan")
+        action_switch_rate = float("nan")
+        if len(g) > 0 and {"tau", "kbits"}.issubset(g.columns):
+            tau_key = pd.to_numeric(g["tau"], errors="coerce").round(6)
+            kbits_key = pd.to_numeric(g["kbits"], errors="coerce")
+            mask = tau_key.notna() & kbits_key.notna()
+            if mask.any():
+                actions = list(
+                    zip(
+                        tau_key.loc[mask].astype("float64").to_numpy(),
+                        kbits_key.loc[mask].astype("int64").to_numpy(),
+                    )
+                )
+                action_unique_count = float(len(set(actions)))
+                if len(actions) >= 2:
+                    switches = sum(a != b for a, b in zip(actions[1:], actions[:-1]))
+                    action_switch_rate = float(switches / (len(actions) - 1))
+
         rows.append({
             "run_id": str(run_id),
             "profile": str(prof),
@@ -1213,6 +1329,8 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
             "mae_event_mean": mae_mean,
             "mae_event_p95": mae_p95,
             "kbits_mean": float(g["kbits"].mean()),
+            "action_unique_count": float(action_unique_count),
+            "action_switch_rate": float(action_switch_rate),
             "time_base": time_base,
             "rx_delay_mean_ms": float(rx_delay_mean_ms),
             "rx_delay_p50_ms": float(rx_delay_p50_ms),
@@ -1229,6 +1347,237 @@ def summarize_by_run(df: pd.DataFrame) -> pd.DataFrame:
     out["policy"] = pd.Categorical(out["policy"], categories=pol_order, ordered=True)
     out = out.sort_values(["run_id", "profile", "policy", "sensor"]).reset_index(drop=True)
     return out
+
+
+def compute_seq_aligned_quality_metrics(
+    df: pd.DataFrame,
+    *,
+    baseline_policy: str = "periodic",
+    tau_ref_policy: str = "fixed_tau",
+) -> pd.DataFrame:
+    """Compute quality metrics by aligning sparse policies to a periodic baseline via `seq`.
+
+    Motivation:
+        - This project prioritizes low transmission while preserving information quality and
+          not missing "interesting" segments (anomalies). AoI is not a primary KPI.
+        - Across independent runs, absolute timestamps differ (wall-clock anchored). The per-sensor
+          sample sequence number `seq` is stable and allows robust alignment.
+
+    Approach:
+        - Choose a periodic baseline run per (profile, sensor) as "truth" (quantized values).
+        - Reconstruct candidate streams via "last observation carried forward" at baseline seqs.
+        - Define anomaly segments on the baseline using a reference tau derived from
+          `tau_ref_policy` (typically fixed_tau); measure segment recall (hit-rate) for each run.
+        - To avoid counting single-sample noise spikes as "incidents", anomaly segments are filtered
+          to require at least 2 consecutive samples above the threshold.
+
+    Args:
+        df: De-duplicated event DataFrame (collector schema normalized by `load_events`).
+        baseline_policy: Policy used as the reference stream (default: periodic).
+        tau_ref_policy: Policy used to derive the anomaly threshold tau_ref (default: fixed_tau).
+
+    Returns:
+        DataFrame keyed by (run_id, profile, policy, sensor) with additional metrics:
+            - recon_mae_{mean,p95,p99,max}: reconstruction error vs baseline along seq.
+            - anomaly_tau_ref: threshold used to define anomalies (from tau_ref_policy).
+            - anomaly_segments: count of anomaly segments in the baseline (per profile/sensor).
+            - anomaly_segments_hit: how many segments contain >=1 event for the run.
+            - anomaly_segment_recall: hit / segments.
+    """
+    need = {"run_id", "profile", "policy", "sensor", "seq", "val", "res", "tau"}
+    if not need.issubset(df.columns):
+        return pd.DataFrame()
+
+    # Ensure deterministic ordering and de-dup once (seq alignment relies on stable ordering).
+    df = dedup_and_sort(df).copy()
+    min_anomaly_segment_len_samples = 2
+
+    def _pick_baseline_run(g: pd.DataFrame, pol: str) -> str | None:
+        sub = g[g["policy"].astype("string") == pol]
+        if sub.empty:
+            return None
+        counts = sub.groupby("run_id", sort=False)["seq"].count()
+        if counts.empty:
+            return None
+        return str(counts.idxmax())
+
+    def _recon_err(
+        base_seq: np.ndarray,
+        base_val: np.ndarray,
+        cand_seq: np.ndarray,
+        cand_val: np.ndarray,
+    ):
+        if base_seq.size == 0 or cand_seq.size == 0:
+            return np.array([], dtype="float64")
+        # For each baseline seq, take the last candidate event with seq <= baseline seq.
+        idx = np.searchsorted(cand_seq, base_seq, side="right") - 1
+        ok = idx >= 0
+        if not np.any(ok):
+            return np.array([], dtype="float64")
+        return np.abs(base_val[ok] - cand_val[idx[ok]]).astype("float64")
+
+    def _segments_from_mask(seq: np.ndarray, mask: np.ndarray) -> list[tuple[int, int]]:
+        if seq.size == 0 or mask.size == 0 or seq.size != mask.size:
+            return []
+        idx = np.where(mask)[0]
+        if idx.size == 0:
+            return []
+        segs: list[tuple[int, int]] = []
+        s = int(idx[0])
+        p = int(idx[0])
+        for i in idx[1:]:
+            i = int(i)
+            # Segment continues only if the *sequence number* is consecutive.
+            if i == p + 1 and int(seq[i]) == int(seq[p]) + 1:
+                p = i
+                continue
+            segs.append((int(seq[s]), int(seq[p])))
+            s = i
+            p = i
+        segs.append((int(seq[s]), int(seq[p])))
+        return segs
+
+    def _segment_recall(
+        segs: list[tuple[int, int]],
+        cand_seq: np.ndarray,
+    ) -> tuple[float, float, float]:
+        if not segs:
+            return float("nan"), float("nan"), float("nan")
+        if cand_seq.size == 0:
+            return float(len(segs)), 0.0, 0.0
+        hit = 0
+        for a, b in segs:
+            j = int(np.searchsorted(cand_seq, a, side="left"))
+            if j < cand_seq.size and int(cand_seq[j]) <= int(b):
+                hit += 1
+        recall = float(hit / len(segs))
+        return float(len(segs)), float(hit), recall
+
+    # When synthetic metadata is available, compute recon/coverage per (scenario, seed) so
+    # aggregates across multiple seeds remain meaningful. Without this, a single baseline run
+    # can incorrectly be used for other seeds, producing non-zero "periodic vs periodic" errors
+    # and depressed anomaly recall.
+    group_cols = ["profile", "sensor"]
+    if "meta_scenario" in df.columns:
+        group_cols.append("meta_scenario")
+    if "meta_seed" in df.columns:
+        group_cols.append("meta_seed")
+
+    rows: list[dict[str, object]] = []
+    for keys, g in df.groupby(group_cols, sort=False, dropna=False):
+        prof = keys[0]
+        sensor = keys[1]
+        base_run = _pick_baseline_run(g, str(baseline_policy))
+        if base_run is None:
+            continue
+        base = g[
+            (g["policy"].astype("string") == str(baseline_policy))
+            & (g["run_id"].astype("string") == base_run)
+        ]
+        base = base.sort_values("seq", kind="mergesort")
+        base_seq_s = pd.to_numeric(base["seq"], errors="coerce")
+        base_val_s = pd.to_numeric(base["val"], errors="coerce")
+        base_res_s = pd.to_numeric(base["res"], errors="coerce")
+        base_ok = base_seq_s.notna() & base_val_s.notna() & base_res_s.notna()
+        base_seq = base_seq_s[base_ok].astype("int64").to_numpy()
+        base_val = base_val_s[base_ok].to_numpy(dtype="float64")
+        base_res = base_res_s[base_ok].to_numpy(dtype="float64")
+
+        # If candidate policies use different kbits, their dequantized values will not match the
+        # periodic baseline exactly even when the underlying signal is identical. To keep the
+        # seq-aligned recon metric comparable (and avoid penalizing finer quantization when the
+        # "truth" is already quantized), project candidate values onto the baseline quantization
+        # grid before computing reconstruction error.
+        base_kbits: int | None = None
+        if "kbits" in base.columns:
+            kb_s = pd.to_numeric(base["kbits"], errors="coerce")
+            kb = kb_s[base_ok].to_numpy(dtype="float64")
+            kb = kb[np.isfinite(kb)]
+            if kb.size > 0:
+                base_kbits = int(np.median(kb))
+
+        # Derive anomaly threshold (tau_ref) from a representative fixed_tau run if present.
+        tau_ref = float("nan")
+        tau_run = _pick_baseline_run(g, str(tau_ref_policy))
+        if tau_run is not None:
+            tau_src = g[
+                (g["policy"].astype("string") == str(tau_ref_policy))
+                & (g["run_id"].astype("string") == tau_run)
+            ]
+            tau_vals = pd.to_numeric(tau_src["tau"], errors="coerce").to_numpy(dtype="float64")
+            tau_vals = tau_vals[np.isfinite(tau_vals)]
+            if tau_vals.size > 0:
+                tau_ref = float(np.median(tau_vals))
+
+        anomaly_segs: list[tuple[int, int]] = []
+        tau_ref_ok = bool(np.isfinite(tau_ref))
+        if tau_ref_ok:
+            mask = np.isfinite(base_res) & (np.abs(base_res) > float(tau_ref))
+            anomaly_segs = _segments_from_mask(base_seq, mask)
+            anomaly_segs = [
+                (a, b)
+                for (a, b) in anomaly_segs
+                if (int(b) - int(a) + 1) >= int(min_anomaly_segment_len_samples)
+            ]
+
+        # Compute metrics per run (all policies) under this (profile, sensor).
+        for run_id, gr in g.groupby("run_id", sort=False):
+            pol = str(gr["policy"].iloc[0])
+            gr = gr.sort_values("seq", kind="mergesort")
+            cand_seq_s = pd.to_numeric(gr["seq"], errors="coerce")
+            cand_val_s = pd.to_numeric(gr["val"], errors="coerce")
+            cand_ok = cand_seq_s.notna() & cand_val_s.notna()
+            cand_seq = cand_seq_s[cand_ok].astype("int64").to_numpy()
+            cand_val = cand_val_s[cand_ok].to_numpy(dtype="float64")
+
+            if base_kbits is not None:
+                try:
+                    q = quantizer_for_sensor(SensorType(str(sensor)), int(base_kbits))
+                    cand_val, _ = quantize_array(q, cand_val)
+                except Exception:
+                    pass
+
+            err = _recon_err(base_seq, base_val, cand_seq, cand_val)
+            if err.size > 0:
+                recon_mean = float(np.mean(err))
+                recon_p95 = float(np.quantile(err, 0.95))
+                recon_p99 = float(np.quantile(err, 0.99))
+                recon_max = float(np.max(err))
+            else:
+                recon_mean = float("nan")
+                recon_p95 = float("nan")
+                recon_p99 = float("nan")
+                recon_max = float("nan")
+
+            # Coverage: if no anomaly segments exist in the baseline for this (profile, sensor),
+            # define recall=1.0 (vacuously satisfied) rather than NaN to avoid failing KPI4 on
+            # stable segments with zero positives.
+            seg_n, seg_hit, seg_recall = float("nan"), float("nan"), float("nan")
+            if not tau_ref_ok:
+                seg_n, seg_hit, seg_recall = float("nan"), float("nan"), float("nan")
+            elif not anomaly_segs:
+                seg_n, seg_hit, seg_recall = 0.0, 0.0, 1.0
+            elif cand_seq.size > 0:
+                seg_n, seg_hit, seg_recall = _segment_recall(anomaly_segs, cand_seq)
+            else:
+                seg_n, seg_hit, seg_recall = float(len(anomaly_segs)), 0.0, 0.0
+
+            rows.append({
+                "run_id": str(run_id),
+                "profile": str(prof),
+                "policy": str(pol),
+                "sensor": str(sensor),
+                "recon_mae_mean": recon_mean,
+                "recon_mae_p95": recon_p95,
+                "recon_mae_p99": recon_p99,
+                "recon_mae_max": recon_max,
+                "anomaly_tau_ref": float(tau_ref),
+                "anomaly_segments": seg_n,
+                "anomaly_segments_hit": seg_hit,
+                "anomaly_segment_recall": seg_recall,
+            })
+
+    return pd.DataFrame(rows)
 
 
 def summarize(summary_by_run: pd.DataFrame) -> pd.DataFrame:
@@ -1285,6 +1634,8 @@ def summarize(summary_by_run: pd.DataFrame) -> pd.DataFrame:
         "rx_delay_mean_ms",
         "rx_delay_p50_ms",
         "rx_delay_p95_ms",
+        "action_unique_count",
+        "action_switch_rate",
         "event_reason_threshold_frac",
         "event_reason_heartbeat_frac",
         "dup_bytes_ratio",
@@ -1309,6 +1660,14 @@ def summarize(summary_by_run: pd.DataFrame) -> pd.DataFrame:
         "outbox_pending_max",
         "outbox_pending_auc_s",
         "outbox_pending_recovery_s",
+        "recon_mae_mean",
+        "recon_mae_p95",
+        "recon_mae_p99",
+        "recon_mae_max",
+        "anomaly_tau_ref",
+        "anomaly_segments",
+        "anomaly_segments_hit",
+        "anomaly_segment_recall",
     ]:
         if c in summary_by_run.columns:
             metric_cols.append(c)
@@ -1408,14 +1767,22 @@ def compare_policies(
             "baseline_mae_event_mean": _base("mae_event_mean"),
             "baseline_mae_event_p95": _base("mae_event_p95"),
         }
+        for c in ["recon_mae_mean", "recon_mae_p95", "recon_mae_p99", "recon_mae_max"]:
+            if c in summary.columns:
+                row[f"baseline_{c}"] = _base(c)
 
-        for col, unit in [
+        metric_pairs: list[tuple[str, str]] = [
             ("rate_Bps", "Bps"),
             ("aoi_mean_ms", "ms"),
             ("aoi_p95_ms", "ms"),
             ("mae_event_mean", "mae"),
             ("mae_event_p95", "mae"),
-        ]:
+        ]
+        for c in ["recon_mae_mean", "recon_mae_p95", "recon_mae_p99", "recon_mae_max"]:
+            if c in summary.columns:
+                metric_pairs.append((c, "mae"))
+
+        for col, unit in metric_pairs:
             cand = float(r[col])
             basev = float(row[f"baseline_{col}"])
             row[f"{col}_delta_{unit}"] = cand - basev
@@ -1428,6 +1795,115 @@ def compare_policies(
     out["policy"] = pd.Categorical(out["policy"], categories=pol_order, ordered=True)
     out = out.sort_values(["profile", "sensor", "policy"]).reset_index(drop=True)
     return out
+
+
+def compute_final_kpi(summary: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
+    """Compute strict final KPI verdicts (PASS/FAIL) for adaptive policy.
+
+    KPI (PASS requires all 5):
+      (1) Rate_improvement_vs_periodic >= 85%
+      (2) Rate_improvement_vs_fixed_tau >= -10%
+      (3) recon_mae_p95_improvement_vs_fixed_tau >= -10%
+      (4) anomaly_segment_recall >= 0.90
+      (5) aoi_p95_ms_improvement_vs_fixed_tau >= -10%
+
+    Evaluation scope is enforced per (profile, sensor). Any missing/NaN value FAILs.
+
+    Returns:
+        (kpi_table, project_pass) where project_pass is True only if all rows PASS and
+        at least one (profile, sensor) is present.
+    """
+    if summary.empty:
+        return pd.DataFrame(), False
+
+    adaptive = summary[summary["policy"].astype("string") == "adaptive"]
+    if adaptive.empty:
+        return pd.DataFrame(), False
+
+    comp_periodic = compare_policies(summary, baseline_policy="periodic")
+    comp_fixed = compare_policies(summary, baseline_policy="fixed_tau")
+
+    def _keyed(df: pd.DataFrame) -> dict[tuple[str, str, str], pd.Series]:
+        if df.empty:
+            return {}
+        return {
+            (str(r["profile"]), str(r["sensor"]), str(r["policy"])): r
+            for _, r in df.iterrows()
+        }
+
+    comp_periodic_k = _keyed(comp_periodic)
+    comp_fixed_k = _keyed(comp_fixed)
+    summary_k = _keyed(summary)
+
+    pairs: list[tuple[str, str]] = [
+        (str(r["profile"]), str(r["sensor"]))
+        for _, r in adaptive[["profile", "sensor"]].drop_duplicates().iterrows()
+    ]
+
+    rows: list[dict[str, object]] = []
+    for prof, sensor in pairs:
+        pol = "adaptive"
+        key = (prof, sensor, pol)
+
+        r_p = comp_periodic_k.get(key)
+        r_f = comp_fixed_k.get(key)
+        r_s = summary_k.get(key)
+
+        rate_imp_periodic = (
+            float(r_p.get("rate_Bps_improvement_pct")) if r_p is not None else float("nan")
+        )
+        rate_imp_fixed = (
+            float(r_f.get("rate_Bps_improvement_pct")) if r_f is not None else float("nan")
+        )
+        # Robust recon KPI: percent improvement is undefined when the fixed_tau baseline is ~0.
+        # In that case, require adaptive recon_p95 to also be ~0 (else treat as a clear regression).
+        recon_p95_imp_fixed = float("nan")
+        fixed_row = summary_k.get((prof, sensor, "fixed_tau"))
+        if fixed_row is not None and r_s is not None:
+            basev = float(fixed_row.get("recon_mae_p95", float("nan")))
+            cand = float(r_s.get("recon_mae_p95", float("nan")))
+            if math.isfinite(basev) and math.isfinite(cand):
+                eps = 1e-12
+                if basev <= eps:
+                    recon_p95_imp_fixed = 0.0 if cand <= eps else -100.0
+                else:
+                    recon_p95_imp_fixed = percent_improvement(basev, cand)
+        aoi_p95_imp_fixed = (
+            float(r_f.get("aoi_p95_ms_improvement_pct")) if r_f is not None else float("nan")
+        )
+        anomaly_recall = (
+            float(r_s.get("anomaly_segment_recall")) if r_s is not None else float("nan")
+        )
+
+        k1 = bool(math.isfinite(rate_imp_periodic) and rate_imp_periodic >= 85.0)
+        k2 = bool(math.isfinite(rate_imp_fixed) and rate_imp_fixed >= -10.0)
+        k3 = bool(math.isfinite(recon_p95_imp_fixed) and recon_p95_imp_fixed >= -10.0)
+        k4 = bool(math.isfinite(anomaly_recall) and anomaly_recall >= 0.90)
+        k5 = bool(math.isfinite(aoi_p95_imp_fixed) and aoi_p95_imp_fixed >= -10.0)
+        overall = bool(k1 and k2 and k3 and k4 and k5)
+
+        rows.append(
+            {
+                "profile": prof,
+                "sensor": sensor,
+                "policy": pol,
+                "rate_improvement_vs_periodic_pct": float(rate_imp_periodic),
+                "rate_improvement_vs_fixed_tau_pct": float(rate_imp_fixed),
+                "recon_mae_p95_improvement_vs_fixed_tau_pct": float(recon_p95_imp_fixed),
+                "anomaly_segment_recall": float(anomaly_recall),
+                "aoi_p95_improvement_vs_fixed_tau_pct": float(aoi_p95_imp_fixed),
+                "kpi1_rate_vs_periodic": "PASS" if k1 else "FAIL",
+                "kpi2_rate_vs_fixed_tau": "PASS" if k2 else "FAIL",
+                "kpi3_recon_p95_vs_fixed_tau": "PASS" if k3 else "FAIL",
+                "kpi4_anomaly_segment_recall": "PASS" if k4 else "FAIL",
+                "kpi5_aoi_p95_vs_fixed_tau": "PASS" if k5 else "FAIL",
+                "overall": "PASS" if overall else "FAIL",
+            }
+        )
+
+    out = pd.DataFrame(rows)
+    project_pass = bool((not out.empty) and (out["overall"] == "PASS").all())
+    return out, project_pass
 
 
 # --------------------------- 리포트 ---------------------------
@@ -1550,129 +2026,272 @@ def _write_report_md(
 
         lines.append("| " + " | ".join(cells) + " |")
 
-    # --- LinUCB diagnostics (optional) ---
-    diag_cols = [
-        "linucb_n_decisions",
-        "linucb_action_entropy_mean_60s",
-        "linucb_switch_rate",
-        "linucb_safe_forced_rate",
-        "linucb_forced_reason_aoi_limit_rate",
-        "linucb_forced_reason_mae_limit_rate",
-        "linucb_forced_reason_both_rate",
-        "linucb_ucb_uncertainty_mean",
-        "linucb_rate_limit_skips_per_decision",
-        "outbox_pending_max",
-        "outbox_pending_auc_s",
-        "outbox_pending_recovery_s",
-        "dup_bytes_ratio",
-        "rx_delay_p50_ms",
-        "rx_delay_p95_ms",
+    # --- Seq-aligned quality (vs periodic) ---
+    qual_cols = [
+        "recon_mae_mean",
+        "recon_mae_p95",
+        "recon_mae_max",
+        "anomaly_tau_ref",
+        "anomaly_segment_recall",
+        "anomaly_segments",
+        "anomaly_segments_hit",
     ]
-    if any(c in tbl.columns for c in diag_cols):
+    if any(c in tbl.columns for c in qual_cols):
+        lines.append("")
+        lines.append("## Quality (seq-aligned vs periodic)")
+        lines.append("")
+        lines.append(
+            "- `recon_mae_*`: periodic baseline(=전부 전송) 스트림을 **센서별 `seq`로 정렬**한 뒤, "
+            "후보 정책 스트림을 LOCF(마지막 전송값 유지)로 복원하여 MAE를 계산합니다."
+        )
+        lines.append("- `anomaly_segment_recall`:")
+        lines.append("  - periodic baseline에서 `|res| > tau_ref` 세그먼트(길이>=2샘플)를 정의")
+        lines.append("  - 후보 정책이 세그먼트 내 1회 이상 전송하면 hit")
+        lines.append("  - recall = hit / segments")
+        lines.append("  - (convention) segments=0 => recall=1.0 (vacuously satisfied)")
+        lines.append("")
+
+        if has_runs:
+            lines.append(
+                "| profile | policy | sensor | recon_mean | recon_p95 | recon_max | "
+                "tau_ref | anomaly_recall | hit/total |"
+            )
+            lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|")
+        else:
+            lines.append(
+                "| profile | policy | sensor | recon_mean | recon_p95 | recon_max | "
+                "tau_ref | anomaly_recall | hit/total |"
+            )
+            lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|")
+
+        def _fmt_float(v: float, digits: str) -> str:
+            if not np.isfinite(v):
+                return "NaN"
+            return format(float(v), digits)
+
+        def _fmt_int(col: str) -> str:
+            v = float(r.get(col, float("nan")))
+            if not np.isfinite(v):
+                return "NaN"
+            return str(int(round(v)))
+
+        for _, r in tbl.iterrows():
+            recon_mean = (
+                _fmt_mean_std("recon_mae_mean", ".3f")
+                if ("recon_mae_mean" in r and has_runs)
+                else _fmt_float(float(r.get("recon_mae_mean", float("nan"))), ".3f")
+            )
+            recon_p95 = (
+                _fmt_mean_std("recon_mae_p95", ".3f")
+                if ("recon_mae_p95" in r and has_runs)
+                else _fmt_float(float(r.get("recon_mae_p95", float("nan"))), ".3f")
+            )
+            recon_max = (
+                _fmt_mean_std("recon_mae_max", ".3f")
+                if ("recon_mae_max" in r and has_runs)
+                else _fmt_float(float(r.get("recon_mae_max", float("nan"))), ".3f")
+            )
+            tau_ref = (
+                _fmt_mean_std("anomaly_tau_ref", ".3f")
+                if ("anomaly_tau_ref" in r and has_runs)
+                else _fmt_float(float(r.get("anomaly_tau_ref", float("nan"))), ".3f")
+            )
+            recall = (
+                _fmt_mean_std("anomaly_segment_recall", ".3f")
+                if ("anomaly_segment_recall" in r and has_runs)
+                else _fmt_float(float(r.get("anomaly_segment_recall", float("nan"))), ".3f")
+            )
+            hit = _fmt_int("anomaly_segments_hit")
+            total = _fmt_int("anomaly_segments")
+            hit_total = "NaN"
+            if hit != "NaN" and total != "NaN":
+                hit_total = f"{hit}/{total}"
+
+            cells = [
+                str(r["profile"]),
+                str(r["policy"]),
+                str(r["sensor"]),
+                recon_mean,
+                recon_p95,
+                recon_max,
+                tau_ref,
+                recall,
+                hit_total,
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
+
+    # --- LinUCB diagnostics (optional) ---
+    if "policy" in tbl.columns:
         diag = tbl[tbl["policy"].astype("string") == "adaptive"].copy()
-        if not diag.empty:
-            lines.append("")
-            lines.append("## LinUCB/파이프라인 진단 (adaptive)")
-            lines.append("")
+    else:
+        diag = pd.DataFrame()
+
+    if not diag.empty:
+        lines.append("")
+        lines.append("## LinUCB/파이프라인 진단 (adaptive)")
+        lines.append("")
+
+        has_decisions = "linucb_n_decisions" in diag.columns
+        if not has_decisions:
             lines.append(
-                "| profile | sensor | n_dec | H(60s) | switch | safe_forced | "
-                "AOI_limit | MAE_limit | BOTH | UCB_u_mean | skip/dec | "
-                "q_max | q_auc[count·s] | q_recover[s] | dup_bytes_ratio[%] | "
-                "rx_p50[ms] | rx_p95[ms] |"
+                "- Decision 로그(`decisions_*.parquet|csv`)가 없어 decision 기반 LinUCB 진단이 "
+                "비어 있습니다."
             )
             lines.append(
-                "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|"
+                "  - Edge: `--decision-publish event`(또는 `always`)로 decision 메시지를 발행해야 "
+                "합니다."
             )
-            for _, r in diag.iterrows():
-                n_dec = (
-                    _fmt_mean_std("linucb_n_decisions", ".0f")
-                    if "linucb_n_decisions" in r
-                    else "NaN"
-                )
-                h_60s = (
-                    _fmt_mean_std("linucb_action_entropy_mean_60s", ".3f")
-                    if "linucb_action_entropy_mean_60s" in r
-                    else "NaN"
-                )
-                switch = (
-                    _fmt_mean_std("linucb_switch_rate", ".3f")
-                    if "linucb_switch_rate" in r
-                    else "NaN"
-                )
-                safe_forced = (
-                    _fmt_mean_std("linucb_safe_forced_rate", ".3f")
-                    if "linucb_safe_forced_rate" in r
-                    else "NaN"
-                )
-                aoi_limit = (
-                    _fmt_mean_std("linucb_forced_reason_aoi_limit_rate", ".3f")
-                    if "linucb_forced_reason_aoi_limit_rate" in r
-                    else "NaN"
-                )
-                mae_limit = (
-                    _fmt_mean_std("linucb_forced_reason_mae_limit_rate", ".3f")
-                    if "linucb_forced_reason_mae_limit_rate" in r
-                    else "NaN"
-                )
-                both = (
-                    _fmt_mean_std("linucb_forced_reason_both_rate", ".3f")
-                    if "linucb_forced_reason_both_rate" in r
-                    else "NaN"
-                )
-                u_mean = (
-                    _fmt_mean_std("linucb_ucb_uncertainty_mean", ".3f")
-                    if "linucb_ucb_uncertainty_mean" in r
-                    else "NaN"
-                )
-                skip_dec = (
-                    _fmt_mean_std("linucb_rate_limit_skips_per_decision", ".3f")
-                    if "linucb_rate_limit_skips_per_decision" in r
-                    else "NaN"
-                )
-                q_max = (
-                    _fmt_mean_std("outbox_pending_max", ".1f")
-                    if "outbox_pending_max" in r
-                    else "NaN"
-                )
-                q_auc = (
-                    _fmt_mean_std("outbox_pending_auc_s", ".1f")
-                    if "outbox_pending_auc_s" in r
-                    else "NaN"
-                )
-                q_rec = (
-                    _fmt_mean_std("outbox_pending_recovery_s", ".1f")
-                    if "outbox_pending_recovery_s" in r
-                    else "NaN"
-                )
-                dup = (
-                    _fmt_pct_mean_std("dup_bytes_ratio", ".1f") if "dup_bytes_ratio" in r else "NaN"
-                )
-                rx_p50 = (
-                    _fmt_mean_std("rx_delay_p50_ms", ".1f") if "rx_delay_p50_ms" in r else "NaN"
-                )
-                rx_p95 = (
-                    _fmt_mean_std("rx_delay_p95_ms", ".1f") if "rx_delay_p95_ms" in r else "NaN"
-                )
+            lines.append(
+                "  - Synthetic generator: `--decision-publish event`로 decision 로그를 생성하세요."
+            )
+            lines.append("")
+
+        # Always show event-observable action diversity metrics when available.
+        show_actions = {"action_unique_count", "action_switch_rate"}.issubset(diag.columns)
+
+        if has_decisions:
+            cols = [
+                "profile",
+                "sensor",
+                "actions",
+                "action_switch",
+                "n_dec",
+                "H(60s)",
+                "switch",
+                "safe_forced",
+                "AOI_limit",
+                "MAE_limit",
+                "BOTH",
+                "UCB_u_mean",
+                "skip/dec",
+                "q_max",
+                "q_auc[count·s]",
+                "q_recover[s]",
+                "dup_bytes_ratio[%]",
+                "rx_p50[ms]",
+                "rx_p95[ms]",
+            ]
+        else:
+            cols = [
+                "profile",
+                "sensor",
+                "actions",
+                "action_switch",
+                "dup_bytes_ratio[%]",
+                "rx_p50[ms]",
+                "rx_p95[ms]",
+            ]
+        header = "| " + " | ".join(cols) + " |"
+        # First two columns are identifiers, the rest are numeric-ish.
+        sep = "|" + "|".join(["---", "---"] + ["---:"] * (len(cols) - 2)) + "|"
+        lines.append(header)
+        lines.append(sep)
+
+        for _, r in diag.iterrows():
+            actions = (
+                _fmt_mean_std("action_unique_count", ".0f")
+                if show_actions and "action_unique_count" in r
+                else "NaN"
+            )
+            action_switch = (
+                _fmt_mean_std("action_switch_rate", ".3f")
+                if show_actions and "action_switch_rate" in r
+                else "NaN"
+            )
+            dup = _fmt_pct_mean_std("dup_bytes_ratio", ".1f") if "dup_bytes_ratio" in r else "NaN"
+            rx_p50 = _fmt_mean_std("rx_delay_p50_ms", ".1f") if "rx_delay_p50_ms" in r else "NaN"
+            rx_p95 = _fmt_mean_std("rx_delay_p95_ms", ".1f") if "rx_delay_p95_ms" in r else "NaN"
+
+            if not has_decisions:
                 cells = [
                     str(r["profile"]),
                     str(r["sensor"]),
-                    n_dec,
-                    h_60s,
-                    switch,
-                    safe_forced,
-                    aoi_limit,
-                    mae_limit,
-                    both,
-                    u_mean,
-                    skip_dec,
-                    q_max,
-                    q_auc,
-                    q_rec,
+                    actions,
+                    action_switch,
                     dup,
                     rx_p50,
                     rx_p95,
                 ]
                 lines.append("| " + " | ".join(cells) + " |")
+                continue
+
+            if "linucb_n_decisions" in r:
+                n_dec = _fmt_mean_std("linucb_n_decisions", ".0f")
+            else:
+                n_dec = "NaN"
+            h_60s = (
+                _fmt_mean_std("linucb_action_entropy_mean_60s", ".3f")
+                if "linucb_action_entropy_mean_60s" in r
+                else "NaN"
+            )
+            switch = (
+                _fmt_mean_std("linucb_switch_rate", ".3f") if "linucb_switch_rate" in r else "NaN"
+            )
+            safe_forced = (
+                _fmt_mean_std("linucb_safe_forced_rate", ".3f")
+                if "linucb_safe_forced_rate" in r
+                else "NaN"
+            )
+            aoi_limit = (
+                _fmt_mean_std("linucb_forced_reason_aoi_limit_rate", ".3f")
+                if "linucb_forced_reason_aoi_limit_rate" in r
+                else "NaN"
+            )
+            mae_limit = (
+                _fmt_mean_std("linucb_forced_reason_mae_limit_rate", ".3f")
+                if "linucb_forced_reason_mae_limit_rate" in r
+                else "NaN"
+            )
+            both = (
+                _fmt_mean_std("linucb_forced_reason_both_rate", ".3f")
+                if "linucb_forced_reason_both_rate" in r
+                else "NaN"
+            )
+            u_mean = (
+                _fmt_mean_std("linucb_ucb_uncertainty_mean", ".3f")
+                if "linucb_ucb_uncertainty_mean" in r
+                else "NaN"
+            )
+            skip_dec = (
+                _fmt_mean_std("linucb_rate_limit_skips_per_decision", ".3f")
+                if "linucb_rate_limit_skips_per_decision" in r
+                else "NaN"
+            )
+            if "outbox_pending_max" in r:
+                q_max = _fmt_mean_std("outbox_pending_max", ".1f")
+            else:
+                q_max = "NaN"
+            if "outbox_pending_auc_s" in r:
+                q_auc = _fmt_mean_std("outbox_pending_auc_s", ".1f")
+            else:
+                q_auc = "NaN"
+            q_rec = (
+                _fmt_mean_std("outbox_pending_recovery_s", ".1f")
+                if "outbox_pending_recovery_s" in r
+                else "NaN"
+            )
+            cells = [
+                str(r["profile"]),
+                str(r["sensor"]),
+                actions,
+                action_switch,
+                n_dec,
+                h_60s,
+                switch,
+                safe_forced,
+                aoi_limit,
+                mae_limit,
+                both,
+                u_mean,
+                skip_dec,
+                q_max,
+                q_auc,
+                q_rec,
+                dup,
+                rx_p50,
+                rx_p95,
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
     p.write_text("\n".join(lines), encoding="utf-8")
 
     # --- Baseline 비교(추가) ---
@@ -1728,140 +2347,96 @@ def _write_report_md(
         lines.append("| " + " | ".join(cells) + " |")
 
     lines.append("")
-    lines.append("## 목표 평가 (Option 2)")
+    lines.append("## KPI 최종 확정안 (PASS/FAIL, strict)")
+    lines.append("")
+    lines.append("- 평가 범위(강제): profile × sensor 단위")
+    lines.append("  - 모든 row PASS여야 프로젝트 PASS (부분 합격 없음)")
+    lines.append("- Baselines (fixed):")
+    lines.append("  - periodic: 최빈 송신(참조 스트림)")
+    lines.append("  - fixed_tau: 사람이 설정한 고정 임계치(품질 기준점)")
+    lines.append("  - adaptive: LinUCB 정책(합격 판정 대상)")
+    lines.append("- PASS 조건(5개 전부):")
+    lines.append("  - K1 Rate_improvement_vs_periodic >= 85%")
+    lines.append("  - K2 Rate_improvement_vs_fixed_tau >= -10%")
+    lines.append("  - K3 recon_mae_p95_improvement_vs_fixed_tau >= -10%")
+    lines.append("  - K4 AnomalySegmentRecall >= 0.90")
+    lines.append("  - K5 AoI_p95_improvement_vs_fixed_tau >= -10%")
+    lines.append("- AnomalySegmentRecall 정의:")
+    lines.append("  - periodic baseline에서 |res| > tau_ref(=fixed_tau 중앙값 tau)")
+    lines.append("  - 길이>=2샘플 세그먼트 hit-rate")
     lines.append("")
     lines.append(
-        "- 기준: Rate>=60% vs periodic, MAE<=10% vs fixed_tau, AoI>=15% vs fixed_tau, "
-        "Rate<=+50% vs fixed_tau."
+        "| profile | sensor | policy | K1 | K2 | K3 | K4 | K5 | Overall |"
     )
-    lines.append("")
-    lines.append(
-        "| profile | sensor | Rate>=60% vs periodic | MAE<=10% vs fixed_tau | "
-        "AoI>=15% vs fixed_tau | Rate<=+50% vs fixed_tau | Overall |"
-    )
-    lines.append("|---|---|---:|---:|---:|---:|---:|")
+    lines.append("|---|---|---:|---:|---:|---:|---:|---:|---:|")
+    kpi, project_pass = compute_final_kpi(summary)
+    kpi_available = not kpi.empty
 
-    comp_periodic = compare_policies(summary, baseline_policy="periodic")
-    comp_fixed = compare_policies(summary, baseline_policy="fixed_tau")
-
-    def _keyed_adaptive(df: pd.DataFrame) -> dict[tuple[str, str], pd.Series]:
-        if df.empty:
-            return {}
-        sub = df[df["policy"].astype("string") == "adaptive"].copy()
-        if sub.empty:
-            return {}
-        return {
-            (str(r["profile"]), str(r["sensor"])): r
-            for _, r in sub.iterrows()
-        }
-
-    def _goal_cell(val: float, threshold: float) -> tuple[str, str]:
+    def _fmt_pct(status: str, val: float) -> str:
         if not math.isfinite(val):
-            return "SKIP", "SKIP"
-        status = "PASS" if val >= threshold else "FAIL"
-        return status, f"{status} ({val:+.1f}%)"
+            return "FAIL (NaN)"
+        return f"{status} ({val:+.1f}%)"
 
-    adapt_periodic = _keyed_adaptive(comp_periodic)
-    adapt_fixed = _keyed_adaptive(comp_fixed)
-    adapt_rows = summary[summary["policy"].astype("string") == "adaptive"]
+    def _fmt_recall(status: str, val: float) -> str:
+        if not math.isfinite(val):
+            return "FAIL (NaN)"
+        return f"{status} ({val:.3f})"
 
-    if adapt_rows.empty:
-        lines.append("| - | - | SKIP | SKIP | SKIP | SKIP | SKIP |")
-    else:
-        seen_keys: set[tuple[str, str]] = set()
-        for _, r in adapt_rows.iterrows():
-            key = (str(r["profile"]), str(r["sensor"]))
-            if key in seen_keys:
-                continue
-            seen_keys.add(key)
-            r_periodic = adapt_periodic.get(key)
-            r_fixed = adapt_fixed.get(key)
-
-            rate_imp = (
-                float(r_periodic.get("rate_Bps_improvement_pct"))
-                if r_periodic is not None
-                else float("nan")
-            )
-            mae_imp = (
-                float(r_fixed.get("mae_event_mean_improvement_pct"))
-                if r_fixed is not None
-                else float("nan")
-            )
-            aoi_imp = (
-                float(r_fixed.get("aoi_mean_ms_improvement_pct"))
-                if r_fixed is not None
-                else float("nan")
-            )
-            rate_imp_fixed = (
-                float(r_fixed.get("rate_Bps_improvement_pct"))
-                if r_fixed is not None
-                else float("nan")
-            )
-
-            rate_status, rate_cell = _goal_cell(rate_imp, 60.0)
-            mae_status, mae_cell = _goal_cell(mae_imp, -10.0)
-            aoi_status, aoi_cell = _goal_cell(aoi_imp, 15.0)
-            rate_fixed_status, rate_fixed_cell = _goal_cell(rate_imp_fixed, -50.0)
-
-            statuses = [rate_status, mae_status, aoi_status, rate_fixed_status]
-            if "FAIL" in statuses:
-                overall = "FAIL"
-            elif all(s == "PASS" for s in statuses):
-                overall = "PASS"
-            else:
-                overall = "SKIP"
-
-            cells = [
-                key[0],
-                key[1],
-                rate_cell,
-                mae_cell,
-                aoi_cell,
-                rate_fixed_cell,
-                overall,
-            ]
-            lines.append("| " + " | ".join(cells) + " |")
-
-    lines.append("### Adaptive vs periodic interpretation")
-    lines.append("")
-    lines.append("Lower is better for Rate/AoI/MAE; positive improvement means better.")
-    comp_adapt = comparisons[comparisons["policy"].astype("string") == "adaptive"]
-    if comp_adapt.empty:
-        lines.append("- adaptive: no comparison rows available (baseline missing).")
-    else:
-        for _, r in comp_adapt.iterrows():
+    failed_pairs: list[tuple[str, str]] = []
+    if kpi_available:
+        for _, r in kpi.iterrows():
             prof = str(r.get("profile", ""))
             sensor = str(r.get("sensor", ""))
-            rate_imp = float(r.get("rate_Bps_improvement_pct", float("nan")))
-            aoi_imp = float(r.get("aoi_mean_ms_improvement_pct", float("nan")))
-            mae_imp = float(r.get("mae_event_mean_improvement_pct", float("nan")))
-            if not (math.isfinite(rate_imp) and math.isfinite(aoi_imp) and math.isfinite(mae_imp)):
-                lines.append(
-                    f"- {prof}/{sensor}: insufficient baseline or non-finite metrics; "
-                    "cannot conclude improvement."
-                )
-                continue
-            rate_txt = f"{rate_imp:+.1f}%"
-            aoi_txt = f"{aoi_imp:+.1f}%"
-            mae_txt = f"{mae_imp:+.1f}%"
-            tradeoffs = []
-            if rate_imp < 0:
-                tradeoffs.append("rate")
-            if aoi_imp < 0:
-                tradeoffs.append("AoI")
-            if mae_imp < 0:
-                tradeoffs.append("MAE")
-            if tradeoffs:
-                tradeoff_txt = ", ".join(tradeoffs)
-                lines.append(
-                    f"- {prof}/{sensor}: rate {rate_txt}, AoI mean {aoi_txt}, "
-                    f"MAE mean {mae_txt} (tradeoff in: {tradeoff_txt})."
-                )
-            else:
-                lines.append(
-                    f"- {prof}/{sensor}: rate {rate_txt}, AoI mean {aoi_txt}, "
-                    f"MAE mean {mae_txt} (all improved)."
-                )
+            pol = str(r.get("policy", "adaptive"))
+            if str(r.get("overall", "FAIL")) != "PASS":
+                failed_pairs.append((prof, sensor))
+
+            c1 = _fmt_pct(
+                str(r.get("kpi1_rate_vs_periodic", "FAIL")),
+                float(r.get("rate_improvement_vs_periodic_pct", float("nan"))),
+            )
+            c2 = _fmt_pct(
+                str(r.get("kpi2_rate_vs_fixed_tau", "FAIL")),
+                float(r.get("rate_improvement_vs_fixed_tau_pct", float("nan"))),
+            )
+            c3 = _fmt_pct(
+                str(r.get("kpi3_recon_p95_vs_fixed_tau", "FAIL")),
+                float(r.get("recon_mae_p95_improvement_vs_fixed_tau_pct", float("nan"))),
+            )
+            c4 = _fmt_recall(
+                str(r.get("kpi4_anomaly_segment_recall", "FAIL")),
+                float(r.get("anomaly_segment_recall", float("nan"))),
+            )
+            c5 = _fmt_pct(
+                str(r.get("kpi5_aoi_p95_vs_fixed_tau", "FAIL")),
+                float(r.get("aoi_p95_improvement_vs_fixed_tau_pct", float("nan"))),
+            )
+            overall = str(r.get("overall", "FAIL"))
+
+            cells = [prof, sensor, pol, c1, c2, c3, c4, c5, overall]
+            lines.append("| " + " | ".join(cells) + " |")
+    else:
+        lines.append("| - | - | adaptive | SKIP | SKIP | SKIP | SKIP | SKIP | SKIP |")
+
+    lines.append("")
+    lines.append("### Project verdict")
+    lines.append("")
+    verdict = "PASS" if project_pass else ("FAIL" if kpi_available else "SKIP")
+    lines.append(f"- Verdict: **{verdict}**")
+    if verdict == "SKIP":
+        lines.append("- Reason: no `adaptive` policy rows found in inputs; KPI is not applicable.")
+    else:
+        if failed_pairs:
+            items = ", ".join([f"{p}/{s}" for (p, s) in failed_pairs])
+            lines.append(f"- Failed profile×sensor: {items}")
+
+        lines.append("")
+        lines.append("### Interpretation")
+        lines.append("")
+        lines.append("- 1순위(Primary): periodic 대비 Rate 절감(↑)을 확인합니다.")
+        lines.append("- 제약(Constraints): fixed_tau 대비 Rate/Recon_p95/AoI_p95")
+        lines.append("  - 10% 초과 악화(개선율 < -10%)면 FAIL")
+        lines.append("- 커버리지: AnomalySegmentRecall(↑)로 이상구간 미스 여부를 확인합니다.")
 
     # --- Figures (추가) ---
     figs_path = out_dir / figures_dir
@@ -4391,6 +4966,7 @@ def main():
         formats=_parse_plot_formats(str(args.plot_formats)),
         dpi=int(args.plot_dpi),
     )
+    baseline_policy = str(args.baseline_policy)
 
     df = load_events(args.input)
     df = dedup_and_sort(df)
@@ -4402,6 +4978,19 @@ def main():
 
     meta = load_collector_meta(args.input)
     by_run = summarize_by_run(df)
+    try:
+        qual = compute_seq_aligned_quality_metrics(
+            df,
+            # KPI quality/coverage are always defined against the periodic baseline
+            # (independent of the report's `--baseline-policy` for rate/AoI/MAE tables).
+            baseline_policy="periodic",
+            tau_ref_policy="fixed_tau",
+        )
+    except Exception:
+        logger.exception("failed to compute seq-aligned quality metrics")
+        qual = pd.DataFrame()
+    if not qual.empty:
+        by_run = by_run.merge(qual, how="left", on=["run_id", "profile", "policy", "sensor"])
     if not meta.empty:
         by_run = by_run.merge(meta, how="left", on=["run_id"])
 
@@ -4423,7 +5012,6 @@ def main():
                 on=["run_id", "profile", "policy", "sensor"],
             )
     summary = summarize(by_run)
-    baseline_policy = str(args.baseline_policy)
     comparisons = compare_policies(summary, baseline_policy=baseline_policy)
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -4469,6 +5057,61 @@ def main():
     by_run.to_csv(by_run_path, index=False)
     cmp_path = out_dir / f"metrics_vs_{baseline_policy}.csv"
     comparisons.to_csv(cmp_path, index=False)
+    # KPI uses both periodic and fixed_tau baselines regardless of `--baseline-policy`.
+    if baseline_policy != "periodic":
+        try:
+            compare_policies(summary, baseline_policy="periodic").to_csv(
+                out_dir / "metrics_vs_periodic.csv",
+                index=False,
+            )
+        except Exception:
+            logger.exception("failed to write metrics_vs_periodic.csv")
+    if baseline_policy != "fixed_tau":
+        try:
+            compare_policies(summary, baseline_policy="fixed_tau").to_csv(
+                out_dir / "metrics_vs_fixed_tau.csv",
+                index=False,
+            )
+        except Exception:
+            logger.exception("failed to write metrics_vs_fixed_tau.csv")
+
+    try:
+        kpi, project_pass = compute_final_kpi(summary)
+        kpi_path = out_dir / "kpi_final.csv"
+        kpi.to_csv(kpi_path, index=False)
+        kpi_available = (not summary.empty) and (not kpi.empty)
+        verdict = (
+            "PASS"
+            if project_pass
+            else ("FAIL" if kpi_available else ("FAIL" if summary.empty else "SKIP"))
+        )
+        reason = None
+        if verdict == "SKIP":
+            reason = "no `adaptive` policy rows found in inputs; KPI is not applicable."
+        elif verdict == "FAIL" and summary.empty:
+            reason = "no metrics were computed from inputs; KPI could not be evaluated."
+
+        failed_pairs = []
+        if kpi_available:
+            failed_pairs = [
+                {"profile": str(r["profile"]), "sensor": str(r["sensor"])}
+                for _, r in kpi.iterrows()
+                if str(r.get("overall")) != "PASS"
+            ]
+        (out_dir / "kpi_verdict.json").write_text(
+            json.dumps(
+                {
+                    "project_verdict": str(verdict),
+                    "failed": failed_pairs,
+                    **({"reason": str(reason)} if reason else {}),
+                },
+                ensure_ascii=False,
+                indent=2,
+            ),
+            encoding="utf-8",
+        )
+    except Exception:
+        logger.exception("failed to write KPI artifacts (kpi_final.csv/kpi_verdict.json)")
     if args.save_parquet:
         try:
             pq_path = out_dir / "metrics_summary.parquet"

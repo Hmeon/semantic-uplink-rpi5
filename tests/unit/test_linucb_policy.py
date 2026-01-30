@@ -55,7 +55,7 @@ def test_linucb_ucb_scoring_components() -> None:
     )
     pol = LinUCBPolicy(cfg)
     pol._A[0] = np.eye(pol.d, dtype=np.float64)
-    pol._b[0] = np.array([1, 2, 3, 4, 5, 6], dtype=np.float64)
+    pol._b[0] = np.array([1, 2, 3, 4, 5, 6, 7, 8], dtype=np.float64)
     state = _make_state(aoi_ms=1000.0, res=1.0)
     _, decision = pol.decide(state)
 
@@ -132,6 +132,7 @@ def test_linucb_safe_arm_forcing_reasons() -> None:
         safe_arm=safe_arm,
         aoi_max_ms=1.0,
         mae_max=1.0,
+        safety_force_emit_on_aoi=True,
         diagnostics_enabled=True,
     )
     pol = LinUCBPolicy(cfg)

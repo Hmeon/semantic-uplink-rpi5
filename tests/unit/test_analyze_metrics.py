@@ -10,6 +10,7 @@ from collector.analyze import (
     aoi_mean_and_p95,
     aoi_mean_and_p95_from_rx,
     load_events,
+    summarize_decisions_diagnostics_by_run,
     summarize_by_run,
 )
 
@@ -93,3 +94,31 @@ def test_summarize_by_run_uses_recv_time_when_available() -> None:
     assert float(row["aoi_mean_ms"]) == pytest.approx(600.0, abs=1e-6)
     assert float(row["aoi_p95_ms"]) == pytest.approx(1050.0, abs=1e-6)
 
+
+def test_summarize_decisions_diagnostics_works_without_arm_id() -> None:
+    decisions = pd.DataFrame(
+        {
+            "run_id": ["run1"] * 4,
+            "profile": ["slow_10kbps"] * 4,
+            "policy": ["adaptive"] * 4,
+            "sensor": ["temp"] * 4,
+            "ts": [0, 1_000_000_000, 2_000_000_000, 3_000_000_000],
+            "t_recv_ns": [0, 1_000_000_000, 2_000_000_000, 3_000_000_000],
+            "device_id": ["dev1"] * 4,
+            "state_aoi": [0.0] * 4,
+            "state_res": [0.0] * 4,
+            "state_res_var": [0.0] * 4,
+            "state_loss": [0.0] * 4,
+            "state_q_len": [0] * 4,
+            "tau": [0.2, 0.2, 0.3, 0.2],
+            "kbits": [8, 8, 8, 8],
+            "reward": [0.0] * 4,
+        }
+    )
+    diag, arm_dist, entropy = summarize_decisions_diagnostics_by_run(decisions, window_s=60)
+    assert len(diag) == 1
+    row = diag.iloc[0]
+    assert np.isfinite(float(row["linucb_switch_rate"]))
+    assert np.isfinite(float(row["linucb_action_entropy_mean_60s"]))
+    assert not arm_dist.empty
+    assert not entropy.empty

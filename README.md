@@ -45,6 +45,9 @@ Semantic Uplink는 제한된 링크 환경에서 **의미 있는 변화만** 전
 | `docs/final/_entrypoints.md` | 검증된 CLI 엔트리포인트 및 스크립트 목록. |
 | `docs/final/FINAL_EVALUATION.md` | 최종 3시간 비교 실험, 데이터셋 경로, 정확한 CLI 옵션. |
 | `docs/final/OPERATIONAL_READINESS.md` | RPi5 설치/실행 메모 및 운영 관점 가이드. |
+| `docs/final/RESULTS_DEV_HISTORY_SCNA_SCNB_POC_COVFORCE_KPI.md` | (최종본) scnA/scnB `poc_covforce_kpi` 결과물 8개 폴더와 발전과정 기록. |
+| `docs/specs/KPI_DIAGNOSIS_AND_RECOMMENDATION.md` | KPI 실패 원인 진단 및 “KPI vs LinUCB 개선” 우선순위 판단 기록. |
+| `docs/field_synthetic_scenarios_A_B_spec_v1.md` | “현장 실측 직전” 수준 synthetic 시나리오(A/B) 스펙. |
 | `docs/metrics/FIGURE_NAMING.md` | 분석 산출물(플롯) 파일명 규칙. |
 | `docs/metrics/LABEL_STYLE.md` | 플롯 라벨 스타일 가이드. |
 
@@ -154,7 +157,7 @@ sequenceDiagram
 
 ### 적응형 정책(LinUCB)
 - 행동 공간(action space): `configs/policy*.yaml`에서 `(tau, kbits)` arm을 정의한다(적응형 모드에 필요).
-- 컨텍스트 벡터(context vector): `[1, aoi_norm, |res|_norm, resvar_norm, loss, qlen_norm]`. AoI에는 ACK 지연이 포함되며, `qlen_norm = q_len / 50`이다(`edge/policy/linucb.py`, `edge/policy/runtime.py`).
+- 컨텍스트 벡터(context vector): `[1, aoi_norm, |res|_norm, resvar_norm, loss, qlen_norm]`. AoI에는 ACK 지연이 포함되며, 큐 길이는 `qlen_norm = log1p(q_len) / log1p(q_len_scale)`로 정규화한다(기본 `q_len_scale=50`, `scales.q_len`로 설정; `edge/policy/linucb.py`, `edge/policy/runtime.py`).
 - 보상(reward): `r = -(w_aoi * aoi/aoi_scale + w_mae * mae/mae_scale + w_rate * rate/rate_scale)` (`edge/policy/linucb.py`).
 - 업데이트(update): arm별 ridge regression을 사용한다. `A <- A + x x^T`, `b <- b + r x`. 선택은 `score = theta^T x + alpha_ucb * sqrt(x^T A^-1 x)`로 계산한다(`edge/policy/linucb.py`).
 - 안전/탐색: AoI 또는 MAE 위반 시 안전 arm으로 강제 전환한다. 기본값은 `alpha_ucb=0.75`, `lambda_ridge=1.0`, `warmup_per_arm=1`이다(`edge/policy/linucb.py`).
@@ -255,6 +258,7 @@ pip install -r requirements.txt
 | `configs/device.yaml` | device id, 센서, UI, MQTT 기본값. | `edge/edge_daemon.py`, `experiments/run_scenarios.py` |
 | `configs/policy.yaml` | 적응형 arm + reward + safety. | `edge/edge_daemon.py`, `collector/analyze.py` |
 | `configs/policy_adaptive_*.yaml` | 정책 프리셋(AIoT, 품질 등). | `edge/edge_daemon.py`, `scripts/run_3h_sequence.sh` |
+| `configs/policy_poc_covforce_kpi.yaml` | KPI 검증용 정책 프리셋(coverage liveness + payload-fair + decision diagnostics). | `scripts/generate_synthetic_run.py`, `scripts/run_3h_sequence.sh`, `collector/analyze.py` |
 | `configs/link_profiles.yaml` | tc/netem 프로파일. | `link/shaper/tc_profiles.py`, `stack/pi_stack.py`, `experiments/run_scenarios.py` |
 | `infra/systemd/semantic-uplink-stack.env.example` | `scripts/run_stack.sh`의 환경변수 오버라이드 예시. | `scripts/run_stack.sh` |
 
@@ -357,23 +361,78 @@ python -m experiments.run_scenarios \
 
 출력은 `artifacts/experiments/<timestamp>_<device_id>` 아래에 저장된다. `plan.json`, `run_meta.json`이 함께 기록된다(`experiments/run_scenarios.py`).
 
-### 3정책 × 3시간 시퀀스
+### 현장 실측(단일 RPi5) 3정책 × 3시간 시퀀스 (권장)
+`scripts/run_3h_sequence.sh`는 **단일 RPi5에서** 아래를 순차 실행한다: `periodic → fixed_tau → adaptive` (각 3h).
+- broker/collector/edge를 같은 호스트에서 실행하므로(권장), `t_recv_ns` 기반 AoI 계산이 안정적이다.
+- 실행 전 `CHECKLIST.md`, `RUN_META.txt`, 실행 로그 `sequence.log`를 자동 기록한다.
+- 종료 후 `collector.analyze`까지 자동 실행하고, `results/field_runs/<run_root>/kpi_verdict.json`을 남긴다.
+
+사전 작업(요약):
+- (필수) 시스템 패키지: `mosquitto`, `mosquitto-clients`, `alsa-utils`, `coreutils`(= `timeout`), `python3-venv`
+- (필수) 브로커 실행: `mosquitto -c infra/mosquitto/mosquitto.conf` (또는 systemd로 broker를 상시 실행)
+- (권장) 시간 동기: `timedatectl status`에서 `System clock synchronized: yes` 확인(스크립트가 필요 시 NTP를 잠시 멈춤)
+- (센서) DS18B20: `ls /sys/bus/w1/devices/28-*/w1_slave` 확인(필요 시 `W1_PATH`로 지정, 배선/overlay는 `docs/hardware.md` 참고)
+- (센서) 마이크: `arecord -l`로 장치 확인 후 `MIC_DEVICE=hw:2,0` 등으로 지정
+- (tc/netem) 링크 셰이핑을 쓰면: `TC_ENABLE=1` + root 또는 `CAP_NET_ADMIN` 필요. 권한이 없거나 실링크 그대로 측정하려면 `TC_ENABLE=0`.
+
+설치 예시(Raspberry Pi OS/Debian):
 ```bash
-PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
+sudo apt-get update
+sudo apt-get install -y mosquitto mosquitto-clients alsa-utils i2c-tools coreutils python3-venv
+python3 -m venv .venv && source .venv/bin/activate
+pip install -e .[analysis,hw]
 ```
 
-필수 환경변수는 `scripts/run_3h_sequence.sh`에 정의되어 있다(예: `W1_PATH`, `PROFILE`, `IFACE`, `ADAPTIVE_ARMS`).
-
-### 로그 분석
+빠른 점검(권장): 전체 9시간(3h×3정책) 돌리기 전에 2분×3정책으로 센서/브로커/권한을 먼저 확인한다.
 ```bash
-python -m collector.analyze \
-  --input artifacts/slow10_periodic_3h_B/logs \
-  --input artifacts/slow10_fixed_3h_B/logs \
-  --input artifacts/slow10_linucb_3h_B/logs \
-  --out results/final_compare_3h_slow_10kbps \
-  --baseline-policy periodic \
-  --plots --paper-plots --diagnostic-plots --ucb-timeseries --pareto-p95 --audit
+RUN_SECONDS=120 KPI_ENFORCE_PASS=0 FIELD_LABEL=SMOKE \
+  ADAPTIVE_ARMS=configs/policy_poc_covforce_kpi.yaml \
+  PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
 ```
+
+```bash
+# Field A
+FIELD_LABEL=A SEMUP_SEED=0 DEVICE_ID=rpi5a \
+  ADAPTIVE_ARMS=configs/policy_poc_covforce_kpi.yaml \
+  DECISION_PUBLISH=event \
+  ANALYZE_EXTRA_ARGS="--diagnostic-plots --ucb-timeseries --pareto-p95 --save-parquet" \
+  PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
+
+# Field B (same settings)
+FIELD_LABEL=B SEMUP_SEED=0 DEVICE_ID=rpi5a \
+  ADAPTIVE_ARMS=configs/policy_poc_covforce_kpi.yaml \
+  DECISION_PUBLISH=event \
+  ANALYZE_EXTRA_ARGS="--diagnostic-plots --ucb-timeseries --pareto-p95 --save-parquet" \
+  PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
+```
+
+출력 위치:
+- run root: `artifacts/field_runs/<run_root>/`
+- 결과: `results/field_runs/<run_root>/kpi_verdict.json`
+
+(권장) 결과 아카이브(현장 복귀/공유용):
+```bash
+tar -czf "field_run_<run_root>.tar.gz" "artifacts/field_runs/<run_root>" "results/field_runs/<run_root>"
+```
+
+필수/유용 환경변수는 `scripts/run_3h_sequence.sh`에 정의되어 있다(예: `W1_PATH`, `MIC_DEVICE`, `PROFILE`, `IFACE`, `TC_ENABLE`, `ADAPTIVE_ARMS`, `DECISION_PUBLISH`, `RUN_ROOT_DIR`, `ANALYZE_EXTRA_ARGS`).
+
+### 로그 분석(재실행/분석만)
+```bash
+ANALYZE_ONLY=1 RUN_ROOT_DIR=artifacts/field_runs/<run_root> \
+  PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
+```
+
+### 시나리오 A/B 결과 비교
+```bash
+python scripts/compare_field_results.py \
+  --results-a results/field_runs/<run_root_A> \
+  --results-b results/field_runs/<run_root_B>
+```
+
+KPI(PASS/FAIL, strict):
+- `collector.analyze`는 `kpi_final.csv`(profile × sensor별 K1..K5 + overall)와 `kpi_verdict.json`(프로젝트 PASS/FAIL)을 생성한다.
+- KPI 정의는 `docs/specs/architecture.md`를 기준으로 한다.
 
 참조 보고서: `docs/final/FINAL_EVALUATION.md`(데이터셋/결과 경로 포함).
 
@@ -384,6 +443,7 @@ python -m collector.analyze \
 
 - `arecord`가 없음: `sounddevice`가 없을 때 마이크 백엔드가 arecord로 폴백한다. `alsa-utils`를 설치하거나 `--mic-backend sounddevice`를 사용한다(`edge/sensors/mic_rms.py`).
 - Parquet가 생성되지 않음: `pyarrow`가 없으면 collector가 CSV로 폴백한다(`collector/collector.py`).
+- LinUCB/파이프라인 진단이 비어있음: `decisions_*.parquet`가 없으면 decision 기반 진단이 스킵된다. `--decision-publish event`(또는 `DECISION_PUBLISH=event`)로 decision 로그를 남기고, 정책 YAML에서 `diagnostics.enabled: true`를 사용한다(공정한 rate 비교가 필요하면 `diagnostics.events_enabled: false` 권장).
 - LCD/RTC 미검출: `.[hw]`를 설치하거나 UI/RTC를 비활성화한다(`edge/ui/lcd.py`, `edge/rtc/ds3231.py`).
 - 버튼 비활성: `gpiozero`가 없거나 GPIO 접근이 불가한 상태다. `.[hw]` 설치 또는 `--buttons-disable` 사용(`edge/ui/buttons.py`).
 - tc/netem 적용 실패: root 또는 `CAP_NET_ADMIN` 권한이 필요하다. `--tc-disable` 또는 `TC_ENABLE=0`으로 비활성화한다(`link/shaper/tc_profiles.py`).

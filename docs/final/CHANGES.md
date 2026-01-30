@@ -1,12 +1,23 @@
 # Changes (ship-it audit)
 
+## 2026-01-29
+- Final KPI set locked (strict PASS/FAIL, per profile × sensor); analyzer now emits
+  `kpi_final.csv` and `kpi_verdict.json`.
+- Added seq-aligned reconstruction/coverage metrics used by the KPI
+  (recon MAE vs periodic + anomaly segment recall).
+- Added final AIoT adaptive configs:
+  `configs/policy_adaptive_aiot_field_A_final.yaml`,
+  `configs/policy_adaptive_aiot_field_B_final.yaml`.
+- Added a synthetic run generator for analysis/KPI smoke tests:
+  `scripts/generate_synthetic_run.py`.
+
 ## 2025-12-23
 - Applied link-feedback improvements for LinUCB (PUBACK delay EWMA, loss EWMA)
   and updated AIoT policy weights/safety.
 - Final 3h comparison generated: `results/final_compare_3h_slow_10kbps`
   (inputs: `artifacts/slow10_*_3h_B/logs`).
-- Outcome: rate target met, MAE target met (<=10% vs fixed_tau), AoI target met
-  (>=15% vs fixed_tau), adaptive best trade-off vs fixed_tau.
+- Outcome: see final KPI definition in `docs/specs/architecture.md` (older success
+  criteria notes are deprecated).
 
 ## 2025-12-22
 - Added 3-policy automated sequence runner (`scripts/run_3h_sequence.sh`) with NTP freeze support.

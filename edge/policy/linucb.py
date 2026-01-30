@@ -83,9 +83,12 @@ class LinUCBConfig:
         resvar_scale: Residual variance normalization scale.
         aoi_max_ms: AoI safety threshold in ms.
         mae_max: MAE safety threshold.
+        mae_est_max: Optional MAE(est) threshold for reward/penalties.
         safety_force_emit_on_aoi: Whether to force emit when AoI exceeds limit.
         warmup_per_arm: Minimum pulls per arm before UCB selection.
+        ucb_min_tau: Optional minimum tau for UCB selection.
         safe_arm: Optional explicit safe arm override.
+        aoi_safe_arm: Optional safe arm override for AoI-limit forcing.
         diagnostics_enabled: Emit diagnostic scalars when True.
 
     Returns:
@@ -126,20 +129,47 @@ class LinUCBConfig:
     rate_scale_bps: float = 1024.0   # 1 KB/s 기준
     res_scale: float = 1.0           # 잔차(dB/°C)
     resvar_scale: float = 1.0        # 잔차분산
+    q_len_scale: float = 50.0        # outbox pending count 정규화 스케일
 
     # 안전가드 임계
     aoi_max_ms: float = 5_000.0      # 5s
-    mae_max: float = 2.0             # mic dB / temp °C
+    # NOTE: `mae_max` historically refers to the EWMA residual (|x - pred|) threshold used as a
+    # safety guard in `decide()`. If you want a *different* threshold for `mae` passed into
+    # observe_outcome (which is `|x - last_sent|` in the runtime), set `mae_est_max`.
+    #
+    # For PoC/research, forcing a "safe arm" on moderate residuals can hide the effect of LinUCB.
+    # Use `residual_guard_enabled=false` (or a very large `mae_max`) to evaluate the policy
+    # without hard overrides.
+    residual_guard_enabled: bool = True
+    mae_max: float = 2.0             # mic dB / temp °C (residual threshold for safety)
+    mae_est_max: float | None = None # optional: staleness MAE threshold for reward shaping
     safety_force_emit_on_aoi: bool = False
+    coverage_force_emit_on_unhit_segment: bool = False
 
     # 워밍업(팔별 최소 시도 횟수 보장)
     warmup_per_arm: int = 1
 
+    # Optional constraint on the action set for non-safety selection.
+    # When set, arms with tau < ucb_min_tau are excluded from UCB selection unless a safety
+    # override is active (e.g., AoI/MAE limit). This helps prevent "oversending" from
+    # overly aggressive arms while still keeping a safe arm for anomalies.
+    ucb_min_tau: float | None = None
+
     # 세이프 팔 (None이면 자동: tau 최소, kbits 최대)
     safe_arm: Arm | None = None
 
+    # Optional separate safe arm used when AoI limit triggers (without MAE/residual limit).
+    # Useful to avoid selecting an overly aggressive (low tau) arm just because AoI is high.
+    aoi_safe_arm: Arm | None = None
+
     # Telemetry (default: off). When enabled, policy emits lightweight diagnostics scalars.
     diagnostics_enabled: bool = False
+
+    # Reward shaping for KPI4 (segment recall), implemented in the runtime as a MAE-overage term.
+    # These are *not* hard guardrails: they do not force arms, but bias learning toward
+    # "emit once per anomaly segment" behavior even when segments are short.
+    coverage_step_penalty_n: float = 1.0
+    coverage_miss_penalty_n: float = 0.0
 
 
 @dataclass(slots=True, frozen=True)
@@ -153,6 +183,8 @@ class PolicyState:
         res_var: Residual variance estimate.
         loss: Loss estimate in [0, 1].
         q_len: Queue length estimate (>= 0).
+        seg_active: Optional anomaly-segment flag (0 or 1).
+        seg_unhit: Optional anomaly-segment "needs hit" flag (0 or 1).
 
     Returns:
         None.
@@ -175,6 +207,8 @@ class PolicyState:
     res_var: float
     loss: float       # 0..1
     q_len: int        # >=0
+    seg_active: float = 0.0  # 0/1 (segment marker)
+    seg_unhit: float = 0.0  # 0/1 (reward-shaping hint)
 
 
 def _default_arms(sensor: SensorType) -> list[Arm]:
@@ -230,8 +264,8 @@ class LinUCBPolicy:
         if not self.arms:
             raise ValueError("arms must not be empty")
 
-        # 컨텍스트 차원(d): bias + aoi_norm + res_norm + resvar_norm + loss + qlen_norm
-        self.d = 1 + 5
+        # 컨텍스트 차원(d): bias + aoi_norm + res_norm + resvar_norm + loss + qlen_norm + seg_active + seg_unhit
+        self.d = 1 + 7
         self._A = [np.eye(self.d, dtype=np.float64) * float(cfg.lambda_ridge) for _ in self.arms]
         self._b = [np.zeros((self.d,), dtype=np.float64) for _ in self.arms]
         self._counts = [0 for _ in self.arms]
@@ -258,7 +292,27 @@ class LinUCBPolicy:
             )
             if safe_idx is None:
                 raise ValueError("safe_arm not found in arms grid")
-        self._safe_idx = safe_idx
+        self._safe_idx = int(safe_idx)
+
+        # Optional separate safe arm used when AoI-limit forcing is active.
+        # This prevents AoI guardrail interventions from skewing the MAE/coverage safe arm.
+        if cfg.aoi_safe_arm is None:
+            self._aoi_safe_idx = int(self._safe_idx)
+        else:
+            aoi_safe_idx = next(
+                (
+                    i
+                    for i, a in enumerate(self.arms)
+                    if (
+                        abs(a.tau - cfg.aoi_safe_arm.tau) < 1e-9
+                        and a.kbits == cfg.aoi_safe_arm.kbits
+                    )
+                ),
+                None,
+            )
+            if aoi_safe_idx is None:
+                raise ValueError("aoi_safe_arm not found in arms grid")
+            self._aoi_safe_idx = int(aoi_safe_idx)
 
         # 직전 결정(학습용) 버퍼
         self._last_x: np.ndarray | None = None
@@ -295,6 +349,8 @@ class LinUCBPolicy:
         res_var = float(state.res_var)
         loss = float(state.loss)
         q_len = int(state.q_len)
+        seg_active = float(getattr(state, "seg_active", 0.0))
+        seg_unhit = float(getattr(state, "seg_unhit", 0.0))
         if not math.isfinite(aoi_ms):
             aoi_ms = 0.0
             invalid_state = True
@@ -310,6 +366,14 @@ class LinUCBPolicy:
         if q_len < 0:
             q_len = 0
             invalid_state = True
+        if not math.isfinite(seg_active):
+            seg_active = 0.0
+            invalid_state = True
+        if not math.isfinite(seg_unhit):
+            seg_unhit = 0.0
+            invalid_state = True
+        seg_active = float(min(1.0, max(0.0, seg_active)))
+        seg_unhit = float(min(1.0, max(0.0, seg_unhit)))
         if invalid_state:
             logger.warning(
                 "linucb_state_sanitized device_id=%s sensor=%s",
@@ -324,15 +388,21 @@ class LinUCBPolicy:
             res_var=float(res_var),
             loss=float(loss),
             q_len=int(q_len),
+            seg_active=float(seg_active),
+            seg_unhit=float(seg_unhit),
         )
 
-        aoi_limit = bool(aoi_ms >= self.cfg.aoi_max_ms)
-        mae_limit = bool(abs(res) >= self.cfg.mae_max)
+        # AoI is a hard guardrail only when configured to force-emit.
+        aoi_limit = bool(self.cfg.safety_force_emit_on_aoi and aoi_ms >= self.cfg.aoi_max_ms)
+        mae_limit = bool(self.cfg.residual_guard_enabled and abs(res) >= self.cfg.mae_max)
         safe_forced = bool(aoi_limit or mae_limit)
 
         # 안전가드
         if safe_forced:
-            arm_idx = self._safe_idx
+            if aoi_limit and (not mae_limit):
+                arm_idx = self._aoi_safe_idx
+            else:
+                arm_idx = self._safe_idx
         else:
             # 워밍업: 시도 횟수 미달 팔부터 순서대로 사용
             arm_idx = self._select_arm_ucb(safe_state)
@@ -469,14 +539,31 @@ class LinUCBPolicy:
             self._last_arm_idx = None
             return 0.0
 
-        # 보상 계산(정규화 후 음의 가중합)
-        aoi_n = float(aoi_ms) / max(1e-9, self.cfg.aoi_scale_ms)
-        mae_n = float(mae) / max(1e-9, self.cfg.mae_scale)
-        rate_n = float(rate_bps) / max(1e-9, self.cfg.rate_scale_bps)
+        # Reward shaping (constraint-style):
+        # - Always penalize transmit rate (rate_bps).
+        # - Penalize AoI/MAE only when they exceed configured guardrails.
+        #
+        # This better matches the project's KPI framing where efficiency is primary,
+        # and freshness/quality are guardrails rather than continuously optimized.
+        aoi_scale = max(1e-9, float(self.cfg.aoi_scale_ms))
+        mae_scale = max(1e-9, float(self.cfg.mae_scale))
+        rate_scale = max(1e-9, float(self.cfg.rate_scale_bps))
+
+        aoi_max = float(self.cfg.aoi_max_ms)
+        if not math.isfinite(aoi_max) or aoi_max < 0.0:
+            aoi_max = 0.0
+        mae_max = self.cfg.mae_est_max
+        if mae_max is None or not math.isfinite(float(mae_max)) or float(mae_max) < 0.0:
+            mae_max = float(self.cfg.mae_max)
+        mae_max = float(mae_max)
+
+        aoi_over_n = max(0.0, float(aoi_ms) - aoi_max) / aoi_scale
+        mae_over_n = max(0.0, float(mae) - mae_max) / mae_scale
+        rate_n = float(rate_bps) / rate_scale
         r = -(
-            self.cfg.w_aoi * aoi_n
-            + self.cfg.w_mae * mae_n
-            + self.cfg.w_rate * rate_n
+            self.cfg.w_rate * rate_n
+            + self.cfg.w_aoi * aoi_over_n
+            + self.cfg.w_mae * mae_over_n
         )
 
         # LinUCB 업데이트
@@ -559,14 +646,28 @@ class LinUCBPolicy:
 
     def _select_arm_ucb(self, state: PolicyState) -> int:
         x = self._context(state)
-        # 워밍업 팔 우선
-        for i, c in enumerate(self._counts):
-            if c < self.cfg.warmup_per_arm:
-                return i
 
-        best_idx = 0
+        # Optionally constrain the candidate set (exclude overly aggressive tau values).
+        cand: list[int]
+        min_tau = self.cfg.ucb_min_tau
+        if min_tau is None or not math.isfinite(float(min_tau)):
+            cand = list(range(len(self.arms)))
+        else:
+            thr = float(min_tau)
+            cand = [i for i, a in enumerate(self.arms) if float(a.tau) >= thr]
+            if not cand:
+                return int(self._safe_idx)
+
+        # 워밍업 팔 우선 (candidate set only)
+        for i in cand:
+            if int(self._counts[i]) < int(self.cfg.warmup_per_arm):
+                return int(i)
+
+        best_idx = int(cand[0])
         best_score = -1e100
-        for i, (a_mat, b_vec) in enumerate(zip(self._A, self._b)):
+        for i in cand:
+            a_mat = self._A[i]
+            b_vec = self._b[i]
             # θ̂ = A⁻¹b (stable: solve)
             try:
                 theta = np.linalg.solve(a_mat, b_vec)
@@ -581,7 +682,7 @@ class LinUCBPolicy:
             score = float(np.dot(theta, x) + self.cfg.alpha_ucb * s)
             if score > best_score:
                 best_score, best_idx = score, i
-        return best_idx
+        return int(best_idx)
 
     def _context(self, s: PolicyState) -> np.ndarray:
         # 정규화(0~수 단위 → ~O(1))
@@ -589,8 +690,15 @@ class LinUCBPolicy:
         res_n = float(abs(s.res)) / max(1e-9, self.cfg.res_scale)
         resv_n = float(max(0.0, s.res_var)) / max(1e-9, self.cfg.resvar_scale)
         loss = float(min(1.0, max(0.0, s.loss)))
-        qn = float(max(0, s.q_len)) / 50.0  # 보수적 스케일(큐 50개≈1.0)
-        x = np.array([1.0, aoi_n, res_n, resv_n, loss, qn], dtype=np.float64)
+        # 큐 길이는 링크 불안정 시 수십~수천까지 갈 수 있으므로 log 스케일을 사용.
+        q = float(max(0, s.q_len))
+        q_scale = float(self.cfg.q_len_scale)
+        if not math.isfinite(q_scale) or q_scale <= 1.0:
+            q_scale = 50.0
+        qn = float(math.log1p(q) / math.log1p(q_scale))
+        seg_active = float(min(1.0, max(0.0, getattr(s, "seg_active", 0.0))))
+        seg = float(min(1.0, max(0.0, getattr(s, "seg_unhit", 0.0))))
+        x = np.array([1.0, aoi_n, res_n, resv_n, loss, qn, seg_active, seg], dtype=np.float64)
         return x
 
 

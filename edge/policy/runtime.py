@@ -153,11 +153,41 @@ class SensorPolicyRuntime:
         self._nominal_period_s = nominal_period_s
         self._res_var = OnlineVar()
         self._last_sent_val: float | None = None
+        # Coverage tracking for "semantic" segments (used for reward shaping only).
+        # A segment is defined as consecutive samples where |residual| exceeds a reference
+        # threshold (tau_ref). This is aligned with the analyzer's anomaly segment recall KPI.
+        self._anomaly_active = False
+        self._anomaly_hit = False
+        self._anomaly_len = 0
+        self._coverage_tau_ref: float | None = None
         self._linucb: LinUCBPolicy | None = None
         if mode == PolicyMode.ADAPTIVE:
             if linucb_cfg is None:
                 raise ValueError("linucb_cfg is required for adaptive mode")
             self._linucb = LinUCBPolicy(linucb_cfg)
+            # Use the fixed_tau threshold (EWMA tau) as the reference for "anomaly segments"
+            # so coverage shaping aligns with analyzer KPI4 (segment recall).
+            #
+            # This does *not* force any arm; it only provides a segment marker (context feature)
+            # and an optional reward penalty when a segment is missed.
+            tau_ref_f = float("nan")
+            try:
+                tau_ref_f = float(ewma_cfg.tau)
+            except Exception:
+                tau_ref_f = float("nan")
+            if not (math.isfinite(tau_ref_f) and tau_ref_f > 0.0):
+                # Fallback to configured limits if EWMA tau is unavailable.
+                tau_ref = (
+                    linucb_cfg.mae_est_max
+                    if linucb_cfg.mae_est_max is not None
+                    else linucb_cfg.mae_max
+                )
+                try:
+                    tau_ref_f = float(tau_ref)
+                except Exception:
+                    tau_ref_f = float("nan")
+            if math.isfinite(tau_ref_f) and tau_ref_f > 0.0:
+                self._coverage_tau_ref = float(tau_ref_f)
 
     # ---------------- 공개 API ----------------
 
@@ -242,12 +272,43 @@ class SensorPolicyRuntime:
         res_var = self._res_var.var
         if not math.isfinite(res_var):
             res_var = 0.0
+
+        # Track "anomaly" segments by residual threshold for reward shaping (no hard forcing).
+        missed_segment = False
+        seg_active = 0.0
+        in_anomaly = False
+        tau_ref = self._coverage_tau_ref
+        if tau_ref is not None and math.isfinite(float(tau_ref)) and float(tau_ref) > 0.0:
+            in_anomaly = bool(abs(float(resid)) > float(tau_ref))
+            if in_anomaly:
+                seg_active = 1.0
+                if not self._anomaly_active:
+                    self._anomaly_active = True
+                    self._anomaly_hit = False
+                    self._anomaly_len = 1
+                else:
+                    self._anomaly_len += 1
+            else:
+                if self._anomaly_active and (not self._anomaly_hit) and int(self._anomaly_len) >= 2:
+                    missed_segment = True
+                self._anomaly_active = False
+                self._anomaly_hit = False
+                self._anomaly_len = 0
+        else:
+            self._anomaly_active = False
+            self._anomaly_hit = False
+            self._anomaly_len = 0
         last_emit_ns = self._predictor.last_emit_ns
         edge_aoi_ms = (
             0.0 if last_emit_ns is None else max(0.0, (ts_ns - last_emit_ns) / 1e6)
         )
         aoi_ms = edge_aoi_ms + ack_delay_ms
         q_len = max(0, int(outbox_pending))
+        seg_unhit = float(
+            1.0
+            if self._anomaly_active and (not self._anomaly_hit) and int(self._anomaly_len) >= 2
+            else 0.0
+        )
 
         tau = self._ewma_cfg.tau
         kbits = self._ewma_cfg.kbits
@@ -261,6 +322,8 @@ class SensorPolicyRuntime:
                 res_var=float(res_var),
                 loss=float(loss_est),
                 q_len=int(q_len),
+                seg_active=float(seg_active),
+                seg_unhit=float(seg_unhit),
             )
             assert self._linucb is not None
             if diag_enabled:
@@ -272,6 +335,13 @@ class SensorPolicyRuntime:
             if bool(cfg.safety_force_emit_on_aoi) and aoi_ms >= float(cfg.aoi_max_ms):
                 force_emit = True
                 force_reason = "SAFETY_AOI"
+            if (
+                (not force_emit)
+                and bool(cfg.coverage_force_emit_on_unhit_segment)
+                and (seg_unhit > 0.5)
+            ):
+                force_emit = True
+                force_reason = "COVERAGE_SEG"
         elif self.mode == PolicyMode.PERIODIC:
             tau = -1e-9  # 항상 전송
             kbits = self._ewma_cfg.kbits
@@ -282,11 +352,29 @@ class SensorPolicyRuntime:
 
         if diag_enabled:
             pred_start_ns = time.perf_counter_ns()
+        # NOTE: In adaptive mode, we *optionally* disable the fixed heartbeat when an AoI
+        # guardrail is enabled, but only if the guardrail is at least as strict as the heartbeat.
+        #
+        # Keeping a heartbeat that is stricter than the AoI guardrail can dominate rate and
+        # largely hide arm effects; disabling it in that case keeps behavior aligned with the
+        # configured guardrail.
+        #
+        # EWMAPredictor treats override_heartbeat_s=None as "inherit config", so pass 0.0 to
+        # explicitly disable heartbeat when desired.
+        override_hb_s: float | None = None
+        if self.mode == PolicyMode.ADAPTIVE and self._linucb is not None:
+            cfg = self._linucb.cfg
+            if bool(cfg.safety_force_emit_on_aoi):
+                hb = self._ewma_cfg.heartbeat_s
+                if hb is not None and float(hb) > 0.0:
+                    if float(cfg.aoi_max_ms) <= float(hb) * 1000.0:
+                        override_hb_s = 0.0
         event = self._predictor.predict_and_maybe_emit(
             sample,
             override_tau=tau,
             override_kbits=kbits,
             policy_mode=self.mode,
+            override_heartbeat_s=override_hb_s,
             force_emit=force_emit,
             force_reason=force_reason,
         )
@@ -311,14 +399,49 @@ class SensorPolicyRuntime:
             )
             rate_bps = self._rate_from_event(event, edge_aoi_ms)
             self._last_sent_val = event.val
+            if in_anomaly:
+                self._anomaly_hit = True
 
         if self._linucb is not None:
             if diag_enabled:
                 observe_start_ns = time.perf_counter_ns()
+            # Reward shaping (KPI-aligned, no hard forcing):
+            # - Rate penalty applies only when an event is emitted (rate_bps > 0).
+            # - AoI/MAE are treated as "skip penalties": they apply when we *do not* emit.
+            # - To preserve anomaly coverage (KPI4) without forcing arms, add a per-sample penalty
+            #   while inside an un-hit anomaly segment (len>=2) until the first emit in that
+            #   segment. This encourages "emit once per segment" rather than emitting on every
+            #   sample like fixed_tau.
+            sent = bool(event is not None)
+            aoi_for_reward = 0.0 if sent else float(aoi_ms)
+            cfg = self._linucb.cfg
+            mae_max = cfg.mae_est_max
+            if mae_max is None or not math.isfinite(float(mae_max)) or float(mae_max) < 0.0:
+                mae_max = float(cfg.mae_max)
+            mae_max = float(mae_max)
+            mae_scale = max(1e-9, float(cfg.mae_scale))
+            # Segment-aligned coverage penalties (dimensionless, added to mae_over_n).
+            # - step penalty: while inside an un-hit segment (len>=2) and skipping.
+            # - miss penalty: one-shot penalty when a segment ends un-hit (helps short segments).
+            coverage_penalty_n = 0.0
+            if (not sent) and (seg_unhit > 0.5):
+                coverage_penalty_n += float(cfg.coverage_step_penalty_n)
+            if missed_segment:
+                coverage_penalty_n += float(cfg.coverage_miss_penalty_n)
+
+            if sent:
+                mae_for_reward = 0.0
+            else:
+                mae_for_reward = float(max(float(mae_est), mae_max))
+
+            # Encode coverage_penalty_n into the MAE "overage" term so LinUCB sees it
+            # without changing the core observe_outcome API.
+            if coverage_penalty_n > 0.0:
+                mae_for_reward = float(max(float(mae_for_reward), mae_max) + coverage_penalty_n * mae_scale)
             reward = float(
                 self._linucb.observe_outcome(
-                    aoi_ms=aoi_ms,
-                    mae=mae_est,
+                    aoi_ms=aoi_for_reward,
+                    mae=mae_for_reward,
                     rate_bps=rate_bps,
                 )
             )
@@ -336,11 +459,24 @@ class SensorPolicyRuntime:
                 maxrss_kb = None
                 if diag_enabled:
                     cfg = self._linucb.cfg
-                    aoi_n = float(aoi_ms) / max(1e-9, cfg.aoi_scale_ms)
-                    mae_n = float(mae_est) / max(1e-9, cfg.mae_scale)
-                    rate_n = float(rate_bps) / max(1e-9, cfg.rate_scale_bps)
-                    reward_aoi = float(-(cfg.w_aoi * aoi_n))
-                    reward_mae = float(-(cfg.w_mae * mae_n))
+                    aoi_scale = max(1e-9, float(cfg.aoi_scale_ms))
+                    mae_scale = max(1e-9, float(cfg.mae_scale))
+                    rate_scale = max(1e-9, float(cfg.rate_scale_bps))
+
+                    aoi_max = float(cfg.aoi_max_ms)
+                    if not math.isfinite(aoi_max) or aoi_max < 0.0:
+                        aoi_max = 0.0
+                    mae_max = cfg.mae_est_max
+                    if mae_max is None or not math.isfinite(float(mae_max)) or float(mae_max) < 0.0:
+                        mae_max = float(cfg.mae_max)
+                    mae_max = float(mae_max)
+
+                    aoi_over_n = max(0.0, float(aoi_for_reward) - aoi_max) / aoi_scale
+                    mae_over_n = max(0.0, float(mae_for_reward) - mae_max) / mae_scale
+                    rate_n = float(rate_bps) / rate_scale
+
+                    reward_aoi = float(-(cfg.w_aoi * aoi_over_n))
+                    reward_mae = float(-(cfg.w_mae * mae_over_n))
                     reward_rate = float(-(cfg.w_rate * rate_n))
                     rate_limit_skips = int(self._predictor.consume_rate_limit_skips())
                     t_step_ms = (time.perf_counter_ns() - step_wall_start_ns) / 1e6
@@ -449,26 +585,115 @@ def load_linucb_config(
     """
     arms_raw = cfg_dict.get("arms") or []
     arms = [Arm(tau=float(a["tau"]), kbits=int(a["kbits"])) for a in arms_raw]
+    lin = cfg_dict.get("linucb", {}) or {}
     reward = cfg_dict.get("reward", {}) or {}
     safety = cfg_dict.get("safety", {}) or {}
     diagnostics = cfg_dict.get("diagnostics", {}) or {}
     scales = cfg_dict.get("scales", {}) or {}
+
+    # Optional hyperparameters (allow both `linucb.*` and legacy top-level keys).
+    alpha_ucb_raw = cfg_dict.get("alpha_ucb")
+    if alpha_ucb_raw is None:
+        alpha_ucb_raw = lin.get("alpha_ucb", lin.get("alpha", 0.75))
+    alpha_ucb = float(alpha_ucb_raw)
+
+    lambda_ridge_raw = cfg_dict.get("lambda_ridge")
+    if lambda_ridge_raw is None:
+        lambda_ridge_raw = lin.get("lambda_ridge", lin.get("lambda", 1.0))
+    lambda_ridge = float(lambda_ridge_raw)
+
+    warmup_per_arm_raw = cfg_dict.get("warmup_per_arm")
+    if warmup_per_arm_raw is None:
+        warmup_per_arm_raw = lin.get("warmup_per_arm", 1)
+    warmup_per_arm = int(warmup_per_arm_raw)
+
+    ucb_min_tau_raw = cfg_dict.get("ucb_min_tau")
+    if ucb_min_tau_raw is None:
+        ucb_min_tau_raw = lin.get("ucb_min_tau", lin.get("min_tau", None))
+    ucb_min_tau = None
+    if ucb_min_tau_raw is not None:
+        try:
+            ucb_min_tau = float(ucb_min_tau_raw)
+        except Exception:
+            ucb_min_tau = None
+
+    safe_arm_raw = cfg_dict.get("safe_arm")
+    if safe_arm_raw is None:
+        safe_arm_raw = lin.get("safe_arm", None)
+    safe_arm = None
+    if isinstance(safe_arm_raw, dict):
+        if "tau" in safe_arm_raw and "kbits" in safe_arm_raw:
+            safe_arm = Arm(tau=float(safe_arm_raw["tau"]), kbits=int(safe_arm_raw["kbits"]))
+
+    aoi_safe_arm_raw = cfg_dict.get("aoi_safe_arm")
+    if aoi_safe_arm_raw is None:
+        aoi_safe_arm_raw = lin.get("aoi_safe_arm", None)
+    aoi_safe_arm = None
+    if isinstance(aoi_safe_arm_raw, dict):
+        if "tau" in aoi_safe_arm_raw and "kbits" in aoi_safe_arm_raw:
+            aoi_safe_arm = Arm(
+                tau=float(aoi_safe_arm_raw["tau"]),
+                kbits=int(aoi_safe_arm_raw["kbits"]),
+            )
+
+    q_len_scale = float(scales.get("q_len", scales.get("qlen", 50.0)))
+
+    mae_est_max = safety.get("mae_est_max", safety.get("mae_max_est", None))
+    mae_est_max_f = None
+    if mae_est_max is not None:
+        try:
+            mae_est_max_f = float(mae_est_max)
+        except Exception:
+            mae_est_max_f = None
+
+    residual_guard_enabled = safety.get(
+        "residual_guard_enabled",
+        safety.get("res_guard_enabled", True),
+    )
+    coverage_force_emit_on_unhit_segment = bool(safety.get("coverage_force_emit_on_unhit_segment", False))
+
+    cov_step_raw = reward.get("coverage_step_penalty_n", reward.get("coverage_penalty_n", 1.0))
+    cov_miss_raw = reward.get("coverage_miss_penalty_n", 0.0)
+    try:
+        cov_step = float(cov_step_raw)
+    except Exception:
+        cov_step = 1.0
+    try:
+        cov_miss = float(cov_miss_raw)
+    except Exception:
+        cov_miss = 0.0
+    if not math.isfinite(cov_step) or cov_step < 0.0:
+        cov_step = 0.0
+    if not math.isfinite(cov_miss) or cov_miss < 0.0:
+        cov_miss = 0.0
     return LinUCBConfig(
         device_id=device_id,
         sensor=sensor,
         profile=profile,
         seed=int(seed) if seed is not None else None,
         arms=arms,
+        alpha_ucb=float(alpha_ucb),
+        lambda_ridge=float(lambda_ridge),
         w_aoi=float(reward.get("alpha", 1.0)),
         w_mae=float(reward.get("beta", 1.0)),
         w_rate=float(reward.get("gamma", 1.0)),
         aoi_scale_ms=float(scales.get("aoi_ms", 1000.0)),
         rate_scale_bps=float(scales.get("rate_bps", 1024.0)),
+        q_len_scale=float(q_len_scale),
         aoi_max_ms=float(safety.get("aoi_max_ms", 5000.0)),
+        residual_guard_enabled=bool(residual_guard_enabled),
         mae_max=float(safety.get("mae_max", 2.0)),
+        mae_est_max=mae_est_max_f,
         safety_force_emit_on_aoi=bool(safety.get("safety_force_emit_on_aoi", False)),
+        coverage_force_emit_on_unhit_segment=bool(coverage_force_emit_on_unhit_segment),
+        warmup_per_arm=int(warmup_per_arm),
+        ucb_min_tau=ucb_min_tau,
+        safe_arm=safe_arm,
+        aoi_safe_arm=aoi_safe_arm,
         mae_scale=float(mae_scale) if mae_scale is not None else 1.0,
         res_scale=float(res_scale) if res_scale is not None else 1.0,
         resvar_scale=float(resvar_scale) if resvar_scale is not None else 1.0,
         diagnostics_enabled=bool(diagnostics.get("enabled", False)),
+        coverage_step_penalty_n=float(cov_step),
+        coverage_miss_penalty_n=float(cov_miss),
     )

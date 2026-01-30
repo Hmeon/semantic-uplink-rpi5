@@ -4,17 +4,44 @@ This report summarizes the final comparison and notes follow-up improvements
 if we want to push receiver-side freshness further, plus the exact CLI options
 and the synchronization rules used to keep scale/link conditions consistent across policies.
 
+## 0) Final KPI (strict PASS/FAIL)
+Evaluation scope (mandatory):
+- The project is **PASS only if every (profile × sensor) is PASS**.
+- No partial/optional PASS is allowed (e.g., “mic-only PASS” is not accepted).
+
+Baseline definitions (fixed):
+- `periodic`: reference stream (most-frequent sending)
+- `fixed_tau`: human-set fixed threshold (quality baseline)
+- `adaptive`: LinUCB policy (the policy under test)
+
+KPI (PASS requires all 5 per profile × sensor):
+1) Efficiency (Primary): `Rate_improvement_vs_periodic >= 85%`
+2) Rate guard (vs fixed_tau): `Rate_improvement_vs_fixed_tau >= -10%`
+3) Recon quality guard: `recon_mae_p95_improvement_vs_fixed_tau >= -10%`
+4) Coverage guard: `AnomalySegmentRecall >= 0.90`
+5) Freshness guard: `AoI_p95_improvement_vs_fixed_tau >= -10%`
+
+Notes on KPI4 (Coverage):
+- Anomaly segments are defined on the periodic baseline using `|res| > tau_ref` (tau_ref from fixed_tau).
+- If a (profile × sensor) has **0 anomaly segments**, recall is defined as **1.0** (vacuously satisfied) rather than failing due to NaN.
+
+How to check:
+- Run `python -m collector.analyze ...` (see section 5). The analyzer writes:
+  - `kpi_verdict.json` (project PASS/FAIL + failed profile/sensor list)
+  - `kpi_final.csv` (per profile × sensor: K1..K5 + overall)
+
 ## 1) Data Sources and Outputs
-- Inputs:
-  - `artifacts/slow10_periodic_3h_B/logs`
-  - `artifacts/slow10_fixed_3h_B/logs`
-  - `artifacts/slow10_linucb_3h_B/logs`
-- Analysis output: `results/final_compare_3h_slow_10kbps`
+- Run root (from `scripts/run_3h_sequence.sh`): `artifacts/field_runs/<run_root>/`
+- Inputs (3-policy):
+  - `artifacts/field_runs/<run_root>/slow_10kbps__periodic/`
+  - `artifacts/field_runs/<run_root>/slow_10kbps__fixed_tau/`
+  - `artifacts/field_runs/<run_root>/slow_10kbps__adaptive/`
+- Analysis output (default): `results/field_runs/<run_root>/`
 - Baseline: `periodic`
 - AoI/Rate use `t_recv_ns` (receiver time). MAE is event-based (`res`).
 
 ## 2) Final Results (Quantitative)
-Values are means from `results/final_compare_3h_slow_10kbps/report.md`.
+Values are means from `<results_dir>/report.md` (see section 1).
 
 mic_rms:
 - periodic: 524.0 B/s, AoI 1536.8 ms, MAE 0.052
@@ -26,11 +53,9 @@ temp:
 - fixed_tau: 23.7 B/s, AoI 6952.2 ms, MAE 0.036
 - adaptive: 27.4 B/s, AoI 5756.9 ms, MAE 0.035
 
-Goal check (from README):
-- Rate reduction >= 60% vs periodic: PASS (89-95% reduction)
-- MAE change <= 10% vs fixed_tau: PASS (mic +1.9%, temp -2.8%)
-- AoI improvement >= 15% vs fixed_tau: PASS (~17-25% improvement)
-- Rate increase <= 50% vs fixed_tau: PASS (mic +44%, temp +16%)
+Final KPI check (strict PASS/FAIL):
+- Use the analyzer outputs in the run directory: `kpi_verdict.json` / `kpi_final.csv`.
+- The mean-only snapshot above is informative, but **not** a KPI verdict.
 
 Trade-off (policy ranking):
 - Adaptive > Fixed_tau for AoI while keeping rate low.
@@ -38,9 +63,8 @@ Trade-off (policy ranking):
   - temp AoI improves ~17.2% vs fixed_tau (6952.2 -> 5756.9 ms)
 - Fixed_tau still gives the lowest rate, but AoI is worst.
 
-Conclusion: adaptive is the best overall trade-off and meets the revised success
-criteria; AoI vs periodic remains worse, which is expected under the MAE-first
-objective.
+Conclusion: adaptive improves AoI vs fixed_tau in this snapshot, but final
+PASS/FAIL must follow the final KPI table (`kpi_final.csv`).
 
 ## 3) Why LinUCB Can Improve Further
 Observed issue: AoI vs periodic remains worse even though adaptive improves AoI
@@ -59,70 +83,27 @@ Recommended fixes:
   to the reward). Feed that into LinUCB as `state_aoi`.
 - Populate `state_loss` with an observable signal (retries, drop estimates,
   or ack timeout rate).
-- Rebalance reward weights/scales in `configs/policy_adaptive_aiot.yaml` to
+- Rebalance reward weights/scales in `configs/policy.yaml` (or `configs/policy_adaptive_aiot.yaml`) to
   strengthen AoI penalties when it drifts (raise `alpha`, reduce `gamma`).
 - Tighten safety guardrails (`aoi_max_ms`) or force a lower-tau arm on AoI
   violations to keep freshness under control.
 
-## 4) Terminal A/B Commands (same conditions as the logs)
-아래는 `slow_10kbps` 3시간 로그를 실측으로 재현하기 위한 동일 조건 옵션이다.
-각 정책별로 **Terminal A(collector)**, **Terminal B(edge)** 를 한 쌍으로 실행한다.
+## 4) One-command reproduction (recommended)
+```bash
+# Field A
+FIELD_LABEL=A SEMUP_SEED=0 PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
 
-사전 준비(공통):
-- 브로커(Mosquitto)가 이미 떠 있다면 생략. 없다면 `mosquitto -p 1883`.
-- 링크 프로필 적용(권장, root 필요):
-  `sudo python -m link.shaper.tc_profiles apply --iface lo --profile slow_10kbps`
-
-Terminal A (Collector, 정책별 실행):
-```bash
-python -m collector.collector \
-  --run-dir artifacts/slow10_periodic_3h_B \
-  --broker localhost --port 1883 \
-  --flush-interval-s 10 --max-runtime-s 10800
-```
-```bash
-python -m collector.collector \
-  --run-dir artifacts/slow10_fixed_3h_B \
-  --broker localhost --port 1883 \
-  --flush-interval-s 10 --max-runtime-s 10800
-```
-```bash
-python -m collector.collector \
-  --run-dir artifacts/slow10_linucb_3h_B \
-  --broker localhost --port 1883 \
-  --flush-interval-s 10 --max-runtime-s 10800
+# Field B (same settings)
+FIELD_LABEL=B SEMUP_SEED=0 PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
 ```
 
-Terminal B (Edge Daemon, 정책별 실행):
-```bash
-SEMUP_SEED=0 timeout 3h python -m edge.edge_daemon \
-  --device-id rpi5a --profile slow_10kbps --mode periodic \
-  --mic-enable --temp-enable \
-  --mic-sr 16000 --mic-frame-ms 500 --temp-hz 1 \
-  --mic-kbits 6 --temp-kbits 8 \
-  --mic-heartbeat 10 --temp-heartbeat 10
-```
-```bash
-SEMUP_SEED=0 timeout 3h python -m edge.edge_daemon \
-  --device-id rpi5a --profile slow_10kbps --mode fixed_tau \
-  --mic-enable --temp-enable \
-  --mic-sr 16000 --mic-frame-ms 500 --temp-hz 1 \
-  --mic-tau 3.0 --temp-tau 0.2 \
-  --mic-kbits 6 --temp-kbits 8 \
-  --mic-heartbeat 10 --temp-heartbeat 10
-```
-```bash
-SEMUP_SEED=0 timeout 3h python -m edge.edge_daemon \
-  --device-id rpi5a --profile slow_10kbps --mode adaptive \
-  --mic-enable --temp-enable \
-  --mic-sr 16000 --mic-frame-ms 500 --temp-hz 1 \
-  --arms configs/policy_adaptive_aiot.yaml
-```
+The sequence script writes `RUN_META.txt`, `CHECKLIST.md`, and `sequence.log` under the run root and
+auto-runs `collector.analyze` into `results/field_runs/<run_root>/`.
 
-주의:
-- `frame_ms=500`(mic 2Hz) + `temp_hz=1`이 현재 로그의 이벤트 수와 일치하는 핵심 조건.
-- `--decision-publish`는 기본값이 `always`이므로 decisions 로그가 자동 수집됨.
-- 시간 안정성(NTP)이 흔들리면 AoI가 왜곡될 수 있으니 테스트 전 시간 동기화 권장.
+Notes:
+- AoI uses `t_recv_ns - ts` so **edge and collector clocks must share a timebase** (same host recommended).
+- The script enforces time sync via `timedatectl status` by default; override only if you accept risk (`ALLOW_UNSYNC=1`).
+- By default it fails the run if KPI != PASS; set `KPI_ENFORCE_PASS=0` to only report.
 
 ## 5) CLI Options Used for Comparable Runs
 These are the run-level options that define each policy under the same profile.
@@ -150,16 +131,19 @@ Adaptive (LinUCB, AIoT):
 python -m edge.edge_daemon \
   --device-id rpi5a --profile slow_10kbps --mode adaptive \
   --mic-enable --temp-enable \
-  --arms configs/policy_adaptive_aiot.yaml
+  --arms configs/policy.yaml \
+  --decision-publish never
 ```
 
 Analysis:
 ```bash
 python -m collector.analyze \
-  --input artifacts/<run>/logs \
-  --out results/final_compare_3h_slow_10kbps \
+  --input artifacts/field_runs/<run_root>/slow_10kbps__periodic \
+  --input artifacts/field_runs/<run_root>/slow_10kbps__fixed_tau \
+  --input artifacts/field_runs/<run_root>/slow_10kbps__adaptive \
+  --out results/field_runs/<run_root> \
   --baseline-policy periodic \
-  --plots --paper-plots --diagnostic-plots --ucb-timeseries --pareto-p95 --audit
+  --policy-config configs/policy.yaml --audit
 ```
 
 ## 6) How Scale and Link Conditions Were Synchronized
@@ -182,15 +166,23 @@ All three policies were synchronized to ensure a fair comparison:
   - MAE is event-based and not full-signal MAE
 
 ## 7) Final Interpretation
-Adaptive is objectively better than fixed_tau on the final logs in terms of the
-overall trade-off (lower AoI, acceptable rate, stable MAE) and meets the revised
-goals (MAE within +10% vs fixed_tau, AoI +15% vs fixed_tau, rate -60% vs periodic,
-rate +50% max vs fixed_tau). AoI remains worse than periodic, which is acceptable
-under the MAE-first objective. If we want periodic-level freshness, align the
-LinUCB reward with receiver-side AoI and add a real link condition signal.
+With the final KPI, the primary target is rate reduction vs periodic (>=85%) but
+adaptive must also stay within guardrails vs fixed_tau (Rate/Recon_p95/AoI_p95)
+and preserve coverage (AnomalySegmentRecall).
+
+If you fail KPI2 (rate vs fixed_tau), start by constraining arms and/or reward
+to avoid oversending:
+- Prefer a higher `reward.gamma` (rate penalty), and keep arms near fixed_tau.
+- Use an AoI guardrail (`safety_force_emit_on_aoi: true`) as the liveness
+  mechanism; in adaptive mode the runtime disables the fixed heartbeat in this
+  case to avoid heartbeat dominating the rate.
+- See `configs/policy_adaptive_aiot_field_A_final.yaml` /
+  `configs/policy_adaptive_aiot_field_B_final.yaml` as starting points.
 
 ## 8) Applied Improvements (Post-Evaluation)
-The following fixes are now applied in code/config and require new runs:
-- Edge uses Outbox PUBACK latency EWMA as a receiver-delay proxy and adds it to AoI in LinUCB state/reward.
-- Outbox tracks retry/timeout EWMA as `state_loss` so the policy sees link stress.
-- AIoT policy weights updated (alpha up, gamma down), `aoi_max_ms` tightened, and rate scales relaxed.
+The following are applied in code/config and require new runs to reflect:
+- Analyzer emits strict final KPI artifacts: `kpi_final.csv`, `kpi_verdict.json`.
+- Seq-aligned recon/coverage metrics are computed against the periodic baseline
+  (reconstruction MAE and anomaly segment recall).
+- Edge policy config supports nested `linucb:` hyperparameters (also per-sensor),
+  plus log-scaled queue normalization (`scales.q_len`).
