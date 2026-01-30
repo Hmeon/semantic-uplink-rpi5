@@ -64,7 +64,10 @@ KPI4(coverage)의 의미:
 추가로 발견된 편향 요인(중요):
 - EWMA diagnostics가 켜지면 `EventMsg.event_reason`가 payload에 포함되어 **MQTT bytes가 증가**합니다.
   - adaptive만 diagnostics가 켜져 있으면 KPI2(rate vs fixed_tau)가 **불리하게 편향**될 수 있습니다.
-  - 따라서 KPI 검증용 config는 `diagnostics.enabled: false`를 권장합니다(아래 4절 참조).
+  - 해결: **decision/learning 진단**과 **event payload 진단**을 분리해, payload-fair KPI와 진단 가시성을 동시에 확보합니다.
+    - `diagnostics.enabled: true` (LinUCB decision 로그 진단 활성)
+    - `diagnostics.events_enabled: false` (event payload 진단 비활성 → bytes 공정성 유지)
+    - 최종 KPI 프리셋: `configs/policy_poc_covforce_kpi.yaml`
 
 ---
 
@@ -108,9 +111,17 @@ KPI4(coverage)의 의미:
 - config 스키마: `common/config.py`
 - 런타임 로딩/동작: `edge/policy/runtime.py`
 
-### 4.2 KPI 평가용 config 분리(진단모드 편향 제거)
-KPI 평가에서는 payload 크기 차이를 제거하기 위해 diagnostics를 끈 config를 권장합니다.
-- `configs/policy_poc_covforce_kpi.yaml` (diagnostics=false, coverage_force=true)
+### 4.2 KPI 평가용 diagnostics 공정성: decision은 켜고(event는 끈다)
+KPI 평가에서 중요한 것은 **(정책별) 이벤트 payload 크기가 달라지지 않는 것**입니다.
+
+- 이벤트 쪽(EWMA) diagnostics가 켜지면 `event_reason` 등이 payload에 포함되어 bytes가 증가할 수 있습니다.
+- 반대로 decision 로그(LinUCB diagnostics)는 이벤트 uplink와 분리하면(= payload에 포함되지 않으면) KPI2를 왜곡하지 않습니다.
+
+따라서 최종 KPI 프리셋은 아래처럼 구성합니다.
+- `configs/policy_poc_covforce_kpi.yaml`
+  - `diagnostics.enabled: true` (파이프라인/학습 진단 지표 확보)
+  - `diagnostics.events_enabled: false` (payload-fair)
+  - synthetic에서는 `--decision-publish local`로 decision을 링크 트래픽에 포함하지 않음
 
 ---
 

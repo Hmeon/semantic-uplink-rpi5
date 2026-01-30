@@ -4,7 +4,7 @@
 - Minimal safe dev (mock temp + console UI):
   `python -m edge.edge_daemon --device-id dev1 --mode periodic --temp-enable --temp-backend mock --ui-enable --ui-kind console --base-topic edge`
 - Full device run (uses configs/device.yaml):
-  `python -m edge.edge_daemon --device-id rpi5-01 --profile slow_10kbps --mode adaptive --run-dir artifacts/run_rpi5 --device-config configs/device.yaml --arms configs/policy_adaptive_aiot.yaml --base-topic edge`
+  `python -m edge.edge_daemon --device-id rpi5-01 --profile slow_10kbps --mode adaptive --run-dir artifacts/run_rpi5 --device-config configs/device.yaml --arms configs/policy_poc_covforce_kpi.yaml --decision-publish event --base-topic edge`
 
 ## Collector
 - `python -m collector.collector --run-dir artifacts/run1 --broker localhost --port 1883 --base-topic edge`

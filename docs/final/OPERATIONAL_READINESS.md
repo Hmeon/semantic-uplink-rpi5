@@ -8,7 +8,7 @@
 
 ## Run modes
 - Edge daemon:
-  - `python -m edge.edge_daemon --device-id rpi5-01 --profile slow_10kbps --mode adaptive --run-dir /var/lib/semantic-uplink/run --device-config configs/device.yaml --arms configs/policy_adaptive_aiot.yaml`
+  - `python -m edge.edge_daemon --device-id rpi5-01 --profile slow_10kbps --mode adaptive --run-dir /var/lib/semantic-uplink/run --device-config configs/device.yaml --arms configs/policy_poc_covforce_kpi.yaml --decision-publish event`
 - Collector:
   - `python -m collector.collector --run-dir /var/lib/semantic-uplink/run --broker localhost --port 1883`
 - Analyze:
@@ -17,7 +17,12 @@
 ## Logging and rotation
 - Logging is configured via `common/logging_setup.py` with optional rotating file handler.
 - Use `--log-file` and `--log-max-bytes`/`--log-backup-count` on CLI where available.
-- Diagnostics logs are gated by `diagnostics.enabled` in the active policy config (default false).
+- Policy diagnostics are gated by:
+  - `diagnostics.enabled`: decision/learning diagnostics (written to `decisions_*.parquet` when decision publish is enabled)
+  - `diagnostics.events_enabled`: event-level diagnostics payload (e.g., `event_reason`); when omitted it defaults to `diagnostics.enabled`
+
+  For payload-fair KPI comparisons, prefer `diagnostics.enabled: true` with `diagnostics.events_enabled: false`
+  (this is how `configs/policy_poc_covforce_kpi.yaml` is configured).
 
 ## Failure modes and recovery
 - Network outage: edge continues to enqueue to outbox; collector reconnects (MQTT reconnect warnings expected).

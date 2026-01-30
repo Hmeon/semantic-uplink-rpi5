@@ -1,17 +1,29 @@
-# Final Evaluation (slow_10kbps, 3h)
+# Final Evaluation (slow_10kbps, 3h) — Pre-field (Synthetic A/B) + Field (Single RPi5)
 
-This report summarizes the final comparison and notes follow-up improvements
-if we want to push receiver-side freshness further, plus the exact CLI options
-and the synchronization rules used to keep scale/link conditions consistent across policies.
+Updated: 2026-01-31
+
+This project has two “final” evaluation stages:
+
+1) **Pre-field (Synthetic Scenarios A/B)** — field-like, bias-minimized synthetic runs used to validate KPI logic and the adaptive mode in a controlled way.
+2) **Field measurement (single RPi5)** — a real hardware run on one device, executed as a 3-policy sequence.
+
+The intent is: **A/B synthetic PASS** → then proceed to **single-RPi5 field measurement** with the same evaluation rules.
+
+For the development history (what was tried, what failed, what was fixed), see:
+- `docs/final/RESULTS_DEV_HISTORY_SCNA_SCNB_POC_COVFORCE_KPI.md`
+- `docs/specs/KPI_DIAGNOSIS_AND_RECOMMENDATION.md`
+
+---
 
 ## 0) Final KPI (strict PASS/FAIL)
+
 Evaluation scope (mandatory):
 - The project is **PASS only if every (profile × sensor) is PASS**.
 - No partial/optional PASS is allowed (e.g., “mic-only PASS” is not accepted).
 
-Baseline definitions (fixed):
+Baselines (fixed):
 - `periodic`: reference stream (most-frequent sending)
-- `fixed_tau`: human-set fixed threshold (quality baseline)
+- `fixed_tau`: fixed residual threshold baseline (quality reference)
 - `adaptive`: LinUCB policy (the policy under test)
 
 KPI (PASS requires all 5 per profile × sensor):
@@ -22,167 +34,155 @@ KPI (PASS requires all 5 per profile × sensor):
 5) Freshness guard: `AoI_p95_improvement_vs_fixed_tau >= -10%`
 
 Notes on KPI4 (Coverage):
-- Anomaly segments are defined on the periodic baseline using `|res| > tau_ref` (tau_ref from fixed_tau).
-- If a (profile × sensor) has **0 anomaly segments**, recall is defined as **1.0** (vacuously satisfied) rather than failing due to NaN.
+- Anomaly segments are defined on the periodic baseline using `|res| > tau_ref` (`tau_ref` derived from fixed_tau).
+- Segments are **consecutive** runs with length **>= 2 samples**.
+- A segment is considered “hit” if the candidate emits **at least 1 event** within that segment.
 
-How to check:
-- Run `python -m collector.analyze ...` (see section 5). The analyzer writes:
-  - `kpi_verdict.json` (project PASS/FAIL + failed profile/sensor list)
-  - `kpi_final.csv` (per profile × sensor: K1..K5 + overall)
+The analyzer emits:
+- `kpi_verdict.json` (project PASS/FAIL + failures)
+- `kpi_final.csv` (K1..K5 + overall per profile × sensor)
 
-## 1) Data Sources and Outputs
-- Run root (from `scripts/run_3h_sequence.sh`): `artifacts/field_runs/<run_root>/`
-- Inputs (3-policy):
-  - `artifacts/field_runs/<run_root>/slow_10kbps__periodic/`
-  - `artifacts/field_runs/<run_root>/slow_10kbps__fixed_tau/`
-  - `artifacts/field_runs/<run_root>/slow_10kbps__adaptive/`
-- Analysis output (default): `results/field_runs/<run_root>/`
-- Baseline: `periodic`
-- AoI/Rate use `t_recv_ns` (receiver time). MAE is event-based (`res`).
+---
 
-## 2) Final Results (Quantitative)
-Values are means from `<results_dir>/report.md` (see section 1).
+## 1) Final evaluation policy config (recommended)
 
-mic_rms:
-- periodic: 524.0 B/s, AoI 1536.8 ms, MAE 0.052
-- fixed_tau: 26.0 B/s, AoI 6287.7 ms, MAE 0.052
-- adaptive: 37.4 B/s, AoI 4745.2 ms, MAE 0.053
+Use:
+- `configs/policy_poc_covforce_kpi.yaml`
 
-temp:
-- periodic: 255.0 B/s, AoI 1802.9 ms, MAE 0.036
-- fixed_tau: 23.7 B/s, AoI 6952.2 ms, MAE 0.036
-- adaptive: 27.4 B/s, AoI 5756.9 ms, MAE 0.035
+Why this config is the final preset:
+- **KPI4 stability without “fixed_tau 회귀(guardrail)”**: `coverage_force_emit_on_unhit_segment: true` enforces “one emit per anomaly segment” *without forcing a safe arm*.
+- **Payload-fair KPI** while still getting rich diagnostics:
+  - `diagnostics.enabled: true` → decision/learning diagnostics are available (UCB, forced_reason, reward components, etc.).
+  - `diagnostics.events_enabled: false` → event payload is not inflated by diagnostic fields (avoids biasing Rate vs fixed_tau).
 
-Final KPI check (strict PASS/FAIL):
-- Use the analyzer outputs in the run directory: `kpi_verdict.json` / `kpi_final.csv`.
-- The mean-only snapshot above is informative, but **not** a KPI verdict.
+---
 
-Trade-off (policy ranking):
-- Adaptive > Fixed_tau for AoI while keeping rate low.
-  - mic_rms AoI improves ~24.5% vs fixed_tau (6287.7 -> 4745.2 ms)
-  - temp AoI improves ~17.2% vs fixed_tau (6952.2 -> 5756.9 ms)
-- Fixed_tau still gives the lowest rate, but AoI is worst.
+## 2) Pre-field synthetic evaluation (Scenario A/B)
 
-Conclusion: adaptive improves AoI vs fixed_tau in this snapshot, but final
-PASS/FAIL must follow the final KPI table (`kpi_final.csv`).
+### 2.1 What the final outputs are (this workspace)
+The final pre-field synthetic outputs are the following 8 result folders:
+- `results/scnA_poc_covforce_kpi_rep00`
+- `results/scnA_poc_covforce_kpi_rep01`
+- `results/scnA_poc_covforce_kpi_rep02`
+- `results/scnA_poc_covforce_kpi_agg_seeded`
+- `results/scnB_poc_covforce_kpi_rep00`
+- `results/scnB_poc_covforce_kpi_rep01`
+- `results/scnB_poc_covforce_kpi_rep02`
+- `results/scnB_poc_covforce_kpi_agg_seeded`
 
-## 3) Why LinUCB Can Improve Further
-Observed issue: AoI vs periodic remains worse even though adaptive improves AoI
-vs fixed_tau. The current learning signal does not reflect receiver-side
-freshness well.
+Each folder contains:
+- `report.md`, `kpi_verdict.json`, `kpi_final.csv`
+- `metrics_by_run.csv`, `metrics_summary.csv|parquet`, `quality_audit.*`
+- `linucb_arm_distribution.csv`, `linucb_entropy_60s.csv`
+- `figs/` + `plot_manifest.json`
 
-Key limitations in code (see `edge/policy/runtime.py`):
-- AoI in policy state is computed from last emit time on the edge, not from
-  receiver-side freshness (`t_recv_ns`), so the reward is misaligned with the
-  evaluation metric.
-- `state_loss` is fixed at 0.0. No real link-loss or queue delay estimate is
-  injected into the context, reducing adaptivity to link conditions.
-
-Recommended fixes:
-- Use ACK/outbox timing to approximate receiver-side AoI (or add a delay model
-  to the reward). Feed that into LinUCB as `state_aoi`.
-- Populate `state_loss` with an observable signal (retries, drop estimates,
-  or ack timeout rate).
-- Rebalance reward weights/scales in `configs/policy.yaml` (or `configs/policy_adaptive_aiot.yaml`) to
-  strengthen AoI penalties when it drifts (raise `alpha`, reduce `gamma`).
-- Tighten safety guardrails (`aoi_max_ms`) or force a lower-tau arm on AoI
-  violations to keep freshness under control.
-
-## 4) One-command reproduction (recommended)
+### 2.2 Minimal reproduction template
+Generate adaptive artifacts (decisions logged locally; not counted as event uplink):
 ```bash
-# Field A
-FIELD_LABEL=A SEMUP_SEED=0 PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
-
-# Field B (same settings)
-FIELD_LABEL=B SEMUP_SEED=0 PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
+python scripts/generate_synthetic_run.py --model field --scenario B --policy adaptive --seed 2 \
+  --run-dir artifacts/field_scnB_adaptive_3h_poc_covforce_kpi_rep02 --overwrite \
+  --arms-config configs/policy_poc_covforce_kpi.yaml --decision-publish local
 ```
 
-The sequence script writes `RUN_META.txt`, `CHECKLIST.md`, and `sequence.log` under the run root and
-auto-runs `collector.analyze` into `results/field_runs/<run_root>/`.
-
-Notes:
-- AoI uses `t_recv_ns - ts` so **edge and collector clocks must share a timebase** (same host recommended).
-- The script enforces time sync via `timedatectl status` by default; override only if you accept risk (`ALLOW_UNSYNC=1`).
-- By default it fails the run if KPI != PASS; set `KPI_ENFORCE_PASS=0` to only report.
-
-## 5) CLI Options Used for Comparable Runs
-These are the run-level options that define each policy under the same profile.
-
-Periodic (baseline):
-```bash
-python -m edge.edge_daemon \
-  --device-id rpi5a --profile slow_10kbps --mode periodic \
-  --mic-enable --temp-enable \
-  --mic-kbits 6 --temp-kbits 8
-```
-
-Fixed_tau (EWMA):
-```bash
-python -m edge.edge_daemon \
-  --device-id rpi5a --profile slow_10kbps --mode fixed_tau \
-  --mic-enable --temp-enable \
-  --mic-tau 3.0 --temp-tau 0.2 \
-  --mic-kbits 6 --temp-kbits 8 \
-  --mic-heartbeat 10 --temp-heartbeat 10
-```
-
-Adaptive (LinUCB, AIoT):
-```bash
-python -m edge.edge_daemon \
-  --device-id rpi5a --profile slow_10kbps --mode adaptive \
-  --mic-enable --temp-enable \
-  --arms configs/policy.yaml \
-  --decision-publish never
-```
-
-Analysis:
+Analyze with full outputs:
 ```bash
 python -m collector.analyze \
-  --input artifacts/field_runs/<run_root>/slow_10kbps__periodic \
-  --input artifacts/field_runs/<run_root>/slow_10kbps__fixed_tau \
-  --input artifacts/field_runs/<run_root>/slow_10kbps__adaptive \
-  --out results/field_runs/<run_root> \
+  -i artifacts/field_scnB_periodic_3h_v11_rep02 \
+  -i artifacts/field_scnB_fixed_tau_3h_v11_rep02 \
+  -i artifacts/field_scnB_adaptive_3h_poc_covforce_kpi_rep02 \
+  -o results/scnB_poc_covforce_kpi_rep02 \
   --baseline-policy periodic \
-  --policy-config configs/policy.yaml --audit
+  --policy-config configs/policy_poc_covforce_kpi.yaml \
+  --audit --plots --paper-plots --diagnostic-plots --ucb-timeseries --pareto-p95 --save-parquet
 ```
 
-## 6) How Scale and Link Conditions Were Synchronized
-All three policies were synchronized to ensure a fair comparison:
-- Same profile: `slow_10kbps` across periodic, fixed_tau, adaptive.
-- Same device_id: `rpi5a`.
-- Same run length: 3 hours (10800s), same 10s flush cadence.
-- Same sensor scale:
-  - mic_rms values around -18 (range roughly -19.5 to -16.5)
-  - temp values around 11C (range roughly 10.5 to 11.8)
-- Same quantization baseline:
-  - periodic/fixed_tau use mic=6 bits, temp=8 bits
-  - adaptive chooses from AIoT arms (tau/kbits), but link profile is constant
-- Same link delay model:
-  - periodic/fixed_tau use ~1.3s mean delay with similar jitter
-  - adaptive uses slightly lower mean delay (~1.1s) to reflect reduced queueing,
-    not a different link profile
-- Same evaluation method:
-  - AoI/Rate computed from `t_recv_ns` in `collector.analyze`
-  - MAE is event-based and not full-signal MAE
+For the complete seed-0..2 aggregated reproduction, see:
+- `docs/final/RESULTS_DEV_HISTORY_SCNA_SCNB_POC_COVFORCE_KPI.md`
 
-## 7) Final Interpretation
-With the final KPI, the primary target is rate reduction vs periodic (>=85%) but
-adaptive must also stay within guardrails vs fixed_tau (Rate/Recon_p95/AoI_p95)
-and preserve coverage (AnomalySegmentRecall).
+---
 
-If you fail KPI2 (rate vs fixed_tau), start by constraining arms and/or reward
-to avoid oversending:
-- Prefer a higher `reward.gamma` (rate penalty), and keep arms near fixed_tau.
-- Use an AoI guardrail (`safety_force_emit_on_aoi: true`) as the liveness
-  mechanism; in adaptive mode the runtime disables the fixed heartbeat in this
-  case to avoid heartbeat dominating the rate.
-- See `configs/policy_adaptive_aiot_field_A_final.yaml` /
-  `configs/policy_adaptive_aiot_field_B_final.yaml` as starting points.
+## 3) Field measurement (single RPi5): 3-policy × 3-hour sequence
 
-## 8) Applied Improvements (Post-Evaluation)
-The following are applied in code/config and require new runs to reflect:
-- Analyzer emits strict final KPI artifacts: `kpi_final.csv`, `kpi_verdict.json`.
-- Seq-aligned recon/coverage metrics are computed against the periodic baseline
-  (reconstruction MAE and anomaly segment recall).
-- Edge policy config supports nested `linucb:` hyperparameters (also per-sensor),
-  plus log-scaled queue normalization (`scales.q_len`).
+Recommended runner:
+- `scripts/run_3h_sequence.sh`
+
+It executes on a **single RPi5**:
+- periodic → fixed_tau → adaptive (each for `RUN_SECONDS`, default 10800s)
+- runs a collector per phase
+- runs `collector.analyze` at the end
+
+### 3.1 Preflight checklist (practical)
+- Packages (RPi OS/Debian example):
+  ```bash
+  sudo apt-get update
+  sudo apt-get install -y mosquitto mosquitto-clients alsa-utils i2c-tools coreutils python3-venv
+  python3 -m venv .venv && source .venv/bin/activate
+  pip install -e .[analysis,hw]
+  ```
+- Broker running:
+  - `mosquitto -c infra/mosquitto/mosquitto.conf` (or run via systemd)
+- Sensor presence:
+  - DS18B20: `ls /sys/bus/w1/devices/28-*/w1_slave` (override via `W1_PATH`)
+  - Mic: `arecord -l` and set `MIC_DEVICE` (example `hw:2,0`)
+- Time sync:
+  - `timedatectl status` → `System clock synchronized: yes` recommended
+
+### 3.2 Smoke test first (2min × 3 policies)
+Before a full 9-hour run:
+```bash
+RUN_SECONDS=120 KPI_ENFORCE_PASS=0 FIELD_LABEL=SMOKE \
+  ADAPTIVE_ARMS=configs/policy_poc_covforce_kpi.yaml \
+  DECISION_PUBLISH=event \
+  ANALYZE_EXTRA_ARGS="--diagnostic-plots --ucb-timeseries --pareto-p95 --save-parquet" \
+  PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
+```
+
+### 3.3 Full field run (3h × 3 policies)
+```bash
+FIELD_LABEL=A SEMUP_SEED=0 DEVICE_ID=rpi5a \
+  ADAPTIVE_ARMS=configs/policy_poc_covforce_kpi.yaml \
+  DECISION_PUBLISH=event \
+  ANALYZE_EXTRA_ARGS="--diagnostic-plots --ucb-timeseries --pareto-p95 --save-parquet" \
+  PYTHON=$HOME/.venv/bin/python bash scripts/run_3h_sequence.sh
+```
+
+Outputs:
+- Run root: `artifacts/field_runs/<run_root>/`
+- Results: `results/field_runs/<run_root>/`
+
+What to check:
+- `results/field_runs/<run_root>/kpi_verdict.json`
+- `results/field_runs/<run_root>/kpi_final.csv`
+- `results/field_runs/<run_root>/report.md`
+
+Archive (recommended):
+```bash
+tar -czf "field_run_<run_root>.tar.gz" "artifacts/field_runs/<run_root>" "results/field_runs/<run_root>"
+```
+
+---
+
+## 4) Fairness & diagnostics (why some knobs matter)
+
+To keep KPI comparisons meaningful:
+- **Do not inflate event payload only for adaptive.**
+  - In this project, event-level diagnostics (e.g., `event_reason`) can change MQTT bytes, which biases KPI2.
+  - The final preset (`configs/policy_poc_covforce_kpi.yaml`) keeps event payload diagnostics off via `diagnostics.events_enabled: false`.
+- **Decision diagnostics are safe to enable for analysis** as long as you keep decisions out of the event uplink:
+  - Synthetic: `--decision-publish local`
+  - Field: `DECISION_PUBLISH=event` is fine if you treat decision logs as “diagnostic telemetry”; if you want strict uplink-only accounting, keep decisions off and accept reduced pipeline diagnostics.
+
+---
+
+## 5) Applied improvements (final state)
+
+These are part of the final repo state and reflected in the final outputs:
+- Strict KPI artifacts: `kpi_final.csv`, `kpi_verdict.json` (+ `report.md`).
+- Seed-aware, seq-aligned KPI calculation (prevents seed mixing in multi-run analysis).
+- KPI4 stabilization without fixed_tau “guardrail regression”:
+  - `safety.coverage_force_emit_on_unhit_segment: true`
+- Diagnostics decoupling:
+  - `diagnostics.enabled` (decision/learning) vs `diagnostics.events_enabled` (event payload)
+- Analyzer “pipeline diagnostics” made visible when decision logs are present:
+  - arm distribution + action entropy outputs
+

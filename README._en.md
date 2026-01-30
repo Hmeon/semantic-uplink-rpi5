@@ -320,7 +320,7 @@ Environment variables used in scripts:
 ## Running & Development
 | Task | Command |
 | --- | --- |
-| Edge daemon (full device) | `python -m edge.edge_daemon --device-id rpi5-01 --profile slow_10kbps --mode adaptive --run-dir artifacts/run_rpi5 --device-config configs/device.yaml --arms configs/policy_adaptive_aiot.yaml` |
+| Edge daemon (full device) | `python -m edge.edge_daemon --device-id rpi5-01 --profile slow_10kbps --mode adaptive --run-dir artifacts/run_rpi5 --device-config configs/device.yaml --arms configs/policy_poc_covforce_kpi.yaml --decision-publish event` |
 | Collector | `python -m collector.collector --run-dir artifacts/run1 --broker localhost --port 1883 --base-topic edge` |
 | Analyze | `python -m collector.analyze --input artifacts/run1/logs --out results/run1 --diagnostic-plots --audit` |
 | Single-Pi stack | `bash scripts/run_stack.sh` |
