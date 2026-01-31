@@ -10,8 +10,8 @@ from collector.analyze import (
     aoi_mean_and_p95,
     aoi_mean_and_p95_from_rx,
     load_events,
-    summarize_decisions_diagnostics_by_run,
     summarize_by_run,
+    summarize_decisions_diagnostics_by_run,
 )
 
 

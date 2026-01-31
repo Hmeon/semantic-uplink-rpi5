@@ -264,7 +264,8 @@ class LinUCBPolicy:
         if not self.arms:
             raise ValueError("arms must not be empty")
 
-        # 컨텍스트 차원(d): bias + aoi_norm + res_norm + resvar_norm + loss + qlen_norm + seg_active + seg_unhit
+        # Context dimension (d): bias + aoi_norm + res_norm + resvar_norm + loss + qlen_norm
+        # + seg_active + seg_unhit
         self.d = 1 + 7
         self._A = [np.eye(self.d, dtype=np.float64) * float(cfg.lambda_ridge) for _ in self.arms]
         self._b = [np.zeros((self.d,), dtype=np.float64) for _ in self.arms]

@@ -437,7 +437,10 @@ class SensorPolicyRuntime:
             # Encode coverage_penalty_n into the MAE "overage" term so LinUCB sees it
             # without changing the core observe_outcome API.
             if coverage_penalty_n > 0.0:
-                mae_for_reward = float(max(float(mae_for_reward), mae_max) + coverage_penalty_n * mae_scale)
+                mae_for_reward = float(
+                    max(float(mae_for_reward), mae_max)
+                    + coverage_penalty_n * mae_scale
+                )
             reward = float(
                 self._linucb.observe_outcome(
                     aoi_ms=aoi_for_reward,
@@ -650,7 +653,9 @@ def load_linucb_config(
         "residual_guard_enabled",
         safety.get("res_guard_enabled", True),
     )
-    coverage_force_emit_on_unhit_segment = bool(safety.get("coverage_force_emit_on_unhit_segment", False))
+    coverage_force_emit_on_unhit_segment = bool(
+        safety.get("coverage_force_emit_on_unhit_segment", False)
+    )
 
     cov_step_raw = reward.get("coverage_step_penalty_n", reward.get("coverage_penalty_n", 1.0))
     cov_miss_raw = reward.get("coverage_miss_penalty_n", 0.0)

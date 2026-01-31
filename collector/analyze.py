@@ -732,7 +732,12 @@ def summarize_decisions_diagnostics_by_run(
         if "arm_id" in g.columns and g["arm_id"].notna().any():
             ga = g.dropna(subset=["arm_id"]).copy()
             ga["arm_id"] = ga["arm_id"].astype("int64")
-        elif "tau" in g.columns and "kbits" in g.columns and g["tau"].notna().any() and g["kbits"].notna().any():
+        elif (
+            "tau" in g.columns
+            and "kbits" in g.columns
+            and g["tau"].notna().any()
+            and g["kbits"].notna().any()
+        ):
             # When LinUCB diagnostics are disabled, decision logs may omit `arm_id`.
             # In that case, derive a stable per-group arm_id from the chosen (tau, kbits) action.
             ga = g.dropna(subset=["tau", "kbits"]).copy()
