@@ -57,3 +57,16 @@ yarn-error.log*
 semantic_uplink_rpi5.zip
 
 gha-creds-*.json
+
+# Internal / private (not for public GitHub distribution)
+GEMINI.md
+.github/commands/
+.github/workflows/gemini-*.yml
+.github/workflows/gemini-*.yaml
+scripts/generate_synthetic_run.py
+docs/field_synthetic_scenarios_A_B_spec_v1.md
+docs/final/
+docs/specs/
+docs/paper_*.md
+debug_logs.py
+diff.patch
