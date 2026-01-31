@@ -42,12 +42,6 @@ Semantic Uplink는 제한된 링크 환경에서 **의미 있는 변화만** 전
 | 문서 | 설명 |
 | --- | --- |
 | `docs/hardware.md` | 배선도(wiring) 및 핀 맵(pin map). |
-| `docs/final/_entrypoints.md` | 검증된 CLI 엔트리포인트 및 스크립트 목록. |
-| `docs/final/FINAL_EVALUATION.md` | 최종 3시간 비교 실험, 데이터셋 경로, 정확한 CLI 옵션. |
-| `docs/final/OPERATIONAL_READINESS.md` | RPi5 설치/실행 메모 및 운영 관점 가이드. |
-| `docs/final/RESULTS_DEV_HISTORY_SCNA_SCNB_POC_COVFORCE_KPI.md` | (최종본) scnA/scnB `poc_covforce_kpi` 결과물 8개 폴더와 발전과정 기록. |
-| `docs/specs/KPI_DIAGNOSIS_AND_RECOMMENDATION.md` | KPI 실패 원인 진단 및 “KPI vs LinUCB 개선” 우선순위 판단 기록. |
-| `docs/field_synthetic_scenarios_A_B_spec_v1.md` | “현장 실측 직전” 수준 synthetic 시나리오(A/B) 스펙. |
 | `docs/metrics/FIGURE_NAMING.md` | 분석 산출물(플롯) 파일명 규칙. |
 | `docs/metrics/LABEL_STYLE.md` | 플롯 라벨 스타일 가이드. |
 
@@ -258,7 +252,7 @@ pip install -r requirements.txt
 | `configs/device.yaml` | device id, 센서, UI, MQTT 기본값. | `edge/edge_daemon.py`, `experiments/run_scenarios.py` |
 | `configs/policy.yaml` | 적응형 arm + reward + safety. | `edge/edge_daemon.py`, `collector/analyze.py` |
 | `configs/policy_adaptive_*.yaml` | 정책 프리셋(AIoT, 품질 등). | `edge/edge_daemon.py`, `scripts/run_3h_sequence.sh` |
-| `configs/policy_poc_covforce_kpi.yaml` | KPI 검증용 정책 프리셋(coverage liveness + payload-fair + decision diagnostics). | `scripts/generate_synthetic_run.py`, `scripts/run_3h_sequence.sh`, `collector/analyze.py` |
+| `configs/policy_poc_covforce_kpi.yaml` | KPI 검증용 정책 프리셋(coverage liveness + payload-fair + decision diagnostics). | `scripts/run_3h_sequence.sh`, `collector/analyze.py` |
 | `configs/link_profiles.yaml` | tc/netem 프로파일. | `link/shaper/tc_profiles.py`, `stack/pi_stack.py`, `experiments/run_scenarios.py` |
 | `infra/systemd/semantic-uplink-stack.env.example` | `scripts/run_stack.sh`의 환경변수 오버라이드 예시. | `scripts/run_stack.sh` |
 
@@ -432,9 +426,7 @@ python scripts/compare_field_results.py \
 
 KPI(PASS/FAIL, strict):
 - `collector.analyze`는 `kpi_final.csv`(profile × sensor별 K1..K5 + overall)와 `kpi_verdict.json`(프로젝트 PASS/FAIL)을 생성한다.
-- KPI 정의는 `docs/specs/architecture.md`를 기준으로 한다.
-
-참조 보고서: `docs/final/FINAL_EVALUATION.md`(데이터셋/결과 경로 포함).
+- KPI 정의는 `collector/analyze.py`의 KPI 판정 로직을 기준으로 한다.
 
 <a id="troubleshooting"></a>
 ## 트러블슈팅

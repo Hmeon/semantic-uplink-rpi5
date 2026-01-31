@@ -42,12 +42,6 @@ Semantic Uplink is an edge-to-collector pipeline that sends only meaningful sens
 | Document | Description |
 | --- | --- |
 | `docs/hardware.md` | Wiring diagram and pin map. |
-| `docs/final/_entrypoints.md` | Verified CLI entrypoints and scripts. |
-| `docs/final/FINAL_EVALUATION.md` | Final 3-hour comparison, dataset paths, and exact CLI options. |
-| `docs/final/OPERATIONAL_READINESS.md` | RPi5 install/run notes and operational guidance. |
-| `docs/final/RESULTS_DEV_HISTORY_SCNA_SCNB_POC_COVFORCE_KPI.md` | (Final) The 8 final scnA/scnB `poc_covforce_kpi` result folders + development history. |
-| `docs/specs/KPI_DIAGNOSIS_AND_RECOMMENDATION.md` | KPI failure diagnosis and “KPI vs LinUCB improvement” decision record. |
-| `docs/field_synthetic_scenarios_A_B_spec_v1.md` | Field-like synthetic Scenario A/B spec (pre-field measurement stage). |
 | `docs/metrics/FIGURE_NAMING.md` | Plot naming conventions for analysis outputs. |
 | `docs/metrics/LABEL_STYLE.md` | Plot label style guidelines. |
 
@@ -258,7 +252,7 @@ Key config files:
 | `configs/device.yaml` | Device id, sensors, UI, MQTT defaults. | `edge/edge_daemon.py`, `experiments/run_scenarios.py` |
 | `configs/policy.yaml` | Adaptive arms + reward + safety. | `edge/edge_daemon.py`, `collector/analyze.py` |
 | `configs/policy_adaptive_*.yaml` | Policy presets (AIoT, quality, etc.). | `edge/edge_daemon.py`, `scripts/run_3h_sequence.sh` |
-| `configs/policy_poc_covforce_kpi.yaml` | KPI-oriented preset (coverage liveness + payload-fair + decision diagnostics). | `scripts/generate_synthetic_run.py`, `scripts/run_3h_sequence.sh`, `collector/analyze.py` |
+| `configs/policy_poc_covforce_kpi.yaml` | KPI-oriented preset (coverage liveness + payload-fair + decision diagnostics). | `scripts/run_3h_sequence.sh`, `collector/analyze.py` |
 | `configs/link_profiles.yaml` | tc/netem profiles. | `link/shaper/tc_profiles.py`, `stack/pi_stack.py`, `experiments/run_scenarios.py` |
 | `infra/systemd/semantic-uplink-stack.env.example` | Env overrides for `scripts/run_stack.sh`. | `scripts/run_stack.sh` |
 
@@ -431,9 +425,7 @@ python scripts/compare_field_results.py \
 
 KPI (strict PASS/FAIL):
 - `collector.analyze` emits `kpi_final.csv` (K1..K5 + overall per profile × sensor) and `kpi_verdict.json` (project PASS/FAIL).
-- KPI definition: `docs/specs/architecture.md`.
-
-Reference report: `docs/final/FINAL_EVALUATION.md` (dataset and result paths).
+- KPI definition: see the KPI verdict logic in `collector/analyze.py`.
 
 <a id="troubleshooting"></a>
 ## Troubleshooting

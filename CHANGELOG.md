@@ -20,9 +20,6 @@ The format is based on Keep a Changelog, and this project follows Semantic Versi
   - `diagnostics.enabled` (decision/learning diagnostics)
   - `diagnostics.events_enabled` (event payload diagnostics)
 - Final KPI-oriented policy preset: `configs/policy_poc_covforce_kpi.yaml` (coverage liveness + decision diagnostics on + event diagnostics off).
-- Pre-field synthetic Scenario A/B spec and final output documentation:
-  - `docs/field_synthetic_scenarios_A_B_spec_v1.md`
-  - `docs/final/RESULTS_DEV_HISTORY_SCNA_SCNB_POC_COVFORCE_KPI.md`
 
 ### Fixed
 - Analyzer seed mixing issue in multi-run seq-aligned KPI computation (baseline alignment is now seed-aware).
