@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="docs/figma/Semantic_logo.png" alt="Semantic_logo" width="250" />
+  <img src="docs/figma/semantic_logo.png" alt="semantic_logo" width="250" />
   <h1>AIoT Semantic Uplink (RPi5)</h1>
   <p><b>저속·손실 링크에서 “필요할 때만, 필요한 만큼만” 보내기 위한 엣지 전송 정책 실험 플랫폼</b></p>
 
