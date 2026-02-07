@@ -25,6 +25,13 @@ jobs:
         run: |
           ruff check .
 
+      - name: CLI Smoke
+        run: |
+          python -m edge.edge_daemon --help
+          python -m collector.collector --help
+          python -m collector.analyze --help
+          python -m experiments.run_scenarios --help
+
       - name: Pytest
         run: |
-          pytest -q --cov=common --cov=collector --cov=edge --cov=link --cov-report=term-missing --cov-fail-under=20
+          pytest -q --cov=common --cov=collector --cov=edge --cov=link --cov-report=term-missing --cov-fail-under=40

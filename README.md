@@ -165,6 +165,8 @@ python -m experiments.run_scenarios --help
 - 하드웨어 배선: [`docs/hardware.md`](docs/hardware.md)
 - 도식/디자인 자료: [`docs/figma/README.md`](docs/figma/README.md)
 - 지표 및 도표 규칙: [`docs/metrics/FIGURE_NAMING.md`](docs/metrics/FIGURE_NAMING.md)
+- 엔터프라이즈 고도화 로드맵: [`docs/ROADMAP_ENTERPRISE.md`](docs/ROADMAP_ENTERPRISE.md)
+- 변경 전 프리플라이트 체크리스트: [`docs/PROJECT_PREFLIGHT_CHECKLIST.md`](docs/PROJECT_PREFLIGHT_CHECKLIST.md)
 
 ---
 

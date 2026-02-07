@@ -44,6 +44,8 @@ Semantic Uplink is an edge-to-collector pipeline that sends only meaningful sens
 | `docs/hardware.md` | Wiring diagram and pin map. |
 | `docs/metrics/FIGURE_NAMING.md` | Plot naming conventions for analysis outputs. |
 | `docs/metrics/LABEL_STYLE.md` | Plot label style guidelines. |
+| `docs/ROADMAP_ENTERPRISE.md` | Enterprise hardening roadmap and stage gates. |
+| `docs/PROJECT_PREFLIGHT_CHECKLIST.md` | Mandatory pre-change checklist for safe batches. |
 
 <a id="quickstart"></a>
 ## Quickstart
