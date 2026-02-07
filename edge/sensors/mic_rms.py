@@ -209,7 +209,8 @@ class MicRMS:
             rms = float(np.sqrt(np.mean(x * x)))
             dbfs = 20.0 * math.log10(max(rms, eps)) + self.db_offset
             # clipping 비율
-            clip_ratio = float(np.mean(np.abs(frame) >= thr_val))
+            # Promote to int32 first to avoid int16 overflow on abs(-32768).
+            clip_ratio = float(np.mean(np.abs(frame.astype(np.int32)) >= thr_val))
             s = Sample(ts_ns=ts_ns, seq=self.seq, dbfs=dbfs, clip_ratio=clip_ratio)
             self.seq += 1
             yield s

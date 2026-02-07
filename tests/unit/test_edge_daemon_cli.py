@@ -121,3 +121,86 @@ def test_parse_args_device_config_none_is_supported() -> None:
     )
     assert args.device_config is None
     assert args.device_id == "dev1"
+
+
+def test_parse_args_maps_lcd_backend_alias_and_buttons_defaults(tmp_path) -> None:
+    from edge.edge_daemon import parse_args
+
+    device_yaml = _write_device_yaml(
+        tmp_path,
+        """
+        device_id: dev1
+        mqtt:
+          host: broker.local
+          tls: true
+        sensors:
+          temp:
+            period_hz: 1.5
+        ui:
+          enabled: true
+          backend: lcd
+        buttons:
+          enabled: true
+          mode_pin: 5
+          profile_pin: 6
+          marker_pin: 13
+          debounce_ms: 120
+        """,
+    )
+
+    args = parse_args(["--device-config", str(device_yaml), "--temp-backend", "mock"])
+    assert args.ui_enable is True
+    assert args.ui_kind == "lcd1602"
+    assert args.buttons_enable is True
+    assert args.btn_mode_pin == 5
+    assert args.btn_profile_pin == 6
+    assert args.btn_marker_pin == 13
+    assert args.btn_debounce_ms == 120
+    assert args.tls is True
+
+
+def test_parse_args_maps_ssd1306_backend_and_allows_tls_override(tmp_path) -> None:
+    from edge.edge_daemon import parse_args
+
+    device_yaml = _write_device_yaml(
+        tmp_path,
+        """
+        device_id: dev1
+        mqtt:
+          host: broker.local
+          tls: true
+        sensors:
+          temp:
+            period_hz: 1.0
+        ui:
+          enabled: true
+          backend: ssd1306
+        """,
+    )
+
+    args = parse_args(["--device-config", str(device_yaml), "--no-tls", "--temp-backend", "mock"])
+    assert args.ui_kind == "ssd1306"
+    assert args.tls is False
+
+
+def test_parse_args_unknown_ui_backend_falls_back_to_auto(tmp_path) -> None:
+    from edge.edge_daemon import parse_args
+
+    device_yaml = _write_device_yaml(
+        tmp_path,
+        """
+        device_id: dev1
+        mqtt:
+          host: broker.local
+        sensors:
+          temp:
+            period_hz: 1.0
+        ui:
+          enabled: true
+          backend: custom_ui
+        """,
+    )
+
+    args = parse_args(["--device-config", str(device_yaml), "--temp-backend", "mock"])
+    assert args.ui_enable is True
+    assert args.ui_kind == "auto"

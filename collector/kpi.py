@@ -252,7 +252,9 @@ def compute_final_kpi(summary: pd.DataFrame) -> tuple[pd.DataFrame, bool]:
             float(r_f.get("aoi_p95_ms_improvement_pct")) if r_f is not None else float("nan")
         )
         anomaly_recall = (
-            float(r_s.get("anomaly_segment_recall")) if r_s is not None else float("nan")
+            float(r_s.get("anomaly_segment_recall", float("nan")))
+            if r_s is not None
+            else float("nan")
         )
 
         k1 = bool(math.isfinite(rate_imp_periodic) and rate_imp_periodic >= 85.0)

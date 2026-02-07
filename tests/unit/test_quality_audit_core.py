@@ -283,3 +283,228 @@ def test_run_quality_audit_naming_violation_failure(tmp_path) -> None:
         code_roots=(),
     )
     assert bad_name in report["visualization"]["naming_violations"]
+
+
+def test_run_quality_audit_format_and_missing_expected_files(tmp_path) -> None:
+    analysis = tmp_path / "analysis"
+    figs = analysis / "figs"
+    figs.mkdir(parents=True)
+
+    pd.DataFrame(
+        [
+            {
+                "profile": "slow_10kbps",
+                "policy": "adaptive",
+                "sensor": "temp",
+                "rate_Bps": 10.0,
+                "aoi_mean_ms": 400.0,
+                "aoi_p95_ms": 800.0,
+                "mae_event_mean": 0.6,
+                "mae_event_p95": 0.8,
+                "kbits_mean": 8.0,
+            }
+        ]
+    ).to_csv(analysis / "metrics_summary.csv", index=False)
+    (analysis / "analysis_meta.json").write_text(
+        json.dumps(
+            {
+                "flags": {
+                    "plots": True,
+                    "diagnostic_plots": False,
+                    "ucb_timeseries": False,
+                    "pareto_p95": True,
+                },
+                "plot_cfg": {"formats": ["png"], "dpi": 300},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    only_one = qa.fig_basename(
+        sensor="temp",
+        profile="slow_10kbps",
+        policy="compare",
+        metric="rate_bar",
+    )
+    (figs / f"{only_one}.png").write_bytes(_make_png_bytes(width=80, height=60, dpi=300))
+
+    report = qa.run_quality_audit(
+        analysis,
+        min_png_bytes=1,
+        min_png_width=10,
+        min_png_height=10,
+        require_vector=True,
+        code_roots=(),
+    )
+    assert report["format_audit"]["status"] == "FAIL"
+    assert "vector format missing" in str(report["format_audit"]["reason"])
+    assert int(report["visualization"]["expected_status_counts"].get("FAIL", 0)) >= 1
+    assert report["visualization"]["missing_expected_files"]
+
+
+def test_run_quality_audit_diagnostic_expected_scope_is_adaptive_only(tmp_path) -> None:
+    analysis = tmp_path / "analysis"
+    figs = analysis / "figs"
+    figs.mkdir(parents=True)
+
+    pd.DataFrame(
+        [
+            {
+                "profile": "slow_10kbps",
+                "policy": "periodic",
+                "sensor": "temp",
+                "rate_Bps": 10.0,
+                "aoi_mean_ms": 400.0,
+                "aoi_p95_ms": 800.0,
+                "mae_event_mean": 0.6,
+                "mae_event_p95": 0.8,
+                "kbits_mean": 8.0,
+                "linucb_safe_forced_rate": 0.5,
+                "linucb_forced_reason_aoi_limit_rate": 0.2,
+                "linucb_forced_reason_mae_limit_rate": 0.2,
+                "linucb_forced_reason_both_rate": 0.1,
+                "linucb_switch_rate": 0.3,
+            }
+        ]
+    ).to_csv(analysis / "metrics_summary.csv", index=False)
+
+    pd.DataFrame(
+        [
+            {
+                "run_id": "run-1",
+                "profile": "slow_10kbps",
+                "policy": "periodic",
+                "sensor": "temp",
+                "event_reason_threshold_count": 3,
+                "event_reason_heartbeat_count": 2,
+                "linucb_rate_limit_skips_total": 1,
+                "dup_bytes_ratio": 0.1,
+            }
+        ]
+    ).to_csv(analysis / "metrics_by_run.csv", index=False)
+
+    pd.DataFrame(
+        [
+            {
+                "run_id": "run-1",
+                "profile": "slow_10kbps",
+                "policy": "periodic",
+                "sensor": "temp",
+                "arm_id": 0,
+                "frac": 1.0,
+            }
+        ]
+    ).to_csv(analysis / "linucb_arm_distribution.csv", index=False)
+
+    pd.DataFrame(
+        [
+            {
+                "run_id": "run-1",
+                "profile": "slow_10kbps",
+                "policy": "periodic",
+                "sensor": "temp",
+                "window_idx": 0,
+                "window_s": 60,
+                "entropy_log2": 0.0,
+            }
+        ]
+    ).to_csv(analysis / "linucb_entropy_60s.csv", index=False)
+
+    (analysis / "analysis_meta.json").write_text(
+        json.dumps(
+            {
+                "flags": {
+                    "plots": True,
+                    "diagnostic_plots": True,
+                    "ucb_timeseries": True,
+                    "pareto_p95": False,
+                },
+                "plot_cfg": {"formats": ["png"], "dpi": 300},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = qa.run_quality_audit(
+        analysis,
+        min_png_bytes=1,
+        min_png_width=1,
+        min_png_height=1,
+        require_vector=False,
+        code_roots=(),
+    )
+    expected = report["visualization"]["expected_figures"]
+    assert not any("safe_forced_reasons" in str(x.get("base_name")) for x in expected)
+    assert not any("switch_rate" in str(x.get("base_name")) for x in expected)
+    assert not any("event_reasons" in str(x.get("base_name")) for x in expected)
+    assert not any("arm_dist" in str(x.get("base_name")) for x in expected)
+    assert not any("entropy_60s" in str(x.get("base_name")) for x in expected)
+
+
+def test_write_quality_audit_files_renders_partial_failure_sections(tmp_path) -> None:
+    analysis = tmp_path / "analysis"
+    analysis.mkdir(parents=True)
+
+    report = {
+        "generated_at": "2026-02-07T00:00:00+00:00",
+        "analysis_dir": str(analysis).replace("\\", "/"),
+        "figs_dir": str(analysis / "figs").replace("\\", "/"),
+        "plot_formats_inferred": ("png",),
+        "plot_flags": {
+            "plots_enabled": True,
+            "diagnostic_plots_enabled": True,
+            "ucb_timeseries_enabled": False,
+            "pareto_p95_enabled": False,
+        },
+        "format_audit": {"status": "FAIL", "reason": "vector format missing (pdf/svg)"},
+        "visualization": {
+            "expected_figures": [{"status": "FAIL", "base_name": "temp_a_b_rate_bar"}],
+            "expected_status_counts": {"FAIL": 1},
+            "missing_expected_files": ["temp_a_b_rate_bar.png"],
+            "file_checks": [{"status": "FAIL", "path": "figs/temp_a_b_rate_bar.png"}],
+            "file_status_counts": {"FAIL": 1},
+            "label_checks": [
+                {
+                    "base_name": "temp_a_b_rate_bar",
+                    "status": "FAIL",
+                    "details": {"missing": ["xlabel"]},
+                }
+            ],
+            "label_status_counts": {"FAIL": 1},
+            "naming_violations": ["badname.png"],
+            "png_quality_fails": ["temp_a_b_rate_bar.png"],
+            "tiny_files": ["tiny.png"],
+            "small_png_dims": ["small.png"],
+        },
+        "tables": {
+            "metric_coverage": {"metrics_summary.csv": {"rate_Bps": {"status": "FAIL"}}},
+        },
+        "logging": {
+            "print_calls": [{"path": "collector/x.py", "line": 10}],
+            "exception_traceback_audit": {
+                "failures": [{"path": "collector/x.py", "line": 11, "function": "f"}],
+                "skipped": 0,
+            },
+            "logging_setup_present": False,
+            "timestamp_format_detected": False,
+            "policy_diag_debug_log_audit": {
+                "status": "FAIL",
+                "details": {"missing_keys": ["run_id"]},
+            },
+            "status_counts": {"PASS": 0, "FAIL": 4},
+        },
+    }
+
+    json_path, md_path = qa.write_quality_audit_files(report, analysis_dir=analysis)
+    assert json_path.exists()
+    assert md_path.exists()
+
+    md = md_path.read_text(encoding="utf-8")
+    assert "## Missing expected figures (FAIL)" in md
+    assert "## Figure naming violations (FAIL)" in md
+    assert "## PNG quality failures (FAIL)" in md
+    assert "## Missing axis labels (FAIL)" in md
+    assert "## Tiny figure files (FAIL)" in md
+    assert "## Small PNG dimensions (FAIL)" in md
+    assert "print(): FAIL" in md
+    assert "policy diagnostics DEBUG log keys: FAIL missing=" in md

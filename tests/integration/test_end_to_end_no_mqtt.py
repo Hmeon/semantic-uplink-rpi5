@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import sys
 import time
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from collector.collector import Collector, Config
 from common.schema import EventMsg, LinkProfile, PolicyDecisionMsg, PolicyMode, SensorType
 
 
-def test_end_to_end_without_mqtt_broker(tmp_path: Path) -> None:
+def test_end_to_end_without_mqtt_broker(tmp_path: Path, monkeypatch) -> None:
     """
     Docker/Mosquitto 없이도 '수집 → 중복제거 → Parquet → 분석' 경로를 검증한다.
 
@@ -165,3 +166,72 @@ def test_end_to_end_without_mqtt_broker(tmp_path: Path) -> None:
     assert not math.isnan(float(row["baseline_rate_Bps"]))
     assert not math.isnan(float(row["rate_Bps_improvement_pct"]))
 
+    # 4) non-Docker integration equivalence: exercise analyze.main artifact contract
+    # on the same run directory, without MQTT broker or subprocess orchestration.
+    out_dir_main = tmp_path / "analysis_main"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "analyze.py",
+            "--input",
+            str(run_dir),
+            "--out",
+            str(out_dir_main),
+            "--baseline-policy",
+            "periodic",
+            "--no-plots",
+            "--no-paper-plots",
+            "--no-diagnostic-plots",
+            "--no-audit",
+            "--log-level",
+            "ERROR",
+        ],
+    )
+    analyze.main()
+
+    for name in [
+        "analysis_meta.json",
+        "metrics_summary.csv",
+        "metrics_by_run.csv",
+        "metrics_vs_periodic.csv",
+        "metrics_vs_fixed_tau.csv",
+        "kpi_final.csv",
+        "kpi_verdict.json",
+        "report.md",
+    ]:
+        assert (out_dir_main / name).exists()
+
+    verdict = json.loads((out_dir_main / "kpi_verdict.json").read_text(encoding="utf-8"))
+    # This non-Docker run injects periodic/fixed_tau only, so KPI is not applicable.
+    assert verdict.get("project_verdict") == "SKIP"
+
+    # 5) non-Docker integration equivalence: audit-enabled analyzer path.
+    out_dir_main_audit = tmp_path / "analysis_main_audit"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "analyze.py",
+            "--input",
+            str(run_dir),
+            "--out",
+            str(out_dir_main_audit),
+            "--baseline-policy",
+            "periodic",
+            "--no-plots",
+            "--no-paper-plots",
+            "--no-diagnostic-plots",
+            "--audit",
+            "--log-level",
+            "ERROR",
+        ],
+    )
+    analyze.main()
+
+    assert (out_dir_main_audit / "quality_audit.json").exists()
+    assert (out_dir_main_audit / "quality_audit.md").exists()
+    verdict_audit = json.loads(
+        (out_dir_main_audit / "kpi_verdict.json").read_text(encoding="utf-8")
+    )
+    assert verdict_audit.get("project_verdict") == "SKIP"

@@ -648,18 +648,25 @@ class EdgeDaemon:
     def _maybe_start_buttons(self):
         if self._buttons is not None:
             return
-        self._buttons = build_buttons(
-            ButtonsConfig(
-                enable=self.buttons_cfg.enable,
-                mode_pin=self.buttons_cfg.mode_pin,
-                profile_pin=self.buttons_cfg.profile_pin,
-                marker_pin=self.buttons_cfg.marker_pin,
-                debounce_ms=self.buttons_cfg.debounce_ms,
-            ),
-            on_mode=self._cycle_mode,
-            on_profile=self._cycle_profile,
-            on_marker=self._emit_marker,
-        )
+        try:
+            self._buttons = build_buttons(
+                ButtonsConfig(
+                    enable=self.buttons_cfg.enable,
+                    mode_pin=self.buttons_cfg.mode_pin,
+                    profile_pin=self.buttons_cfg.profile_pin,
+                    marker_pin=self.buttons_cfg.marker_pin,
+                    debounce_ms=self.buttons_cfg.debounce_ms,
+                ),
+                on_mode=self._cycle_mode,
+                on_profile=self._cycle_profile,
+                on_marker=self._emit_marker,
+            )
+        except Exception:
+            self._buttons = None
+            logger.exception("buttons_build_failed")
+            return
+        if self._buttons is None:
+            return
         try:
             self._buttons.start()
         except Exception:
